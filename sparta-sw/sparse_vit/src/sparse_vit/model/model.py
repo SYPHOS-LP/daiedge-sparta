@@ -5,7 +5,7 @@ import torch
 from torch import nn
 from collections import OrderedDict
 
-from .embedding import EmbeddingPatchifyLinear, EmbeddingPatchifyDCT
+from .embedding import EmbeddingPatchifyLinear
 from .encoder import ViTEncoderLayer
 from .tasks import ClassifierHeadToken, ClassifierHeadDeiT
 from .utils import init_model_weights
@@ -145,8 +145,6 @@ def build_vit_base_model(
     if embed_type == "rgb":
         embed = EmbeddingPatchifyLinear(**_embed_kw)
 
-    elif embed_type == "dct":
-        embed = EmbeddingPatchifyDCT(**_embed_kw)
     else:
         raise ValueError("Choose `embed_type` from ('rgb', 'cdt')")
 
@@ -277,9 +275,6 @@ def build_vit_embed_head_layers(
     # Initialize embedding layer and task-specific layer
     if embed_type == "rgb":
         embed = EmbeddingPatchifyLinear(**_embed_kw)
-
-    elif embed_type == "dct":
-        embed = EmbeddingPatchifyDCT(**_embed_kw)
 
     if mode in "vit":
         heads = ClassifierHeadToken(**task_kw)
