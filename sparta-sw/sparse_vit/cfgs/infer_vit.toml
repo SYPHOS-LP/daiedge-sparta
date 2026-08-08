@@ -1,0 +1,51 @@
+device = "cpu"
+
+# Choose type of dataset
+[dataset]
+name = "cifar10"                                          # {'cifar10', 'dir'}
+path = "/home/anousias/Documents/Datasets/cifar10" # Path to actual data 
+
+# Optionally use a dataloader
+[dataset.dataloader]
+batch_size = 8
+shuffle = false
+num_workers = 0
+drop_last = false
+
+# The `model` tag guides the build-model functionality to 
+# generate an architecture similar to the trained model.
+[infer.model.load]
+mode = "all" # "embed_head"
+
+[infer.model.params]
+params = "load"
+
+[infer.model.params.params_kw]
+model_path = "/home/anousias/Documents/Projects/daiedge/sparta-sw/models/finetuned/vit-b32-tiny-imagenet-finetuned-zb0khh5l-ep30.pth"
+
+[infer.model.embed]
+embed_type = "rgb"
+img_size = 224
+p_size = 32 # This controls 16 vs 32 patch size
+channels = 3
+use_cls = true
+use_dstl = false
+use_regs = 0
+pe_type = "haar"
+
+[infer.model.encoder]
+mode = "vit"
+N = 12
+h = 12
+d_in = 768
+d_hid = 3072
+activation = "relu"
+bias = false
+attn_type = "linear"
+norm_type = "rms_norm"
+dropout = 0.05
+dropout_attn = 0.05
+ffn_type = "mlp"
+
+[infer.model.task]
+num_classes = 200

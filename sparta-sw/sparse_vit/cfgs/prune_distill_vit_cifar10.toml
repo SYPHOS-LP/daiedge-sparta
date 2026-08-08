@@ -1,0 +1,147 @@
+device = "cuda"
+use_wandb = true
+
+[dataset]
+format = "predefined"
+name = "cifar10"
+path = "/workspace/data/cifar10"
+transform = "augment"
+
+[dataset.kw]
+task = "classification"
+weights = []
+
+[dataset.dataloader.train]
+batch_size = 128
+shuffle = true
+num_workers = 8
+drop_last = false
+
+[dataset.dataloader.valid]
+batch_size = 64
+shuffle = false
+num_workers = 4
+drop_last = false
+
+[prune]
+
+finetune = true     # Whether to finetune pruned model or not
+finegrained = false # Whether to use different pruning ratios per layer (see `sparse_vit.pruning.constants.py`)
+
+# Choose from ("magnitude", "sparsegpt") (not added yet? "movement", "sparseml_gmp", "contrastive")
+# - if 'magnitude', then `prune_method_kw` must have params: `scope`: ("layerwise", "global")
+# - if 'sparsegpt', then `prune_method_kw` must have params: `batches`: int, 
+[prune.method]
+prune_method = "magnitude"
+prune_method_kw = { "scope" = "layerwise" } # "magnitude"
+# prune_method_kw = { "batches" = 128 } # "sparsegpt"
+
+# choose from ('steps', 'range', 'cubic') 
+# - if 'steps' must be a monotonic list of non-decreasing floats, 
+# - if 'range' a three tuple of the form (start, stop, num)
+# - if 'cubic' refers to the method by Zhu & Gupta, 2017 and requires a three tuple of the form (start, end, num)
+[prune.schedule]
+schedule_type = "steps"
+schedule_amounts = [0.5, 0.7, 0.8, 0.85, 0.9]
+
+[train]
+
+[train.lr_scheduler]
+epochs = [10, 10, 15, 15, 20]
+warmup = [1, 1, 1, 1, 2]
+
+[train.optim]
+lr = [5.5e-6, 1e-5, 1.25e-5, 1.5e-5, 1.5e-5]
+weight_decay = 0.05
+
+[train.layers]
+freeze = false
+
+[train.teacher.model]
+# Configuration for teacher model
+
+[train.teacher.model.params]
+params = "load"
+
+[train.teacher.model.params.params_kw]
+model_path = "/workspace/models/vit-base-p16-cifar10-finetuned-m617gm8l-ep80.pth"
+
+[train.teacher.model.embed]
+img_size = 224
+p_size = 16
+channels = 3
+use_cls = true
+use_dstl = false
+use_regs = 0
+pe_type = "haar"
+
+[train.teacher.model.encoder]
+mode = "vit"
+N = 12
+h = 12
+d_in = 768
+d_hid = 3072
+activation = "relu"
+bias = false
+attn_type = "linear"
+norm_type = "rms_norm"
+dropout = 0.05
+dropout_attn = 0.05
+
+[train.teacher.model.task]
+num_classes = 10
+
+[train.model]
+# Configuration for student model
+
+[train.model.params]
+params = "load"
+
+[train.model.params.params_kw]
+model_path = "/workspace/models/vit-base-p16-cifar10-finetuned-m617gm8l-ep80.pth"
+
+[train.model.embed]
+img_size = 224
+p_size = 16
+channels = 3
+use_cls = true
+use_dstl = false
+use_regs = 0
+pe_type = "haar"
+
+[train.model.encoder]
+mode = "deit"
+N = 12
+h = 12
+d_in = 768
+d_hid = 3072
+activation = "relu"
+bias = true
+attn_type = "self"
+norm_type = "rms_norm"
+dropout = 0.05
+dropout_attn = 0.05
+
+[train.model.task]
+num_classes = 10
+
+[train.loss]
+label_smoothing = 0.1
+
+[other.distill]
+dstl_type = "soft"
+
+[other.log]
+log_sparsity = true
+
+[out]
+model_dir = "./.out/models"
+model_name = "vit-base-cifar10-pruned-distilled"
+
+[wandb]
+WANDB_MODE = "online"                    # Options: 'online', 'offline' ,'disabled'
+name = "vit-base-cifar10-pruned-distilled"
+
+[wandb.init]
+project = "sparta-sw"
+entity = "anousias-k3y"

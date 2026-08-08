@@ -1,0 +1,97 @@
+device = "cuda"
+use_wandb = true
+
+[dataset]
+format = "predefined"
+name = "cifar10"
+path = "/home/int/Workspace_02/sparta-vit/sparta-sw/data"
+transform = "augment"
+
+[dataset.kw]
+task = "classification"
+weights = []
+
+[dataset.dataloader.train]
+batch_size = 128
+shuffle = true
+num_workers = 8
+drop_last = true
+
+[dataset.dataloader.valid]
+batch_size = 32
+shuffle = false
+num_workers = 4
+drop_last = false
+
+[train]
+
+[train.lr_scheduler]
+epochs = 30
+warmup = 5
+
+[train.optim]
+lr = 5e-5
+weight_decay = 0.02
+
+[train.layers]
+freeze = false
+
+# [train.model.params]
+# params = "load"
+# 
+# [train.model.params.params_kw]
+# model_path = "/home/int/Workspace_02/sparta-vit/sparta-sw/sparse_vit/src/bin/runs/vit-base-tiny-imagenet-finetuned-xx.pth"
+# replace_head = true
+
+[train.model.params]
+params = "pretrained"
+
+[train.model.params.params_kw]
+"weights" = "IMAGENET1K_V1"
+filter_branch = ["embed.pos_embedding"]
+
+[train.model.embed]
+embed_type = "rgb"
+img_size = 224
+p_size = 16
+channels = 3
+use_cls = true
+use_dstl = false
+use_regs = 0
+pe_type = "haar"
+
+[train.model.encoder]
+mode = "vit"
+N = 12
+h = 12
+d_in = 768
+d_hid = 3072
+activation = "relu"
+bias = false
+attn_type = "linear"
+norm_type = "rms_norm"
+dropout = 0.05
+dropout_attn = 0.05
+ffn_type = "mlp"
+
+[train.model.task]
+num_classes = 10
+
+[train.loss]
+loss_type = "ce"
+label_smoothing = 0.05
+
+[other.log]
+log_sparsity = true
+
+[out]
+model_dir = "./.out/models"
+model_name = "vit-base-cifar10-finetuned"
+
+[wandb]
+WANDB_MODE = "online"        # Options: 'online', 'offline' ,'disabled'
+name = "vit-base-16-cifar10"
+
+[wandb.init]
+project = "sparta-sw"
+entity = "anousias-k3y"
