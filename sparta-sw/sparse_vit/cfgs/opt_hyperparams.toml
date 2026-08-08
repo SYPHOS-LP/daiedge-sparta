@@ -1,0 +1,35 @@
+[opt]
+cfg_path = "/home/int/Workspace_02/sparta-vit/sparta-sw/sparse_vit/cfgs/train_vit_cifar10.toml"
+exec = "/home/int/Workspace_02/sparta-vit/sparta-sw/sparse_vit/src/bin/train_vit.py"
+
+# Any parameter to be optimized is defined under the `opt.params` field
+# with the exact same path from the original configuration file along 
+# with the values to be applied for each configuration.
+
+[[opt.params]]
+paths = ["train.optim.lr"]
+vals = [1e-4, 5e-5]
+
+[[opt.params]]
+paths = ["train.optim.weight_decay"]
+vals = [0.05]
+
+[[opt.params]]
+paths = ["train.lr_scheduler.epochs"]
+vals = [50]
+
+[[opt.params]]
+paths = ["train.model.encoder.activation"]
+vals = ["gelu", "relu"]
+
+[[opt.params]]
+paths = ["train.model.encoder.attn_type"]
+vals = ["self", "sparsemax", "entmax15"]
+
+[[opt.params]]
+paths = ["train.model.encoder.dropout"]
+vals = [0.05, 0.1]
+
+[[opt.params]]
+paths = ["train.loss.label_smoothing"]
+vals = [0.1, 0.2]

@@ -1,0 +1,23 @@
+device = "cpu"
+
+[infer.model.embed]
+img_size = 224
+p_size = 16
+channels = 3
+use_cls = true
+pe_type = "learnable"
+
+[infer.model.encoder]
+N = 4
+h = 8
+d_in = 512
+d_hid = 1024
+activation = "relu"
+attn_type = "self"
+norm_type = "layernorm"
+norm_kw = { "bias" = false }
+dropout = 0.1
+dropout_attn = 0.1
+
+[infer.model.task]
+num_classes = 10

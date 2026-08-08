@@ -1,0 +1,99 @@
+device = "cpu"
+use_wandb = true
+
+[dataset]
+format = "predefined"
+name = "tiny-imagenet"
+path = "/workspace/data/tiny-imagenet-200"
+transform = "augment"
+
+[dataset.kw]
+task = "classification"
+weights = []
+
+[dataset.dataloader.train]
+batch_size = 128
+shuffle = true
+num_workers = 8
+drop_last = false
+
+[dataset.dataloader.valid]
+batch_size = 32
+shuffle = false
+num_workers = 4
+drop_last = false
+
+[model]
+path = "/home/anousias/Documents/Projects/daiedge/sparta-sw/models/vit-base-tiny-imagenet-finetuned-8u5k8qjv-ep100.pth"
+
+[quant]
+method = "brevitas_ptq" # OPTIONS: "static", "gptq", "brevitas_ptq"
+
+quant_scope = "all_conv2d" # Options: "all_conv2d", "pruned_conv2d"
+eval_verbose = true
+eval_log_interval = 10
+calibrate_steps = 16
+use_gptq = true
+qat = true
+bits = 4
+abits = 8
+weight_per_tensor = true # false = per-channel weight scales (recommended); true = one scale per tensor
+use_int_norm = false
+fuse_rms_norm = true     # fold each ln_mha/ln_mlp/head-ln gamma into the following linear before quantizing
+weight_scale_po2 = true  # restrict Linear/Conv2d weight quantizer scales to powers of two (shift instead of multiply)
+weight_weight_po2 = true # restrict Linear / Conv2D weights to powers of two
+act_scale_po2 = true     # same restriction, applied to every activation quantizer
+encoder_only = false     # Whether quantization is applied on the encoder only
+export_qonnx = false     # set to false to skip QONNX export
+
+[train.qat]
+epochs = 10
+warmup = 2
+lr = 0.75e-5
+weight_decay = 0.05
+
+[train.model.params]
+params = "init"
+
+[train.model.embed]
+img_size = 224
+p_size = 16
+channels = 3
+use_cls = true
+use_dstl = false
+use_regs = 0
+pe_type = "haar"
+
+[train.model.encoder]
+mode = "vit"
+N = 12
+h = 12
+d_in = 768
+d_hid = 3072
+activation = "relu"
+bias = false
+attn_type = "linear"
+norm_type = "rms_norm"
+dropout = 0.05
+dropout_attn = 0.05
+
+[train.model.task]
+num_classes = 10
+
+[train.loss]
+label_smoothing = 0.1
+
+[other.log]
+log_sparsity = true
+
+[out]
+model_dir = "./runs/quantized"
+model_name = "vit-base-cifar10-32b-finetuned-pruned-quant-correct_finalize_qat-30ep-fusedRMS"
+
+[wandb]
+WANDB_MODE = "disabled"                    # Options: 'online', 'offline', 'disabled'
+name = "vit-base-cifar10-32b-finetuned-pruned-quant-correct_finalize_qat-30ep-fusedRMS"
+
+[wandb.init]
+project = "sparta-sw"
+entity = "anousias-k3y"

@@ -1,0 +1,103 @@
+device = "cuda:1"
+use_wandb = true
+
+[dataset]
+format = "predefined"
+name = "cifar10"
+path = "data"
+transform = "augment"
+
+[dataset.kw]
+task = "classification"
+weights = []
+
+[dataset.dataloader.train]
+batch_size = 128
+shuffle = true
+num_workers = 8
+drop_last = false
+
+[dataset.dataloader.valid]
+batch_size = 64
+shuffle = false
+num_workers = 4
+drop_last = false
+
+[model]
+path = "./runs/vit-base-cifar10-b32-distilled-pruned-zyapj7gv-ep50.pth"
+
+[quant]
+method = "brevitas_ptq" # OPTIONS: "static", "gptq", "brevitas_ptq"
+
+quant_scope = "all_conv2d" # Options: "all_conv2d", "pruned_conv2d"
+eval_verbose = true
+eval_log_interval = 10
+calibrate_steps = 16
+use_gptq = true
+qat = true
+bits = 4
+abits = 8
+weight_per_tensor = true # false = per-channel weight scales (recommended); true = one scale per tensor
+use_int_norm = false
+fuse_rms_norm = true # fold each ln_mha/ln_mlp/head-ln gamma into the following linear before quantizing
+weight_scale_po2 = false # restrict Linear/Conv2d weight quantizer scales to powers of two (shift instead of multiply)
+act_scale_po2 = false    # same restriction, applied to every activation quantizer
+export_qonnx = false # set to false to skip QONNX export
+
+[train.qat]
+epochs = 10
+warmup = 2
+lr = 1e-5
+weight_decay = 0.05
+
+distill = true          # QAT with distillation: student = quant_model, teacher = fp32 checkpoint at [model].path
+dstl_type = "soft"      # "soft" (KL + CE) or "hard" (deit only, needs use_dstl = true below)
+temperature = 3.0
+alpha = 0.5             # weight on hard-label CE; (1 - alpha) goes to the soft KL term
+
+[train.model.params]
+params = "init"
+
+[train.model.embed]
+img_size = 224
+p_size = 32
+channels = 3
+use_cls = true
+use_dstl = false
+use_regs = 0
+pe_type = "haar"
+
+[train.model.encoder]
+mode = "vit"
+N = 12
+h = 12
+d_in = 768
+d_hid = 3072
+activation = "relu"
+bias = false
+attn_type = "linear"
+norm_type = "rms_norm"
+norm_kw = {}
+dropout = 0.05
+dropout_attn = 0.05
+
+[train.model.task]
+num_classes = 10
+
+[train.loss]
+label_smoothing = 0.1
+
+[other.log]
+log_sparsity = true
+
+[out]
+model_dir = "./runs/quantized"
+model_name = "vit-base-cifar10-32b-finetuned-pruned-quant-distill"
+
+[wandb]
+WANDB_MODE = "online"                    # Options: 'online', 'offline', 'disabled'
+name = "vit-base-cifar10-32b-finetuned-pruned-quant-distill"
+
+[wandb.init]
+project = "rodo-sw"
+entity = "pkroditis-org"

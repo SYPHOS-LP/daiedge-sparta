@@ -1,0 +1,35 @@
+[opt]
+cfg_path = "/home/sparta-vit/sparta-sw/sparse_vit/cfgs/train_vit_imagenet.toml"
+exec = "/home/sparta-vit/sparta-sw/sparse_vit/src/bin/train_vit.py"
+
+# Any parameter to be optimized is defined under the `opt.params` field
+# with the exact same path from the original configuration file along 
+# with the values to be applied for each configuration.
+
+[[opt.params]]
+paths = ["train.optim.lr"]
+vals = [5e-5]
+
+[[opt.params]]
+paths = ["train.optim.weight_decay"]
+vals = [0.02]
+
+[[opt.params]]
+paths = ["train.lr_scheduler.epochs"]
+vals = [20]
+
+[[opt.params]]
+paths = ["train.model.encoder.activation"]
+vals = ["relu"]
+
+[[opt.params]]
+paths = ["train.model.encoder.attn_type"]
+vals = ["linear"]
+
+[[opt.params]]
+paths = ["train.model.encoder.ffn_type"]
+vals = ["mlp"]
+
+[[opt.params]]
+paths = ["train.loss.label_smoothing"]
+vals = [0.05]
