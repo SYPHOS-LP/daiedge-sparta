@@ -24,7 +24,7 @@ inference through joint software and hardware adaptations. At the core of SPARTA
 of a ViT variant that employs end-to-end sparsity and quantization both in model weights and activations.
 These are directly utilized by a dedicated FPGA compute engine that supports sparse-dense (SpDMM) and
 sparse-sparse (SPMM) matrix multiplication  primitives. We deploy and evaluate SPARTA on the AMD Kria
-KV260 board, achieving real-time inference throughput, with a modest drop in model's accuracy.
+KR260 board, achieving real-time inference throughput, with a modest drop in model's accuracy.
 
 
 ## Acknowledgements
