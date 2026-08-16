@@ -1,0 +1,24 @@
+**/__pycache__/
+workspace/
+workspace_mha/
+
+# E2E simulation (sim/): local Python env, large model checkpoints/binaries, datasets
+sim/.venv-sw/
+sim/data/
+sim/models/
+# compiled model payloads + golden dumps (regenerate via compile_model.py — see sim/README.md)
+sim/e2e/
+sim/e2e_fixed/
+sim/e2e_backup*/
+
+# Internal working notes: debugging post-mortems, abandoned plans, raw notes.
+# The substantive ones were promoted into docs/ proper.
+docs/exploration/
+
+# build artifacts
+.hls.failed
+dfx_runtime.txt
+
+# bitstreams
+deploy*/
+ip/

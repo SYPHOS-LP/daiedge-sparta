@@ -1,0 +1,40 @@
+# ============================================================================
+# RMSNorm component configuration
+#
+# Independent component config: owns ONLY rmsnorm's own types + constants.
+# The generated header pulls in ap_int.h/ap_fixed.h, plus the one sanctioned
+# cross-component include (encoder_types.h, see `includes:` below).
+#
+# See inc/layers/rmsnorm.h for the layer's functionality.
+#
+# Generated to config/inc/rmsnorm_cfg.h by scripts/gen_layer_config.py.
+# ============================================================================
+
+includes:
+  - encoder_types.h
+
+defines:
+  # layer dimensions (MAX for buffer sizing; actual counts are runtime args)
+  - { name: RMS_FEATURE_W_MAX, value: 768, comment: "maximum feature width (rows, feature-major layout)" }
+  - { name: RMS_TOKEN_W_MAX,   value: 50,  comment: "maximum token width (columns)" }
+  # --- optional packed URAM output (encoder path; matches MHA/MLP bank layout) ---
+  - { name: RMS_BANK_PACK,      value: 8, comment: "int8 lanes per packed URAM word (= MHA/MLP_BANK_PACK)" }
+  - { name: RMS_BANK_WORD_BITS, value: "(RMS_BANK_PACK * 8)", comment: "64-bit packed word" }
+  - { name: RMS_BANK_PAD_TOK,   value: "(((RMS_TOKEN_W_MAX + RMS_BANK_PACK - 1) / RMS_BANK_PACK) * RMS_BANK_PACK)", comment: "tokens padded to multiple of PACK (197->200)" }
+  - { name: RMS_BANK_ROW_WORDS, value: "(RMS_BANK_PAD_TOK / RMS_BANK_PACK)", comment: "packed words per feature row (25)" }
+  - { name: RMS_EPS, value: 1e-6f, comment: "epsilon added to mean-square before rsqrt" }
+  # rsqrt LUT variant selector constants + the active choice
+  - { name: RMS_RSQRT_UNIFORM, value: 1 }
+  - { name: RMS_RSQRT_LOG,     value: 2 }
+  - { name: RMS_RSQRT_EXPMANT, value: 3 }
+  - { name: RMS_RSQRT_VARIANT, value: RMS_RSQRT_EXPMANT, comment: "active variant: exponent-mantissa (search-free; removes the binary-search critical path). See docs/exploration/expmant_lut_explained.md" }
+  # rsqrt table size: 2^addr_bits entries
+  - { name: RMS_LUT_ADDR_BITS, value: 8, comment: "256 entries (Exp-Mant mantissa addr). Reduced 16->8: max rel err 0.045%->0.098%, still < the old log-LUT's 0.205% and far under the architectural floor. Ablation: docs/exploration/expmant_lut_explained.md" }
+  - { name: RMS_LUT_SIZE, value: "(1 << RMS_LUT_ADDR_BITS)" }
+
+types:
+  - { name: T_RmsBankWord, kind: ap_uint, width_expr: "RMS_BANK_WORD_BITS", comment: "packed URAM bank word: RMS_BANK_PACK int8 (encoder packed-output path)" }
+  # internal fixed-point datapath (no float in hardware)
+  - { name: T_RmsSq,    kind: ap_ufixed, total: 56, int: 26, comment: "x^2 + mean-square accumulator (30 frac bits; eps=1e-6 representable)" }
+  - { name: T_RmsRsqrt, kind: ap_ufixed, total: 28, int: 12, comment: "1/sqrt(ms) in [~0.25,~1000]" }
+  - { name: T_RmsNorm,  kind: ap_fixed,  total: 32, int: 16, comment: "x*rsqrt working value" }
