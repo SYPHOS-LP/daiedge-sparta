@@ -1,0 +1,99 @@
+# ============================================================================
+# MLP component configuration
+#
+# Independent component config: owns ONLY the MLP's own types + constants.
+# The generated header pulls in ap_int.h/ap_fixed.h, plus the one sanctioned
+# cross-component include (encoder_types.h, see `includes:` below).
+#
+# See inc/layers/mlp.h for the layer's functionality.
+#
+# Generated to config/inc/mlp_cfg.h by scripts/gen_layer_config.py.
+# ============================================================================
+
+includes:
+  - encoder_types.h
+
+defines:
+  # --- layer dimensions (MAX for buffer sizing; actual counts are runtime args) ---
+  - { name: MLP_FEATURE_W_MAX,        value: 768,    comment: "maximum feature width (rows, feature-major layout)" }
+  - { name: MLP_TOKEN_W_MAX,          value: 50,     comment: "maximum token width (columns)" }
+  - { name: MLP_HIDDEN_FEATURE_W_MAX, value: 3072,   comment: "maximum hidden width (rows of H)" }
+  - { name: MLP_HIDDEN_NNZ_MAX,       value: 153600, comment: "on-chip H cache capacity" }
+  - { name: MLP_FEATURE_OUT_W_MAX,    value: 768,    comment: "output feature width (rows of Y = cols of W2^T)" }
+
+  # --- sparse format ---
+  - { name: MLP_SPARSE_FORMAT_CSR, value: 1, comment: "CSR format guard for the MLP decode path" }
+
+  # --- stage 1 (fused_sdmm_relu: H=ReLU(W1.X), sparsified to CSR) parallelism ---
+  - { name: MLP_MAC_UNROLL,   value: 16, comment: "on-chip MAC lanes over batch + bank partition (>=2, power of two)" }
+  - { name: MLP_ROW_PARALLEL, value: 4,  comment: "hidden-row PEs computed concurrently (fused MAC loop)" }
+
+  # --- stage 2 (H-driven: Y = W2.H, walk H sequentially, scatter via W2 columns) ---
+  # Output-row fan-out: P scatter PEs each own a CONTIGUOUS out_row slice + its own acc bank
+  # and its own per-slice W2 CSC (staged split by out_row). H is a single BROADCAST stream (read
+  # once per iteration, shared read-only across lanes). The P lanes fuse into ONE II=1 scatter
+  # loop (distinct acc URAMs + distinct W2 arrays -> no shared port -> co-scheduled, not serial).
+  # W2 nonzeros are ~evenly distributed across the out_row range (measured: P=2 -> 1.86x, P=4 ->
+  # 3.33x achievable), so contiguous slices need no rebalancing.
+  - { name: MLP_OUT_ROW_PARALLEL, value: 2, comment: "output-row scatter PEs (own acc bank + own per-slice W2 CSC; H broadcast)" }
+  - { name: MLP_OUT_ROW_SLICE,    value: "((MLP_FEATURE_OUT_W_MAX + MLP_OUT_ROW_PARALLEL - 1) / MLP_OUT_ROW_PARALLEL)", comment: "out_rows owned per PE (768/2=384; ceil so P need not divide d_out)" }
+  # Per-slice CSC packs that slice's nonzeros CONTIGUOUSLY across all columns (no per-column
+  # flush), so per-PE words = ceil(nnz_p/PACK). Measured worst slice is ~53% of total at P=2
+  # (~25k words); size each to the FULL W2 word count so ANY imbalance is safe (static weight,
+  # zero overflow risk). URAM cost: ~12 URAM/copy; P=2 fits (26->~38 of 64).
+  - { name: MLP_W2_WORDS_PE,      value: "MLP_W2_WORDS", comment: "packed W2 words per per-slice CSC (sized to full W2 -> overflow-proof for any out_row imbalance)" }
+
+  # --- per-row weight-decode buffer depths ---
+  - { name: MLP_MAX_W1_NNZ, value: 512,  comment: "W1 per-row decode-buffer depth" }
+  - { name: MLP_MAX_W2_NNZ, value: 3072, comment: "W2 per-row decode-buffer depth" }
+
+  # --- H-driven stage-2: W2 stored COLUMN-major (CSC), staged whole on-chip once ---
+  # W2 is a STATIC weight, so its nnz is exact and compile-time known (no margin needed).
+  - { name: MLP_MAX_W2_TOTAL_NNZ, value: 235920, comment: "full W2 CSC nnz staged on-chip (exact measured max; static weight)" }
+
+  # Output-row tiling for the H-driven accumulator: a full acc[768][197] int32 overflows
+  # URAM (HLS stores 1 elem/URAM-row), so output rows are processed in bands and the
+  # accumulators are PACKED MLP_ACC_PACK int20 lanes per word along the token axis.
+  - { name: MLP_ACC_PACK,      value: 3,  comment: "int20 accumulators packed per acc URAM word (token axis; 3*20=60b)" }
+  - { name: MLP_ACC_BITS,      value: 20, comment: "packed acc lane width (max |acc| ~273k < 2^19)" }
+  - { name: MLP_ACC_WORD_BITS, value: "(MLP_ACC_PACK * MLP_ACC_BITS)", comment: "packed acc URAM word width (3*20=60b)" }
+  - { name: MLP_ACC_PAD_TOK,   value: "(((MLP_TOKEN_W_MAX + MLP_ACC_PACK - 1) / MLP_ACC_PACK) * MLP_ACC_PACK)", comment: "batch padded to a multiple of MLP_ACC_PACK (50->51)" }
+  - { name: MLP_ACC_ROW_WORDS, value: "(MLP_ACC_PAD_TOK / MLP_ACC_PACK)", comment: "packed acc words per output row (51/3=17)" }
+
+  # W2 CSC packed into wide URAM words: MLP_W2_PACK nonzeros of {row(10b):val(4b)} per word,
+  # sized so the lanes fill the 72-bit URAM word (5*14=70b).
+  - { name: MLP_W2_PACK,      value: 5,  comment: "W2 CSC nonzeros packed per URAM word (5*14=70b fills the 72b URAM word)" }
+  - { name: MLP_W2_LANE_BITS, value: 14, comment: "bits per packed W2 nonzero: {row(10b) : val(4b)}" }
+  - { name: MLP_W2_WORD_BITS, value: "(MLP_W2_PACK * MLP_W2_LANE_BITS)", comment: "packed W2 URAM word width (5*14=70b)" }
+  - { name: MLP_W2_WORDS,     value: "((MLP_MAX_W2_TOTAL_NNZ + MLP_W2_PACK - 1) / MLP_W2_PACK)", comment: "packed W2 word count (ceil nnz/PACK)" }
+
+  # --- banked activation tier in PACKED URAM (frees the cyclic-partitioned BRAM) ---
+  - { name: MLP_BANK_PACK,      value: 8, comment: "int8 lanes packed per URAM word (64-bit)" }
+  - { name: MLP_ACT_ELEM_BITS,  value: 8, comment: "activation bit width (int8)" }
+  - { name: MLP_BANK_WORD_BITS, value: "(MLP_BANK_PACK * MLP_ACT_ELEM_BITS)", comment: "64-bit packed bank word" }
+  - { name: MLP_BANK_PAD_TOK,   value: "(((MLP_TOKEN_W_MAX + MLP_BANK_PACK - 1) / MLP_BANK_PACK) * MLP_BANK_PACK)", comment: "batch padded up to a multiple of MLP_BANK_PACK (50->56)" }
+  - { name: MLP_BANK_ROW_WORDS, value: "(MLP_BANK_PAD_TOK / MLP_BANK_PACK)", comment: "packed words per feature row (56/8=7)" }
+  - { name: MLP_BANK_WORDS,     value: "(MLP_FEATURE_W_MAX * MLP_BANK_ROW_WORDS)", comment: "total packed words in the bank (768*7)" }
+  - { name: MLP_BANK_CYCLIC,    value: "(MLP_MAC_UNROLL / MLP_BANK_PACK)", comment: "word-array cyclic factor = words per MAC-wide read (16/8=2)" }
+
+  # --- loop tripcounts: latency ESTIMATION only (ViT MLP @ ~90% weight sparsity) ---
+  - { name: MLP_TC_HIDDEN_FEATURE, value: 3072, comment: "hidden rows (H_ROW_LOOP)" }
+  - { name: MLP_TC_FEATURE_OUT,    value: 768,  comment: "output rows (Y_ROW_LOOP) = d_out" }
+  - { name: MLP_TC_BATCH,          value: 50,   comment: "samples / dense row width" }
+  - { name: MLP_TC_W1_NNZ,         value: 77,   comment: "nonzeros per W1 row (~10% of d_in=768)" }
+  - { name: MLP_TC_W2_NNZ,         value: 307,  comment: "nonzeros per W2 ROW (~10% of d_h=3072); W2-driven decode" }
+  - { name: MLP_TC_W2COL_NNZ,      value: 77,   comment: "nonzeros per W2 COLUMN (~10% of d_out=768); the H-driven scatter walks a column" }
+  - { name: MLP_TC_HIDDEN_NNZ,     value: 5,    comment: "nonzeros per H row (~10% of batch=50)" }
+
+types:
+  - { name: T_MlpWVal,  kind: ap_int,  width: 4,  comment: "on-chip decoded W value buffer (w4 weight, -7..+7)" }
+  - { name: T_MlpIndex, kind: ap_uint, width: 16, comment: "WEIGHT CSR column index (W1 spans MLP_FEATURE_W_MAX=768, W2 spans MLP_HIDDEN_FEATURE_W_MAX=3072); also the DDR element type — 16-bit keeps the DDR side byte-aligned" }
+  - { name: T_MlpHCol,  kind: ap_uint, width: 8,  comment: "on-chip H-cache column index: spans the token/batch dim (<= MLP_TOKEN_W_MAX=50 < 256), so 8-bit halves the H-cache col BRAM vs T_MlpIndex" }
+  - { name: T_MlpW1Col, kind: ap_uint, width: 10, comment: "on-chip decoded-W1-row col buffer: W1 col = input feature (< MLP_FEATURE_W_MAX=768 <= 1024), 10-bit shrinks the decode BRAM. DDR col stays 16-bit (T_MlpIndex)" }
+  - { name: T_MlpW2Col, kind: ap_uint, width: 12, comment: "on-chip decoded-W2-row col buffer: W2 col = hidden feature (< MLP_HIDDEN_FEATURE_W_MAX=3072 <= 4096), 12-bit shrinks the decode BRAM. DDR col stays 16-bit (T_MlpIndex)" }
+  - { name: T_MlpW2Row, kind: ap_uint, width: 10, comment: "on-chip W2 CSC row index (H-driven stage-2): the output row a W2 nonzero targets (< MLP_FEATURE_OUT_W_MAX=768 <= 1024)" }
+  - { name: T_MlpW2Word, kind: ap_uint, width_expr: "MLP_W2_WORD_BITS", comment: "packed W2 CSC URAM word: MLP_W2_PACK lanes of {row(10b):val(4b)}" }
+  - { name: T_MlpAccLane, kind: ap_int,  width_expr: "MLP_ACC_BITS", comment: "one packed acc accumulator lane (int20)" }
+  - { name: T_MlpAccWord, kind: ap_uint, width_expr: "MLP_ACC_WORD_BITS", comment: "packed acc URAM word: MLP_ACC_PACK int20 lanes (token axis)" }
+  - { name: T_MlpAcc,   kind: ap_int,  width: 32, comment: "MAC / scatter accumulator" }
+  - { name: T_MlpBankWord, kind: ap_uint, width_expr: "MLP_BANK_WORD_BITS", comment: "packed bank URAM word: MLP_BANK_PACK int8 activations (64-bit)" }

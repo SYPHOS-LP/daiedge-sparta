@@ -1,0 +1,21 @@
+# ============================================================================
+# Encoder layer configuration
+#
+# Independent component config: owns ONLY the layer's own config (dims).
+# The generated header pulls in ap_int.h/ap_fixed.h, plus the one sanctioned
+# cross-component include (encoder_types.h, see `includes:` below).
+#
+# See inc/top/encoder_layer.h for the layer's functionality.
+#
+# Generated to config/inc/encoder_layer_cfg.h by scripts/gen_layer_config.py.
+# ============================================================================
+
+includes:
+  - encoder_types.h
+
+defines:
+  # layer dimensions (MAX for buffer sizing; actual counts are runtime args)
+  - { name: ENC_FEATURE_W_MAX, value: 768, comment: "maximum feature width (rows, feature-major layout)" }
+  - { name: ENC_TOKEN_W_MAX,   value: 50, comment: "maximum token width (columns)" }
+
+types: []

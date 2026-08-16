@@ -1,0 +1,85 @@
+# ============================================================================
+# Inference config for the POT4 ViT SW model — TEMPLATE.
+#
+# This is the config that sim/emit_e2e.py and sim/full_model_infer.py / check_e2e.py
+# read (via _CFG in full_model_infer.py) to run the SW quant model over CIFAR-10 and
+# capture the exact HW input/output boundary.
+#
+# WHERE THIS FILE GOES:
+#   sim/full_model_infer.py reads it via _CFG, which resolves (relative to the sim/ dir) to:
+#       ../../sparta-sw/sparse_vit/cfgs/infer_pot4_local.toml
+#   i.e. it MUST live at:  <parent>/sparta-sw/sparse_vit/cfgs/infer_pot4_local.toml
+#   (sparta-sw is a sibling of sparta-hw; this is the standard location the code expects).
+#   It is machine-specific and not version-controlled in sparta-sw, so this template is
+#   checked into sparta-hw for reference.
+#
+# TO USE IT:
+#   1. Copy this file to  sparta-sw/sparse_vit/cfgs/infer_pot4_local.toml  (drop the .template suffix).
+#   2. Set the two <SET_ME> paths below for your machine.
+#   3. Everything else is model/quant architecture — leave as-is for the 1ee51p3s model.
+# ============================================================================
+
+device = "cpu"
+use_wandb = false
+
+[dataset]
+name = "cifar10"
+path = "<SET_ME: dir where CIFAR-10 is downloaded/cached, e.g. .../sparta-hw/sim/data>"
+
+[dataset.dataloader]
+batch_size = 8
+shuffle = false
+num_workers = 0
+drop_last = false
+
+[model]
+# The .pth checkpoint — SAME model as the quant_values.txt used by the HW compiler.
+path = "<SET_ME: .../sim/models/20260807/vit-base-cifar10-p16-finetuned-pruned-quant-test-1ee51p3s.pth>"
+
+[quant]
+method = "brevitas_ptq"
+quant_scope = "all_conv2d"
+eval_verbose = true
+eval_log_interval = 10
+calibrate_steps = 16
+use_gptq = true
+qat = true
+bits = 4
+abits = 8
+weight_per_tensor = true
+use_int_norm = false
+fuse_rms_norm = true
+weight_scale_po2 = true
+weight_weight_po2 = true
+act_scale_po2 = true
+export_qonnx = false
+
+[infer.model.embed]
+embed_type = "rgb"
+img_size = 224
+p_size = 16
+channels = 3
+use_cls = true
+use_dstl = false
+use_regs = 0
+pe_type = "haar"
+
+[infer.model.encoder]
+mode = "vit"
+N = 12
+h = 12
+d_in = 768
+d_hid = 3072
+activation = "relu"
+bias = false
+attn_type = "linear"
+norm_type = "rms_norm"
+dropout = 0.05
+dropout_attn = 0.05
+ffn_type = "mlp"
+
+[infer.model.task]
+num_classes = 10
+
+[other.log]
+log_sparsity = true

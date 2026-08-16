@@ -1,0 +1,19 @@
+# ============================================================================
+# HLS Build Configuration
+#
+# Device / clock / optimization settings read by scripts/hls_config_generator.py.
+# (Per-component data types and bounds live in config/yml/*.yaml.)
+# ============================================================================
+
+optimization:
+  strategy: "latency"                  # Options: "latency"
+
+hls:
+  target_clock_period_ns: 4.0          # Tight synth target (250MHz) to make the tool try hardest; silicon runs at 200MHz signoff
+  target_device: "xck26-sfvc784-2LV-c" # Target FPGA device
+
+# Preprocessor defines applied to every build (syn + csim + tb cflags).
+# POT_SHIFT_MAC: the POT4 model stores weights as {sign,exponent} bytes and the datapath
+# multiplies by SHIFTING. Required for the current HYBRID model.bin (the shipping baseline).
+defines:
+  - POT_SHIFT_MAC

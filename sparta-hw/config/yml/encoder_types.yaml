@@ -1,0 +1,13 @@
+# ============================================================================
+# Encoder shared types
+#
+# The SINGLE source of truth for the datatypes that every encoder sub-layer
+# (RMSNorm, MHA, MLP, and the two residual blocks) shares.  This is the ONE
+# sanctioned cross-component include (see each component's `includes:` key).
+#
+# Generated to config/inc/encoder_types.h by scripts/gen_layer_config.py.
+# ============================================================================
+
+types:
+  - { name: T_Activation, kind: ap_int,   width: 8,           comment: "int8 activation shared by every encoder layer (in/out, weights values, residual I/O)" }
+  - { name: T_Scale,      kind: ap_fixed, total: 32, int: 16, comment: "folded quantization scale: per-layer scales[] element + residual-add working value" }
