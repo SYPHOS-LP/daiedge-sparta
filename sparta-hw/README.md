@@ -178,4 +178,4 @@ see `sim/README.md`.
 
 ## License
 
-See [LICENSE](LICENSE).
+See [LICENSE](https://github.com/SYPHOS-LP/daiedge-sparta/blob/main/LICENSE)
