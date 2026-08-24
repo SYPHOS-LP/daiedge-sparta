@@ -66,7 +66,8 @@ void encoder_mlp_block(
     T_Activation* w1_values, T_MlpIndex* w1_col_idx, int* w1_row_ptr,
     T_Activation* w2_values, T_MlpIndex* w2_col_idx, int* w2_row_ptr,
     const T_Scale*      scales,
-    T_Activation*       output
+    T_Activation*       output,
+    bool                w2_prestaged = false
 );
 
 /**

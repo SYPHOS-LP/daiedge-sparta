@@ -44,8 +44,8 @@ defines:
   - { name: MLP_W2_WORDS_PE,      value: "MLP_W2_WORDS", comment: "packed W2 words per per-slice CSC (sized to full W2 -> overflow-proof for any out_row imbalance)" }
 
   # --- per-row weight-decode buffer depths ---
-  - { name: MLP_MAX_W1_NNZ, value: 512,  comment: "W1 per-row decode-buffer depth" }
-  - { name: MLP_MAX_W2_NNZ, value: 3072, comment: "W2 per-row decode-buffer depth" }
+  - { name: MLP_MAX_W1_NNZ, value: 271,  comment: "W1 per-row decode-buffer depth" }
+  - { name: MLP_MAX_W2_NNZ, value: 641,  comment: "W2 per-column decode depth" }
 
   # --- H-driven stage-2: W2 stored COLUMN-major (CSC), staged whole on-chip once ---
   # W2 is a STATIC weight, so its nnz is exact and compile-time known (no margin needed).

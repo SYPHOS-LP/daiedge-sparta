@@ -13,13 +13,15 @@
 #     the HLS flow with package.output.format=ip_catalog
 #
 # Usage
-#   vivado -mode batch -source scripts/encoder_layer_kr260_bd.tcl
-#   vivado -mode batch -source scripts/encoder_layer_kr260_bd.tcl -tclargs 200
+#   vivado -mode batch -source scripts/encoder_layer_kr260_bd.tcl -tclargs <mhz> <dbg>
+#     arg 1: PL0 fabric clock in MHz (default 125)
+#     arg 2: dbg (0/1, default 0) -- when 1, use ip/encoder_layer_dbg + add the
+#            per-layer axi_timer.
 #
-#   arg 1: PL0 fabric clock in MHz (default 125)
-#
-# Vivado returns exit code 0 even when a sourced script errors, so check the
-# log for the final CHECKPOINT line rather than the exit status.
+# Vivado returns exit code 0 even when a sourced script errors, so check the log
+# for the final CHECKPOINT line rather than the exit status.  This script writes
+# DBG_TIMER_BASE (the timer's assigned AXI-Lite base) to the log for the host
+# --timer-base flag.
 # ============================================================================
 
 # ---- Build parameters ------------------------------------------------------
@@ -27,16 +29,22 @@
 # frequencies land in separate directories instead of overwriting each other's
 # implementation results.
 set pl0_mhz [expr {$argc >= 1 ? [lindex $argv 0] : 125}]
+# arg 2: dbg (0/1, default 0). When 1, build a diagnostic variant:
+#   - add an axi_timer on the kernel's ap_clk (PL0) so the host can read true
+#     ap_start->ap_done fabric cycles,
+#   - land in a separate project (enc_kr260_${mhz}mhz_dbg) so it never clobbers
+#     the signoff build's implementation results.
+set dbg [expr {$argc >= 2 ? [lindex $argv 1] : 0}]
 
 set repo_root  [file normalize [file dirname [info script]]/..]
 set proj_dir   "C:/vp"
-set proj_name  "enc_kr260_${pl0_mhz}mhz"
+set proj_name  [expr {$dbg ? "enc_kr260_${pl0_mhz}mhz_dbg" : "enc_kr260_${pl0_mhz}mhz"}]
 set bd_name    "enc_system"
 set cell_name  "enc_top_0"
-set ip_repo    "$repo_root/ip/encoder_layer"
+set ip_repo    [expr {$dbg ? "$repo_root/ip/encoder_layer_dbg" : "$repo_root/ip/encoder_layer"}]
 set board_part "xilinx.com:kr260_som:part0:1.1"
 
-puts "=== PL0 = ${pl0_mhz}MHz, project = $proj_dir/$proj_name ==="
+puts "=== PL0 = ${pl0_mhz}MHz, dbg = $dbg, project = $proj_dir/$proj_name ==="
 
 file mkdir $proj_dir
 create_project $proj_name $proj_dir/$proj_name -part xck26-sfvc784-2LV-c -force
@@ -89,6 +97,23 @@ apply_bd_automation -rule xilinx.com:bd_rule:axi4 \
     -config { Master "/zynq_ultra_ps_e_0/M_AXI_HPM0_LPD" Clk "Auto" } \
     [get_bd_intf_pins $cell_name/s_axi_control]
 
+# ---- Diagnostic AXI timer (issue #3) ---------------------------------------
+# A free-running 32-bit counter on the kernel's ap_clk (PL0), so the host can
+# read true ap_start->ap_done cycles instead of the Python wall-clock
+# that conflates compute with DDR staging and the ap_done poll loop.
+#
+# Slaved onto the same control master (M_AXI_HPM0_LPD) via automation with
+# Clk "Auto", so it reuses whatever PL0-derived clock the control path already
+# established rather than assuming a clock net name.  
+# Sharing the control master keeps the timer on ap_clk and adds no data-path traffic.
+if {$dbg} {
+    puts "\n=== dbg: adding axi_timer on ap_clk (PL0) ==="
+    create_bd_cell -type ip -vlnv xilinx.com:ip:axi_timer:2.0 axi_timer_0
+    apply_bd_automation -rule xilinx.com:bd_rule:axi4 \
+        -config { Master "/zynq_ultra_ps_e_0/M_AXI_HPM0_LPD" Clk "Auto" } \
+        [get_bd_intf_pins axi_timer_0/S_AXI]
+}
+
 # ---- Data path: 11 m_axi masters -> 5 PS slave ports ------------------------
 # Each entry is:  <PS port> {<primary master> {<additional masters>}}
 # Bundles are grouped to spread traffic: small load-once buffers together,
@@ -96,7 +121,7 @@ apply_bd_automation -rule xilinx.com:bd_rule:axi4 \
 # stream that produces it.
 set groups {
     S_AXI_HPC0_FPD {sc_mem      {in_mem}}
-    S_AXI_HPC1_FPD {y_mem       {h_mem}}
+    S_AXI_HPC1_FPD {y_mem       {}}
     S_AXI_HP0_FPD  {w_mha_mem   {qv_mem qc_mem}}
     S_AXI_HP1_FPD  {w1_mem      {kv_mem kc_mem}}
     S_AXI_HP2_FPD  {w2_mem      {}}
@@ -168,6 +193,23 @@ foreach {port_suffix spec} $groups {
 
 puts "\n=== Assigning addresses ==="
 assign_bd_address
+
+# Report the diagnostic timer's assigned base so the host knows where to read
+# TCR0. After assign_bd_address the offset lives on the mapped segment in the PS
+# master address space.
+if {$dbg} {
+    set tmr_seg [get_bd_addr_segs -quiet "/zynq_ultra_ps_e_0/Data/*axi_timer_0*"]
+    if {$tmr_seg eq ""} {
+        # fall back to any addr seg referencing the timer
+        set tmr_seg [get_bd_addr_segs -quiet -addressed "*axi_timer_0*"]
+    }
+    if {$tmr_seg ne ""} {
+        set tmr_base [get_property OFFSET [lindex $tmr_seg 0]]
+        puts "DBG_TIMER_BASE: $tmr_base"
+    } else {
+        puts "WARNING: could not resolve axi_timer_0 address segment (base is 0x80010000 per the auto-assign log)"
+    }
+}
 
 validate_bd_design
 save_bd_design

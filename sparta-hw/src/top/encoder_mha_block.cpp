@@ -44,7 +44,6 @@ void encoder_mha_block(
             tokens_dim,
             feature_dim,
             scales[SCALE_ATT_RMSNORM_OUT_INV_IDX],
-            (T_Activation*) nullptr,
             reinterpret_cast<T_RmsBankWord*>(norm_input));
 
     mha(norm_input,
@@ -58,10 +57,10 @@ void encoder_mha_block(
         k_val, k_col,
         hidden);
 
-    residual_add(input, 
+    residual_add(input,
                  hidden,
                  feature_dim * tokens_dim,
-                 scales[SCALE_ATT_RESIDUAL_IDX], 
+                 scales[SCALE_ATT_RESIDUAL_IDX],
                  scales[SCALE_ATT_BRANCH_RATIO_IDX],
                  hidden);
 }

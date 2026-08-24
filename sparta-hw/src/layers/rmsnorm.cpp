@@ -18,7 +18,6 @@ void rmsnorm (
     int                 tokens_dim,
     int                 feature_dim,
     T_Scale             inverse_output_scale,
-    T_Activation*       output,
     T_RmsBankWord*      packed_output
 ) {
 #pragma HLS INLINE off
@@ -83,19 +82,13 @@ void rmsnorm (
             T_RmsNorm input_norm   = (T_RmsNorm) input_row[f] * (T_RmsNorm) inv_rms;
             T_Activation quant_out = saturate_to_int8(input_norm * inverse_output_scale);
 
-            if (packed_output) {
-                /* Packed word index */
-                int word_idx = f * RMS_BANK_ROW_WORDS + word_col;
+            /* Packed word index */
+            int word_idx = f * RMS_BANK_ROW_WORDS + word_col;
 
-                /* Set this token's chunk within the URAM packed word. */
-                T_RmsBankWord word = packed_output[word_idx];
-                word.range(word_chunk * 8 + 7, word_chunk * 8) = (ap_uint<8>)quant_out;
-                packed_output[word_idx] = word;
-            } 
-            else {
-                /* Write directly to the output array. */
-                output[t * token_stride + f * feature_stride] = quant_out;
-            }
+            /* Set this token's chunk within the URAM packed word. */
+            T_RmsBankWord word = packed_output[word_idx];
+            word.range(word_chunk * 8 + 7, word_chunk * 8) = (ap_uint<8>)quant_out;
+            packed_output[word_idx] = word;
         }
     }
 }

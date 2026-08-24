@@ -33,8 +33,6 @@
  * @param tokens_dim             Number of tokens to normalize.
  * @param feature_dim            Features per token.
  * @param inverse_output_scale   Inverse output quantization scale (power-of-two shift).
- * @param output                 Output activations, in feature-major layout. Currently used
- *                               only for the dedicated testbench.
  * @param packed_output          Output activations packed into the URAM bank.
  */
 void rmsnorm(
@@ -42,7 +40,6 @@ void rmsnorm(
     int                 tokens_dim,
     int                 feature_dim,
     T_Scale             inverse_output_scale,
-    T_Activation*       output,
     T_RmsBankWord*      packed_output
 );
 

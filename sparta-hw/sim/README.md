@@ -21,13 +21,12 @@ the software predictions, the datapath is intact.
 ## Requirements
 
 - **Vitis HLS** with `vitis-run` and `v++` on `PATH` (stage 2 only).
-- **The software model**, which lives alongside the accelerator in this repository.
-  `full_model_infer.py` resolves it as `../../sparta-sw/sparse_vit/src` relative to
-  itself:
+- **The software model repository checked out next to this one.** `full_model_infer.py`
+  resolves it as `../../sparta-sw/sparse_vit/src` relative to itself:
 
   ```
-  daiedge-sparta/
-    sparta-hw/     <- the accelerator
+  <parent>/
+    sparta-hw/     <- this repository
     sparta-sw/     <- the software model
   ```
 

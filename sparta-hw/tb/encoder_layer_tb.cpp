@@ -186,11 +186,6 @@ static TestResult run_case(
     scales[SCALE_FF_RESIDUAL_IDX]         = (T_Scale)pot_scale(S_MLP_RES);
     scales[SCALE_FF_BRANCH_RATIO_IDX]     = (T_Scale)pot_scale(S_MLP_BRANCH);
 
-    /* On-chip Q'/K' CSR scratch: the kernel builds the ReLU-sparsified Q'/K' into
-     * these, so the caller owns the storage. Sized to the fully-dense worst case. */
-    std::vector<T_Activation>   qpv(MHA_MAX_QK_NNZ), kpv(MHA_MAX_QK_NNZ);
-    std::vector<T_MhaHeadIndex> qpc(MHA_MAX_QK_NNZ), kpc(MHA_MAX_QK_NNZ);
-
     encoder_layer_top(
         x.data(),
         D, N, d_h,
@@ -203,7 +198,7 @@ static TestResult run_case(
         scales.data(),
         qpv.data(), qpc.data(),
         kpv.data(), kpc.data(),
-        h.data(), y.data());
+        y.data());
 
     double maxerr=0; int off=0,worse=0;
     for(int i=0;i<D;i++) for(int t=0;t<N;t++){
