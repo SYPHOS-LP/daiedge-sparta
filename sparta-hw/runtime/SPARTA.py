@@ -53,13 +53,6 @@ ACT_ELEMS = ENC_D * ENC_N   # feature-major int8 activation buffer size
 # the full dense grid -- overflow-proof at any sparsity rather than an assumed
 # density.  q_col/k_col are T_MhaHeadIndex (8-bit) on this baseline.
 MHA_MAX_QK_NNZ = 38400
-MHA_N_HEADS     = 12   # attention heads          (config/inc/mha_cfg.h)
-MHA_FEATURE_HEAD = 64  # per-head feature width   (MHA_FEATURE_W_MAX / MHA_N_HEADS)
-
-# PL0 fabric clock the bitstream was built for (MHz). Used only to convert the
-# diagnostic AXI-timer's fabric-cycle count to time; override with --pl0-mhz if a
-# bitstream at another frequency is loaded.
-PL0_MHZ = 200.0
 
 
 # ============================================================================
