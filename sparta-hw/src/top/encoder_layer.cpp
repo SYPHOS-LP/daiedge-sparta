@@ -10,6 +10,35 @@
 #include <cassert>
 #endif
 
+/* Helper function that overlaps the MHA computations with the preloading of the 
+ * W2 weights into on-chip memory.
+ */
+static void mha_block_and_w2_prestage(
+    const T_Activation* input, int tokens_dim, int feature_dim,
+    T_Activation* wq_values, T_MhaIndex* wq_col_idx, int* wq_row_ptr,
+    T_Activation* wk_values, T_MhaIndex* wk_col_idx, int* wk_row_ptr,
+    T_Activation* wv_values, T_MhaIndex* wv_col_idx, int* wv_row_ptr,
+    T_Activation* wo_values, T_MhaIndex* wo_col_idx, int* wo_row_ptr,
+    const T_Scale* layer_scales,
+    T_Activation* q_val, T_MhaHeadIndex* q_col,
+    T_Activation* k_val, T_MhaHeadIndex* k_col,
+    T_Activation* hidden,
+    T_Activation* w2_values, T_MlpIndex* w2_col_idx, int* w2_row_ptr,
+    int intermediate_dim
+) {
+#pragma HLS INLINE off
+#pragma HLS DATAFLOW
+    encoder_mha_block(input, tokens_dim, feature_dim,
+                      wq_values, wq_col_idx, wq_row_ptr,
+                      wk_values, wk_col_idx, wk_row_ptr,
+                      wv_values, wv_col_idx, wv_row_ptr,
+                      wo_values, wo_col_idx, wo_row_ptr,
+                      layer_scales,
+                      q_val, q_col, k_val, k_col,
+                      hidden);
+    mlp_stage_w2(w2_values, w2_col_idx, w2_row_ptr, intermediate_dim);
+}
+
 // The layer dims are the single source of truth for both sub-blocks; assert the
 // per-block config literals agree so they cannot drift across the config headers.
 static_assert(ENC_FEATURE_W_MAX == ENC_MHA_FEATURE_W_MAX && ENC_FEATURE_W_MAX == ENC_MLP_FEATURE_W_MAX,
@@ -30,39 +59,36 @@ void encoder_layer_top(
     T_Activation* w2_values, T_MlpIndex* w2_col_idx, int* w2_row_ptr,
     const T_Scale* scales,
     /* DDR-resident activation scratch: Q'/K' val/col (full grid D*N).  Q'/K' row pointers
-     * are on-chip in mha() (produced+consumed there).  The MLP's hidden H no longer needs a
-     * DDR bundle: it streams producer->consumer on-chip in the MLP's DATAFLOW region. */
+     * are on-chip in mha() (produced+consumed there).  */
     T_Activation* q_val, T_MhaHeadIndex* q_col,
     T_Activation* k_val, T_MhaHeadIndex* k_col,
-    T_Activation* hidden,
     T_Activation* output
 ) {
     #pragma HLS INTERFACE s_axilite port=return     bundle=control
     #pragma HLS INTERFACE s_axilite port=tokens_dim bundle=control
-    #pragma HLS INTERFACE m_axi port=scales bundle=sc_mem depth=SCALE_IDX_MAX num_read_outstanding=2 num_write_outstanding=2
+    #pragma HLS INTERFACE m_axi port=scales bundle=sc_mem depth=SCALE_IDX_MAX num_read_outstanding=16 num_write_outstanding=2 max_read_burst_length=256
     #pragma HLS INTERFACE s_axilite port=intermediate_dim bundle=control
     #pragma HLS INTERFACE s_axilite port=feature_dim      bundle=control
-    #pragma HLS INTERFACE m_axi port=input     bundle=in_mem depth=(ENC_FEATURE_W_MAX*ENC_TOKEN_W_MAX) num_read_outstanding=2 num_write_outstanding=2
-    #pragma HLS INTERFACE m_axi port=wq_values  bundle=w_mha_mem depth=MAX_NNZ num_read_outstanding=2 num_write_outstanding=2
-    #pragma HLS INTERFACE m_axi port=wq_col_idx bundle=w_mha_mem depth=MAX_NNZ num_read_outstanding=2 num_write_outstanding=2
-    #pragma HLS INTERFACE m_axi port=wq_row_ptr bundle=w_mha_mem depth=MAX_ROWS+1 num_read_outstanding=2 num_write_outstanding=2
-    #pragma HLS INTERFACE m_axi port=wk_values  bundle=w_mha_mem depth=MAX_NNZ num_read_outstanding=2 num_write_outstanding=2
-    #pragma HLS INTERFACE m_axi port=wk_col_idx bundle=w_mha_mem depth=MAX_NNZ num_read_outstanding=2 num_write_outstanding=2
-    #pragma HLS INTERFACE m_axi port=wk_row_ptr bundle=w_mha_mem depth=MAX_ROWS+1 num_read_outstanding=2 num_write_outstanding=2
-    #pragma HLS INTERFACE m_axi port=wv_values  bundle=w_mha_mem depth=MAX_NNZ num_read_outstanding=2 num_write_outstanding=2
-    #pragma HLS INTERFACE m_axi port=wv_col_idx bundle=w_mha_mem depth=MAX_NNZ num_read_outstanding=2 num_write_outstanding=2
-    #pragma HLS INTERFACE m_axi port=wv_row_ptr bundle=w_mha_mem depth=MAX_ROWS+1 num_read_outstanding=2 num_write_outstanding=2
-    #pragma HLS INTERFACE m_axi port=wo_values  bundle=w_mha_mem depth=MAX_NNZ num_read_outstanding=2 num_write_outstanding=2
-    #pragma HLS INTERFACE m_axi port=wo_col_idx bundle=w_mha_mem depth=MAX_NNZ num_read_outstanding=2 num_write_outstanding=2
-    #pragma HLS INTERFACE m_axi port=wo_row_ptr bundle=w_mha_mem depth=MAX_ROWS+1 num_read_outstanding=2 num_write_outstanding=2
-    #pragma HLS INTERFACE m_axi port=w1_values  bundle=w1_mem depth=MAX_NNZ num_read_outstanding=2 num_write_outstanding=2
-    #pragma HLS INTERFACE m_axi port=w1_col_idx bundle=w1_mem depth=MAX_NNZ num_read_outstanding=2 num_write_outstanding=2
-    #pragma HLS INTERFACE m_axi port=w1_row_ptr bundle=w1_mem depth=MAX_ROWS+1 num_read_outstanding=2 num_write_outstanding=2
-    #pragma HLS INTERFACE m_axi port=w2_values  bundle=w2_mem depth=MAX_NNZ num_read_outstanding=2 num_write_outstanding=2
-    #pragma HLS INTERFACE m_axi port=w2_col_idx bundle=w2_mem depth=MAX_NNZ num_read_outstanding=2 num_write_outstanding=2
-    #pragma HLS INTERFACE m_axi port=w2_row_ptr bundle=w2_mem depth=MAX_ROWS+1 num_read_outstanding=2 num_write_outstanding=2
-    #pragma HLS INTERFACE m_axi port=hidden bundle=h_mem depth=(ENC_FEATURE_W_MAX*ENC_TOKEN_W_MAX) num_read_outstanding=2 num_write_outstanding=2
-    #pragma HLS INTERFACE m_axi port=output bundle=y_mem depth=(ENC_FEATURE_W_MAX*ENC_TOKEN_W_MAX) num_read_outstanding=2 num_write_outstanding=2
+    #pragma HLS INTERFACE m_axi port=input     bundle=in_mem depth=(ENC_FEATURE_W_MAX*ENC_TOKEN_W_MAX) num_read_outstanding=16 num_write_outstanding=2 max_read_burst_length=256
+    #pragma HLS INTERFACE m_axi port=wq_values  bundle=w_mha_mem depth=MAX_NNZ num_read_outstanding=4 num_write_outstanding=2 max_read_burst_length=256
+    #pragma HLS INTERFACE m_axi port=wq_col_idx bundle=w_mha_mem depth=MAX_NNZ num_read_outstanding=4 num_write_outstanding=2 max_read_burst_length=256
+    #pragma HLS INTERFACE m_axi port=wq_row_ptr bundle=w_mha_mem depth=MAX_ROWS+1 num_read_outstanding=4 num_write_outstanding=2 max_read_burst_length=256
+    #pragma HLS INTERFACE m_axi port=wk_values  bundle=w_mha_mem depth=MAX_NNZ num_read_outstanding=4 num_write_outstanding=2 max_read_burst_length=256
+    #pragma HLS INTERFACE m_axi port=wk_col_idx bundle=w_mha_mem depth=MAX_NNZ num_read_outstanding=4 num_write_outstanding=2 max_read_burst_length=256
+    #pragma HLS INTERFACE m_axi port=wk_row_ptr bundle=w_mha_mem depth=MAX_ROWS+1 num_read_outstanding=4 num_write_outstanding=2 max_read_burst_length=256
+    #pragma HLS INTERFACE m_axi port=wv_values  bundle=w_mha_mem depth=MAX_NNZ num_read_outstanding=4 num_write_outstanding=2 max_read_burst_length=256
+    #pragma HLS INTERFACE m_axi port=wv_col_idx bundle=w_mha_mem depth=MAX_NNZ num_read_outstanding=4 num_write_outstanding=2 max_read_burst_length=256
+    #pragma HLS INTERFACE m_axi port=wv_row_ptr bundle=w_mha_mem depth=MAX_ROWS+1 num_read_outstanding=4 num_write_outstanding=2 max_read_burst_length=256
+    #pragma HLS INTERFACE m_axi port=wo_values  bundle=w_mha_mem depth=MAX_NNZ num_read_outstanding=4 num_write_outstanding=2 max_read_burst_length=256
+    #pragma HLS INTERFACE m_axi port=wo_col_idx bundle=w_mha_mem depth=MAX_NNZ num_read_outstanding=4 num_write_outstanding=2 max_read_burst_length=256
+    #pragma HLS INTERFACE m_axi port=wo_row_ptr bundle=w_mha_mem depth=MAX_ROWS+1 num_read_outstanding=4 num_write_outstanding=2 max_read_burst_length=256
+    #pragma HLS INTERFACE m_axi port=w1_values  bundle=w1_mem depth=MAX_NNZ num_read_outstanding=16 num_write_outstanding=2 max_read_burst_length=256
+    #pragma HLS INTERFACE m_axi port=w1_col_idx bundle=w1_mem depth=MAX_NNZ num_read_outstanding=16 num_write_outstanding=2 max_read_burst_length=256
+    #pragma HLS INTERFACE m_axi port=w1_row_ptr bundle=w1_mem depth=MAX_ROWS+1 num_read_outstanding=16 num_write_outstanding=2 max_read_burst_length=256
+    #pragma HLS INTERFACE m_axi port=w2_values  bundle=w2_mem depth=MAX_NNZ num_read_outstanding=16 num_write_outstanding=2 max_read_burst_length=256
+    #pragma HLS INTERFACE m_axi port=w2_col_idx bundle=w2_mem depth=MAX_NNZ num_read_outstanding=16 num_write_outstanding=2 max_read_burst_length=256
+    #pragma HLS INTERFACE m_axi port=w2_row_ptr bundle=w2_mem depth=MAX_ROWS+1 num_read_outstanding=16 num_write_outstanding=2 max_read_burst_length=256
+    #pragma HLS INTERFACE m_axi port=output bundle=y_mem depth=(ENC_FEATURE_W_MAX*ENC_TOKEN_W_MAX) num_read_outstanding=16 num_write_outstanding=16 max_read_burst_length=256 max_write_burst_length=256
     /* DDR-resident activation scratch: Q'/K' + H (single region each). */
     /* Each CSR array on its OWN bundle: sharing a bundle across val/col/ptr blocks HLS bursting
      * ("multiple potential writes to the same bundle in the same region"). One array per bundle
@@ -86,26 +112,30 @@ void encoder_layer_top(
         layer_scales[i] = scales[i];
     }
 
-    /* hidden = input + MHA(RMSNorm(input)) */
-    encoder_mha_block(input,
-                      tokens_dim,
-                      feature_dim,
-                      wq_values, wq_col_idx, wq_row_ptr,
-                      wk_values, wk_col_idx, wk_row_ptr,
-                      wv_values, wv_col_idx, wv_row_ptr,
-                      wo_values, wo_col_idx, wo_row_ptr,
-                      layer_scales,
-                      q_val, q_col,
-                      k_val, k_col,
-                      hidden);
+    /* On-chip intermediate ("hidden") activation. */
+    static T_Activation hidden_oc[ENC_FEATURE_W_MAX * ENC_TOKEN_W_MAX];
+    #pragma HLS BIND_STORAGE variable=hidden_oc type=ram_t2p impl=bram
+
+    /* hidden = input + MHA(RMSNorm(input)), with W2 CSC staging overlapped. */
+    mha_block_and_w2_prestage(input, tokens_dim, feature_dim,
+                              wq_values, wq_col_idx, wq_row_ptr,
+                              wk_values, wk_col_idx, wk_row_ptr,
+                              wv_values, wv_col_idx, wv_row_ptr,
+                              wo_values, wo_col_idx, wo_row_ptr,
+                              layer_scales,
+                              q_val, q_col, k_val, k_col,
+                              hidden_oc,
+                              w2_values, w2_col_idx, w2_row_ptr,
+                              intermediate_dim);
 
     /* output = hidden + MLP(RMSNorm(hidden)) */
-    encoder_mlp_block(hidden,
+    encoder_mlp_block(hidden_oc,
                       tokens_dim,
                       feature_dim,
                       intermediate_dim,
                       w1_values, w1_col_idx, w1_row_ptr,
                       w2_values, w2_col_idx, w2_row_ptr,
                       layer_scales,
-                      output);
+                      output,
+                      true);
 }

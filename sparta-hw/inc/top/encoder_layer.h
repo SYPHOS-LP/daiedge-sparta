@@ -116,7 +116,6 @@
  * @param[in] w2_row_ptr       CSR row pointers for MLP FC2 weight.
 
  * @param[in] scales           Per-layer folded scales.
- * @param[in, out] hidden      DDR scratch for the attention output / feed-forward input, D x N int8.
  * @param[out] output          Layer output, D x N feature-major int8 (DDR).
  */
 void encoder_layer_top(
@@ -133,7 +132,6 @@ void encoder_layer_top(
     const T_Scale *scales,
     T_Activation *q_val, T_MhaHeadIndex *q_col,
     T_Activation *k_val, T_MhaHeadIndex *k_col,
-    T_Activation  *hidden,
     T_Activation  *output
 );
 

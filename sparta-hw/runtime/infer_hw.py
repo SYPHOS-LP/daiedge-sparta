@@ -179,19 +179,25 @@ class HwEncoder:
     """
 
     def __init__(self, model_dir, bitstream=None, instance=None, download=False,
-                 base_addr=None, debug_dir=None, verbose=False):
+                 base_addr=None, debug_dir=None, verbose=False, dbg_nnz=False,
+                 timer_base=None):
         from pynq import allocate
         from SPARTALoader import Loader
 
         self._allocate = allocate
         self.debug_dir = debug_dir
         self.verbose = verbose
+
+        # List for accumulating per-layer fabric-cycle samples
+        self.layer_cycles = {}
+
         if debug_dir:
             os.makedirs(debug_dir, exist_ok=True)
         # HwKernel is the hardware seam: attaches to (or programs) the PL and
         # owns the AXI-Lite control registers.
         self.kernel = SPARTA.HwKernel(bitstream, instance=instance,
-                                      download=download, base_addr=base_addr)
+                                      download=download, base_addr=base_addr,
+                                      timer_base=timer_base)
         self.overlay = self.kernel.overlay      # None on the attach path
         if verbose:
             print(f"  control base {self.kernel._base_addr_str()}, "
@@ -208,7 +214,6 @@ class HwEncoder:
         n = SPARTA.ACT_ELEMS
         self.a = allocate(shape=(n,), dtype=np.int8)
         self.b = allocate(shape=(n,), dtype=np.int8)
-        self.h = allocate(shape=(n,), dtype=np.int8)
         q = SPARTA.MHA_MAX_QK_NNZ
         self.scratch = {
             "q_val": allocate(shape=(q,), dtype=np.int8),
@@ -252,20 +257,27 @@ class HwEncoder:
             t0 = time.monotonic()
             lb = SPARTA._stage_layer(self._allocate, layer)
             t_stage = time.monotonic() - t0
-            args = SPARTA._build_args(x_buf, self.h, y_buf, lb, self.scratch,
+            args = SPARTA._build_args(x_buf, y_buf, lb, self.scratch,
                                       SPARTA.ENC_N, SPARTA.ENC_D, d_h)
             if self.verbose:
                 print(f" {t_stage:.1f}s; invoking kernel...", end="", flush=True)
-            t0 = time.monotonic()
+
             try:
-                self.kernel.invoke(args)
+                t_run = self.kernel.invoke(args)
             except TimeoutError as e:
                 if self.verbose:
                     print(" TIMEOUT")
                 raise RuntimeError(f"encoder layer {L} hung: {e}") from e
-            t_run = time.monotonic() - t0
+
+            cyc = getattr(self.kernel, "last_cycles", None)
             if self.verbose:
                 print(f" done in {t_run:.3f}s")
+            if cyc is not None:
+                # Collect per-layer fabric cycles so main() can report a per-layer
+                # mean at the end.  The verbose per-invoke [dbg-cyc] line is gated.
+                self.layer_cycles.setdefault(L, []).append(int(cyc))
+                if self.verbose:
+                    print(f"  [dbg-cyc] L{L:02d} fabric_cycles={cyc}")
             y_buf.sync_from_device()
             if debug_tag is not None and self.debug_dir is not None:
                 self._dump(debug_tag, L, y_buf)
@@ -286,7 +298,7 @@ class HwEncoder:
 
     def close(self):
         self.kernel.close()
-        for b in (self.a, self.b, self.h, *self.scratch.values()):
+        for b in (self.a, self.b, *self.scratch.values()):
             b.freebuffer()
 
 
@@ -311,6 +323,8 @@ def main():
                     help=f"s_axi_control base address when attaching "
                          f"(default 0x{SPARTA.HwKernel.CONTROL_BASE:08x})")
     ap.add_argument("--images", type=int, default=10, help="how many images to run")
+    ap.add_argument("--verbose", "-v", action="store_true",
+                    help="Control verbosity.")
     ap.add_argument("--layers", type=int, default=None,
                     help="run only the first N encoder layers (default: all). "
                          "Bring-up aid: the prediction is meaningless when the "
@@ -326,6 +340,8 @@ def main():
                     help="skip the SW reference prediction (still needs the SW "
                          "forward pass to produce the encoder input, so this "
                          "only suppresses the comparison)")
+    ap.add_argument("--timer-base", default=None,
+                    help="base address of the diagnostic AXI timer, if present.")
     args = ap.parse_args()
 
     if args.download and not args.bitstream:
@@ -337,8 +353,10 @@ def main():
 
     # Progress logging: the SW model load takes minutes on the board, so
     # without these a slow start is indistinguishable from a hang.
+    # Gated behind --verbose.
     def step(msg):
-        print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+        if args.verbose:
+            print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
     step(f"loading config {args.cfg}")
     cfg = toml.load(args.cfg)
@@ -357,7 +375,8 @@ def main():
                    download=args.download,
                    base_addr=int(args.base_addr, 0) if args.base_addr else None,
                    debug_dir=args.debug_dir if args.debug else None,
-                   verbose=True)
+                   verbose=args.verbose,
+                   timer_base=int(args.timer_base, 0) if args.timer_base else None)
     step("FPGA ready")
 
     if args.layers is not None:
@@ -409,9 +428,24 @@ def main():
               f"are a partial encoder, not a prediction.  SW accuracy "
               f"{correct_sw}/{n} is still valid (full SW model).")
     else:
-        print(f"\nagreement SW vs HW : {agree}/{n}")
-        print(f"accuracy  SW       : {correct_sw}/{n}")
-        print(f"accuracy  HW       : {correct_hw}/{n}")
+        print(f"\nAgreement SW vs HW : {agree}/{n}")
+        print(f"Accuracy  SW       : {correct_sw}/{n}")
+        print(f"Accuracy  HW       : {correct_hw}/{n}", flush=True)
+
+    # Per-layer MEAN latency in fabric clock cycles (mean over all images of that
+    # layer's invocations).  Always printed when cycle data is available (needs a
+    # --timer-base kernel); this is the compact default output alongside accuracy.
+    if hw.layer_cycles:
+        print("\nPer-layer mean latency (fabric cycles):")
+        all_means = []
+        for L in sorted(hw.layer_cycles):
+            samples = hw.layer_cycles[L]
+            mean = sum(samples) / len(samples)
+            all_means.append(mean)
+            print(f"  L{L:02d}  {mean:12,.0f} cyc")
+        overall = sum(all_means) / len(all_means)
+        print(f"  mean {overall:12,.0f} cyc/layer  "
+              f"(over {len(all_means)} layers x {n} image(s))", flush=True)
 
 
 if __name__ == "__main__":

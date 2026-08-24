@@ -140,11 +140,10 @@ int main(int argc, char** argv) {
                 w.scales.data(),
                 qpv.data(), qpc.data(),
                 kpv.data(), kpc.data(),
-                hidden.data(), nxt.data());
+                nxt.data());
             if (fdbg) {
-                std::vector<int8_t> th(XY), ty(XY);
-                for (int i = 0; i < XY; i++) { th[i] = (int8_t)hidden[i]; ty[i] = (int8_t)nxt[i]; }
-                std::fwrite(th.data(), 1, XY, fdbg);
+                std::vector<int8_t> ty(XY);
+                for (int i = 0; i < XY; i++) { ty[i] = (int8_t)nxt[i]; }
                 std::fwrite(ty.data(), 1, XY, fdbg);
             }
             cur.swap(nxt);

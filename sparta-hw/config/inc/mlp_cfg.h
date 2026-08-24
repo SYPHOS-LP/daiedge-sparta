@@ -21,8 +21,8 @@
 #define MLP_OUT_ROW_PARALLEL 2   // output-row scatter PEs (own acc bank + own per-slice W2 CSC; H broadcast)
 #define MLP_OUT_ROW_SLICE ((MLP_FEATURE_OUT_W_MAX + MLP_OUT_ROW_PARALLEL - 1) / MLP_OUT_ROW_PARALLEL)   // out_rows owned per PE (768/2=384; ceil so P need not divide d_out)
 #define MLP_W2_WORDS_PE MLP_W2_WORDS   // packed W2 words per per-slice CSC (sized to full W2 -> overflow-proof for any out_row imbalance)
-#define MLP_MAX_W1_NNZ 512   // W1 per-row decode-buffer depth
-#define MLP_MAX_W2_NNZ 3072   // W2 per-row decode-buffer depth
+#define MLP_MAX_W1_NNZ 271   // W1 per-row decode-buffer depth
+#define MLP_MAX_W2_NNZ 641   // W2 per-column decode depth
 #define MLP_MAX_W2_TOTAL_NNZ 235920   // full W2 CSC nnz staged on-chip (exact measured max; static weight)
 #define MLP_ACC_PACK 3   // int20 accumulators packed per acc URAM word (token axis; 3*20=60b)
 #define MLP_ACC_BITS 20   // packed acc lane width (max |acc| ~273k < 2^19)

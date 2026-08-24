@@ -36,13 +36,15 @@ static_assert(MHA_SCR_A_CNT      == MHA_FEATURE_HEAD * MHA_FEATURE_HEAD, "A cnt 
 // parallel_out_rows_compute manually unrolls the 8 packed lanes of a bank word.
 static_assert(MHA_BANK_PACK == 8, "code assumes MHA_BANK_PACK == 8");
 
-// Per-projection output-row parallelism.  Q'/K' were P=4 (a 66->60ms proj win) then dropped
-// to P=2 when the PESSIMISTIC LUT estimate (88-95%) said the H-driven MLP no longer fit.
-// RESTORED to 4: real Vivado LUT is only ~52% (the estimate was wrong), so the row-parallel
-// budget is back.  Parallelizes the 768 output rows (768/4 divides evenly) -- the RIGHT
-// dimension for the small-N model (token-unroll failed, rows are plentiful).
+// Per-projection output-row parallelism.
 #define MHA_PROJ_P     4
 #define MHA_PROJ_P_QK  4
+
+// Wide DDR read words for better bursts on the AXI ports.
+ #define MHA_WIDE_BITS   256
+#define MHA_VAL_LANES   (MHA_WIDE_BITS / 8)    /* 32 int8 values per beat  */
+#define MHA_COL_LANES   (MHA_WIDE_BITS / 16)   /* 16 uint16 columns per beat */
+typedef ap_uint<MHA_WIDE_BITS> T_MhaWideWord;
 
 /* Global weight buffers shared between all projections, burst loaded from DDR. */
 static T_MhaWVal g_weight_val_buffer[MHA_MAX_W_TOTAL_NNZ];
@@ -77,20 +79,50 @@ static void load_weight_from_ddr (T_Activation* w_val, T_MhaIndex* w_col, int* w
     // changelog); ported from sparta-hw-armagedon-kr260-v3 (9df179a).
     int total_nz = g_weight_rptr_buffer[feature_dim];
 
-    LOAD_VALUES_AND_COLUMNS:
-    for (int i = 0; i < total_nz; i++) {
-        #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_FEATURE*MHA_TC_W_NNZ max=MHA_TC_FEATURE*MHA_TC_W_NNZ
+    /* Wide views of the same contiguous DDR CSR streams. */
+    T_MhaWideWord* w_val_wide = reinterpret_cast<T_MhaWideWord*>(w_val);
+    T_MhaWideWord* w_col_wide = reinterpret_cast<T_MhaWideWord*>(w_col);
+    const int n_val_words = (total_nz + MHA_VAL_LANES - 1) / MHA_VAL_LANES;
+    const int n_col_words = (total_nz + MHA_COL_LANES - 1) / MHA_COL_LANES;
+
+    /* Values: 64 int8 lanes per 512-bit beat. */
+    LOAD_VALUES_WIDE:
+    for (int wq = 0; wq < n_val_words; wq++) {
+        #pragma HLS LOOP_TRIPCOUNT min=(MHA_TC_FEATURE*MHA_TC_W_NNZ/MHA_VAL_LANES+1) max=(MHA_TC_FEATURE*MHA_TC_W_NNZ/MHA_VAL_LANES+1)
         #pragma HLS PIPELINE II=1
-        /* Typecast to 4 and 10 bits. */
+        T_MhaWideWord word = w_val_wide[wq];
+        UNPACK_VAL_LANES:
+        for (int lane = 0; lane < MHA_VAL_LANES; lane++) {
+            #pragma HLS UNROLL
+            int idx = wq * MHA_VAL_LANES + lane;
+            if (idx < total_nz) {
+                ap_uint<8> b = (ap_uint<8>) word.range(lane * 8 + 7, lane * 8);
 #ifdef POT_SHIFT_MAC
-        /* POT weight: DDR byte is {sign(bit7), exponent(bits0..6)}; repack to the
-         * on-chip {sign(bit3), exponent(bits0..2)} the shift-MAC reads. */
-        ap_uint<8> b = (ap_uint<8>) w_val[i];
-        g_weight_val_buffer[i] = (T_MhaWVal)((ap_uint<4>)((b[7] << 3) | (b & 0x7)));
+                /* POT weight: DDR byte is {sign(bit7), exponent(bits0..6)}; repack to
+                 * the on-chip {sign(bit3), exponent(bits0..2)} the shift-MAC reads. */
+                g_weight_val_buffer[idx] = (T_MhaWVal)((ap_uint<4>)((b[7] << 3) | (b & 0x7)));
 #else
-        g_weight_val_buffer[i] = (T_MhaWVal) w_val[i];
+                g_weight_val_buffer[idx] = (T_MhaWVal)(ap_int<8>) b;
 #endif
-        g_weight_col_buffer[i] = (T_MhaWCol) w_col[i];
+            }
+        }
+    }
+
+    /* Columns: 32 uint16 lanes per 512-bit beat. */
+    LOAD_COLUMNS_WIDE:
+    for (int wq = 0; wq < n_col_words; wq++) {
+        #pragma HLS LOOP_TRIPCOUNT min=(MHA_TC_FEATURE*MHA_TC_W_NNZ/MHA_COL_LANES+1) max=(MHA_TC_FEATURE*MHA_TC_W_NNZ/MHA_COL_LANES+1)
+        #pragma HLS PIPELINE II=1
+        T_MhaWideWord word = w_col_wide[wq];
+        UNPACK_COL_LANES:
+        for (int lane = 0; lane < MHA_COL_LANES; lane++) {
+            #pragma HLS UNROLL
+            int idx = wq * MHA_COL_LANES + lane;
+            if (idx < total_nz) {
+                ap_uint<16> c = (ap_uint<16>) word.range(lane * 16 + 15, lane * 16);
+                g_weight_col_buffer[idx] = (T_MhaWCol)(T_MhaIndex) c;
+            }
+        }
     }
 }
 
@@ -146,12 +178,16 @@ static inline void mac_pe (
         /* Unpack */
         T_Activation input_word = (T_Activation) input.range(chunk * 8 + 7, chunk * 8);
 #ifdef POT_SHIFT_MAC
-        /* POT weight is {sign(bit3), exponent(bits0..2)}; the multiply-accumulate is a
-         * shift by the stored exponent plus a sign (the compiler emits log2|w| directly). */
+        /* POT weight is {sign(bit3), exponent(bits0..2)}. LUTs are
+         * a scarce resource at this point, so we bind this operation
+         * to a DSP, as these are underutilized.
+         */
         ap_uint<3> e   = weight.range(2, 0);
         bool       neg = weight[3];
-        T_MhaAcc shifted = (T_MhaAcc) input_word << e;
-        out_row[token_idx] += neg ? (T_MhaAcc)(-shifted) : shifted;
+        T_MhaAcc   pot = neg ? (T_MhaAcc)(-(1 << e)) : (T_MhaAcc)(1 << e);
+        T_MhaAcc   prod = (T_MhaAcc) input_word * pot;
+        #pragma HLS BIND_OP variable=prod op=mul impl=dsp
+        out_row[token_idx] += prod;
 #else
         /* Multiply - Accumulate */
         out_row[token_idx] += weight * input_word;
@@ -296,28 +332,43 @@ static void proj_dense (
     T_MhaAcc rows[MHA_PROJ_P][MHA_TOKEN_W_MAX];
     #pragma HLS ARRAY_PARTITION variable=rows cyclic factor=MHA_MAC_UNROLL dim=2
     #pragma HLS ARRAY_PARTITION variable=rows complete dim=1
-    
+
+    /* On-chip staging for the projection result.  Compute fills this,
+     * then a separate write-back loop streams it to out_dense as one contiguous
+     * burst.
+     */
+    static T_Activation out_stage[MHA_SCR_V_CNT];   // D*N int8 (== v_dense size)
+    #pragma HLS BIND_STORAGE variable=out_stage type=ram_t2p impl=bram
+
     DENSE_PROJECTION_PER_ROW:
     for (int i = 0; i < feature_dim; i += MHA_PROJ_P) {
         #pragma HLS LOOP_TRIPCOUNT min=(MHA_TC_FEATURE/MHA_PROJ_P) max=(MHA_TC_FEATURE/MHA_PROJ_P)
-        
-        parallel_out_rows_compute<MHA_PROJ_P>(g_activation_replicas, 
-                                              i, 
-                                              tokens_dim, 
-                                              g_weight_val_buffer, 
-                                              g_weight_col_buffer, 
-                                              g_weight_rptr_buffer, 
+
+        parallel_out_rows_compute<MHA_PROJ_P>(g_activation_replicas,
+                                              i,
+                                              tokens_dim,
+                                              g_weight_val_buffer,
+                                              g_weight_col_buffer,
+                                              g_weight_rptr_buffer,
                                               rows);
-        DENSE_PROJECTION_WRITE:
+        /* Quantize into on-chip staging. */
+        DENSE_PROJECTION_STAGE:
         for (int j = 0; j <  tokens_dim; j++) {
             #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_TOKEN max=MHA_TC_TOKEN
             #pragma HLS PIPELINE II=1
-           
             for (int l = 0; l < MHA_PROJ_P; l++) {
                 #pragma HLS UNROLL
-                out_dense[(i + l) *  tokens_dim + j] = requant_to_int8(rows[l][j], quant_scale);
+                out_stage[(i + l) * tokens_dim + j] = requant_to_int8(rows[l][j], quant_scale);
             }
         }
+    }
+
+    /* Standalone contiguous write-back. */
+    DENSE_PROJECTION_WRITEBACK:
+    for (int e = 0; e < feature_dim * tokens_dim; e++) {
+        #pragma HLS LOOP_TRIPCOUNT min=(MHA_TC_FEATURE*MHA_TC_TOKEN) max=(MHA_TC_FEATURE*MHA_TC_TOKEN)
+        #pragma HLS PIPELINE II=1
+        out_dense[e] = out_stage[e];
     }
 }
 

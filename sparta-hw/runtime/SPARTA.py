@@ -53,6 +53,13 @@ ACT_ELEMS = ENC_D * ENC_N   # feature-major int8 activation buffer size
 # the full dense grid -- overflow-proof at any sparsity rather than an assumed
 # density.  q_col/k_col are T_MhaHeadIndex (8-bit) on this baseline.
 MHA_MAX_QK_NNZ = 38400
+MHA_N_HEADS     = 12   # attention heads          (config/inc/mha_cfg.h)
+MHA_FEATURE_HEAD = 64  # per-head feature width   (MHA_FEATURE_W_MAX / MHA_N_HEADS)
+
+# PL0 fabric clock the bitstream was built for (MHz). Used only to convert the
+# diagnostic AXI-timer's fabric-cycle count to time; override with --pl0-mhz if a
+# bitstream at another frequency is loaded.
+PL0_MHZ = 200.0
 
 
 # ============================================================================
@@ -87,7 +94,7 @@ class SpartaLayerArgs(ctypes.Structure):
         ("scales", ctypes.c_uint64),
         ("q_val", ctypes.c_uint64), ("q_col", ctypes.c_uint64),
         ("k_val", ctypes.c_uint64), ("k_col", ctypes.c_uint64),
-        ("hidden", ctypes.c_uint64), ("output", ctypes.c_uint64),
+        ("output", ctypes.c_uint64),
     ]
 
 
@@ -126,8 +133,7 @@ REGMAP = {
     "scales":    (0x10c, True),
     "q_val":     (0x118, True), "q_col":      (0x124, True),
     "k_val":     (0x130, True), "k_col":      (0x13c, True),
-    "hidden":    (0x148, True),
-    "output":    (0x154, True),
+    "output":    (0x148, True),
 }
 
 
@@ -161,10 +167,26 @@ class HwKernel:
     CONTROL_BASE = 0x8000_0000
     CONTROL_SIZE = 0x1_0000
 
+    # AXI Timer register offsets (PG079). Only Timer0 is used.
+    TMR_TCSR0 = 0x00   # control/status
+    TMR_TLR0  = 0x04   # load register
+    TMR_TCR0  = 0x08   # counter value (what we sample)
+    TMR_SIZE  = 0x1_0000
+    # TCSR0 bits: ENT0 (enable, bit7) | ARHT0 (auto-reload, bit4) | UDT0=0 (up).
+    # ENT0|ARHT0 = a free-running up-counter that wraps at 2^32.
+    TMR_TCSR0_RUN = (1 << 7) | (1 << 4)
+
     def __init__(self, bitstream=None, instance=None, download=True,
-                 timeout_s=60.0, base_addr=None):
+                 timeout_s=60.0, base_addr=None, timer_base=None):
         self.timeout_s = timeout_s
         self.overlay = None
+        # Optional diagnostic AXI timer: a free-running counter on the
+        # kernel's ap_clk. When present, invoke() returns fabric cycles too.
+        # Set up lazily below only if a base address is provided or the
+        # timer IP is discoverable in an overlay.
+        self.timer = None
+        self._timer_base = timer_base
+        self.last_cycles = None   # fabric cycles of the most recent invoke()
 
         if download:
             # Program the PL and let PYNQ resolve the IP from the metadata.
@@ -181,6 +203,52 @@ class HwKernel:
             from pynq import MMIO
             self.ip = MMIO(base_addr or self.CONTROL_BASE, self.CONTROL_SIZE)
             self._register_ps_memory()
+
+        self._setup_timer(instance)
+
+    def _setup_timer(self, instance):
+        """Map the diagnostic AXI timer, if this bitstream has one.
+
+        On the attach path the timer base is passed explicitly (--timer-base).  
+        On the overlay path we try to discover an axi_timer IP from the metadata.  
+        Absent either, self.timer stays None and invoke() reports no cycles,
+        so a non-debug bitstream just works with the timing feature silently off."""
+        base = self._timer_base
+        if base is None and self.overlay is not None:
+            # Best-effort discovery in the overlay's IP dict.
+            ipd = getattr(self.overlay, "ip_dict", {}) or {}
+            for name, meta in ipd.items():
+                if "axi_timer" in name.lower():
+                    base = meta.get("phys_addr")
+                    break
+        if base is None:
+            return
+        from pynq import MMIO
+        self.timer = MMIO(base, self.TMR_SIZE)
+        # Arm Timer0 as a free-running up-counter: clear, load 0, then run.
+        self.timer.write(self.TMR_TCSR0, 0)
+        self.timer.write(self.TMR_TLR0, 0)
+        # LOAD0 (bit5) pulses TLR0 -> TCR0, then drop it and enable+auto-reload.
+        self.timer.write(self.TMR_TCSR0, (1 << 5))
+        self.timer.write(self.TMR_TCSR0, self.TMR_TCSR0_RUN)
+
+        # The kernel reads the timer over its OWN m_axi port whose base address
+        # is an s_axilite offset register (dbg_timer @ 0x160, 64-bit). We must 
+        # write the timer's physical base there so the kernel's per-block TCR0 
+        # reads hit the real timer.
+        self.DBG_TIMER_ARG = 0x160
+        try:
+            self.ip.write(self.DBG_TIMER_ARG,     base & 0xFFFFFFFF)
+            self.ip.write(self.DBG_TIMER_ARG + 4, (base >> 32) & 0xFFFFFFFF)
+        except Exception as e:
+            print(f"  [dbg-blk] warning: could not write dbg_timer reg 0x160: {e}",
+                  flush=True)
+
+    def _timer_cycles(self):
+        """Read Timer0's free-running counter (32-bit), or None if no timer."""
+        if self.timer is None:
+            return None
+        return self.timer.read(self.TMR_TCR0) & 0xFFFFFFFF
 
     @staticmethod
     def _register_ps_memory():
@@ -370,8 +438,11 @@ class HwKernel:
         # ---- 3: start ------------------------------------------------------
         # _drain_done() guarantees ap_done is clear here, so the ap_done seen
         # below can only come from THIS run.
-        self.ip.write(AP_CTRL, AP_START)
+        # Sample the fabric counter as close to ap_start as possible; pair it with
+        # a read taken right after ap_done to get true ap_start->ap_done cycles.
         t_start = time.monotonic()
+        cyc_start = self._timer_cycles()
+        self.ip.write(AP_CTRL, AP_START)
 
         # ---- 4: wait for completion ---------------------------------------
         deadline = t_start + self.timeout_s
@@ -386,9 +457,17 @@ class HwKernel:
                     f"start={bool(ctrl & AP_START)}, idle={bool(ctrl & AP_IDLE)}). "
                     "A hung kernel usually means a bad buffer address or an "
                     "m_axi bundle that does not reach a PS port.")
+        cyc_end = self._timer_cycles()
 
         # ---- 5: release the done state so the next invoke can start --------
         self.ip.write(AP_CTRL, AP_CONTINUE)
+
+        # Stash fabric cycles for the caller (None if no timer).  The counter is
+        # 32-bit and free-running, so subtract modulo 2^32 to survive one wrap.
+        if cyc_start is not None and cyc_end is not None:
+            self.last_cycles = (cyc_end - cyc_start) & 0xFFFFFFFF
+        else:
+            self.last_cycles = None
         return time.monotonic() - t_start
 
     def _drain_done(self):
@@ -482,7 +561,7 @@ def _addr(buf):
     return int(buf.device_address)
 
 
-def _build_args(x_buf, h_buf, y_buf, lb, scratch, n_tokens, d, d_h):
+def _build_args(x_buf, y_buf, lb, scratch, n_tokens, d, d_h):
     """Fill a SpartaLayerArgs from PYNQ buffer device addresses.
 
     Field order matches encoder_layer_top()'s signature.  The weight tag names
@@ -500,7 +579,7 @@ def _build_args(x_buf, h_buf, y_buf, lb, scratch, n_tokens, d, d_h):
         scales=_addr(lb["scales"]),
         q_val=_addr(scratch["q_val"]), q_col=_addr(scratch["q_col"]),
         k_val=_addr(scratch["k_val"]), k_col=_addr(scratch["k_col"]),
-        hidden=_addr(h_buf), output=_addr(y_buf),
+        output=_addr(y_buf),
     )
 
 
@@ -518,10 +597,9 @@ def run_encoder(model_dir, image=None, bitstream=None, instance=None,
     kernel = HwKernel(bitstream, instance=instance, download=download,
                       base_addr=base_addr)
 
-    # activation ping-pong: X (in) / Y (out) / hidden (MHA->MLP handoff).
+    # activation ping-pong: X (in) / Y (out).
     a = _allocate(allocate, ACT_ELEMS, np.int8)
     b = _allocate(allocate, ACT_ELEMS, np.int8)
-    h = _allocate(allocate, ACT_ELEMS, np.int8)
 
     # Q'/K' scratch: written and read entirely by the kernel, never by the
     # host, so it is allocated once and reused across all 12 layers rather
@@ -544,7 +622,7 @@ def run_encoder(model_dir, image=None, bitstream=None, instance=None,
             layer = mp.layer(L)
             d_h = layer.weights["linear_1"].shape[0]
             lb = _stage_layer(allocate, layer)
-            args = _build_args(x_buf, h, y_buf, lb, scratch, ENC_N, ENC_D, d_h)
+            args = _build_args(x_buf, y_buf, lb, scratch, ENC_N, ENC_D, d_h)
             try:
                 kernel.invoke(args)
             except TimeoutError as e:

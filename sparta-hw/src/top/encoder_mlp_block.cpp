@@ -26,7 +26,8 @@ void encoder_mlp_block(
     T_Activation* w1_values, T_MlpIndex* w1_col_idx, int* w1_row_ptr,
     T_Activation* w2_values, T_MlpIndex* w2_col_idx, int* w2_row_ptr,
     const T_Scale*      scales,
-    T_Activation*       output
+    T_Activation*       output,
+    bool                w2_prestaged
 ) {
 #ifndef __SYNTHESIS__
     assert(feature_dim <= ENC_MLP_FEATURE_W_MAX && "feature_dim exceeds ENC_MLP_FEATURE_W_MAX");
@@ -41,7 +42,6 @@ void encoder_mlp_block(
             tokens_dim,
             feature_dim,
             scales[SCALE_FF_RMSNORM_OUT_INV_IDX],
-            (T_Activation*) nullptr,
             reinterpret_cast<T_RmsBankWord*> (norm_input));
 
     mlp(norm_input,
@@ -55,12 +55,13 @@ void encoder_mlp_block(
         w2_col_idx,
         w2_row_ptr,
         scales,
-        output);
+        output,
+        w2_prestaged);
 
     residual_add(input,
-                 output, 
+                 output,
                  feature_dim * tokens_dim,
-                 scales[SCALE_FF_RESIDUAL_IDX], 
+                 scales[SCALE_FF_RESIDUAL_IDX],
                  scales[SCALE_FF_BRANCH_RATIO_IDX],
                  output);
 }
