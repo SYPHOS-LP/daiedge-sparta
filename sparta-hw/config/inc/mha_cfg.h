@@ -37,8 +37,12 @@
 #define MHA_TILE_ENTRY_BITS 16   // packed weight entry: {block-local column (6 b), value (4 b)}
 #define MHA_TILE_PACK 4   // weight entries per 64-bit bank word
 #define MHA_ROW_BLOCKS (MHA_FEATURE_W_MAX / MHA_FEATURE_HEAD)   // row blocks per weight (12; a block = one head's rows)
-#define MHA_TILE_NNZ_MAX 1024   // per-bank capacity for one row block; measured worst cell = 977 + up to 3 lead-in entries
-#define MHA_TILE_BANK_WORDS (MHA_TILE_NNZ_MAX / MHA_TILE_PACK)   // bank depth in packed words (256)
+#define MHA_TILE_NNZ_MAX 2560   // per-bank capacity for one row block; worst cell 2196 (MLP W2) + up to 3 lead-in entries
+#define MHA_TILE_BANK_WORDS (MHA_TILE_NNZ_MAX / MHA_TILE_PACK)   // bank depth in packed words (640, one URAM)
+#define MHA_H_TILE_FEATURES 256   // hidden features per W2 column block (d_h / MHA_TILES)
+#define MHA_H_TILE_WORDS (MHA_H_TILE_FEATURES * MHA_BANK_ROW_WORDS)   // packed words of one H tile (256*7=1792)
+#define MHA_H_TILE_BASE MHA_TILE_WORDS   // first word of the H region inside a tile
+#define MHA_TILE_WORDS_MAX (MHA_TILE_WORDS + MHA_H_TILE_WORDS)   // tile depth covering both regions (2240, one URAM)
 #define MHA_SCR_A_CNT (MHA_FEATURE_HEAD * MHA_FEATURE_HEAD)   // per-head A = K'V^T (int32)
 #define MHA_TC_FEATURE 768   // feature rows (projections)
 #define MHA_TC_TOKEN 50   // tokens / dense width
@@ -54,7 +58,7 @@ typedef ap_uint<10> T_MhaWCol;   // on-chip decoded W col buffer (feature < MHA_
 typedef ap_uint<8> T_MhaHeadIndex;   // Q'/K' CSR col idx: K'=token(0..196), Q'=BAND-LOCAL feature(0..63) after head-major emit -> both fit 8 bits
 typedef ap_uint<MHA_BANK_WORD_BITS> T_MhaBankWord;   // packed bank URAM word: MHA_BANK_PACK int8 activations (64-bit)
 typedef ap_uint<(MHA_TILE_PACK * MHA_TILE_ENTRY_BITS)> T_MhaTileWord;   // packed weight-bank word: MHA_TILE_PACK entries of {col, val} (64-bit)
-typedef ap_uint<6> T_MhaTileCol;   // block-local column index (0..MHA_TILE_FEATURES-1)
+typedef ap_uint<8> T_MhaTileCol;   // block-local column: 0..63 for the MHA and W1, 0..255 for the MLP's W2 blocks
 typedef ap_uint<8> T_MhaTileCount;   // nonzeros of one output row inside one block (measured max 62)
 typedef ap_int<32> T_MhaAcc;   // MAC / scatter accumulator (int8xint8 summed)
 typedef ap_ufixed<32, 1> T_MhaRecip;   // 1/(d+eps) reciprocal LUT output; d is large so recip ~1e-6, needs many frac bits

@@ -6,6 +6,7 @@
  *********************************************************************************/
 
 #include "mha.h"
+#include "spmm_tiled.h"
 #include "mha_recip.h"
 #include "quantize.h"
 #ifndef __SYNTHESIS__
@@ -45,44 +46,6 @@ static_assert(MHA_BANK_PACK == 8, "code assumes MHA_BANK_PACK == 8");
 #define MHA_COL_LANES   (MHA_WIDE_BITS / 16)   /* 16 uint16 columns per beat */
 typedef ap_uint<MHA_WIDE_BITS> T_MhaWideWord;
 
-/* ---------------------------------------------------------------------------------------
- * Tiled SpMM state.
- *
- * The feature axis is cut into MHA_TILES column blocks.  Block t owns ONE activation tile
- * (its own memory, MHA_TILE_FEATURES rows of packed tokens) and ONE weight bank (its own
- * memory, holding every nonzero whose column falls in that block, rows ascending).  The
- * MHA_TILES lanes therefore each read one nonzero and one activation word per cycle without
- * any copy of the activation: the four replicas this replaces cost 4x the whole D x N bank.
- *
- * compile_model.py --mha-tiles emits the weights to match: values and block-local columns in
- * block order (each block padded to a whole MHA_TILE_PACK word) plus, in the row-pointer slot,
- * the per-(block, row) nonzero counts that let each lane walk row by row.
- * ------------------------------------------------------------------------------------ */
-static T_MhaBankWord  g_act_tile[MHA_TILES][MHA_TILE_WORDS];
-static T_MhaTileWord  g_bank[MHA_TILES][MHA_TILE_BANK_WORDS];
-static T_MhaTileCount g_bank_count[MHA_TILES][MHA_FEATURE_HEAD];
-
-/* Engine state kept at file scope on purpose: with no caller-specific pointer arguments every
- * call to tiled_rows_compute() has identical bindings, which is what lets HLS build ONE engine
- * instead of specialising one per call site. */
-static int      g_bank_cursor[MHA_TILES];
-static T_MhaAcc g_proj_rows[MHA_ROWS_PER_STEP][MHA_TOKEN_W_MAX];
-
-/* DDR position of the next row block, per weight matrix (0 = W_K, 1 = W_Q, 2 = W_V, 3 = W_O) and
- * column block.  g_block_word0 is the column block's first packed word in DDR, g_slice_entry the
- * entry index within the block where the next row block starts, g_slice_cursor0 that entry's lane
- * within its packed word.  Reads start at the word boundary below the first entry (up to
- * MHA_TILE_PACK-1 unused entries precede the slice in the bank) so that no data realignment is
- * needed.  The weight matrices are interleaved across stages, so each keeps its own position. */
-#define MHA_N_WEIGHTS 4
-static int g_block_word0[MHA_N_WEIGHTS][MHA_TILES];
-static int g_slice_entry[MHA_N_WEIGHTS][MHA_TILES];
-static int g_slice_cursor0[MHA_TILES];
-
-/* Wide DDR views used to fill one packed bank word per read. */
-typedef ap_uint<MHA_TILE_PACK * 8>  T_MhaBankValWord;   /* MHA_TILE_PACK POT bytes   */
-typedef ap_uint<MHA_TILE_PACK * 16> T_MhaBankColWord;   /* MHA_TILE_PACK uint16 cols */
-
 /**
  * @brief Linear (softmax-free) attention for one head's feature band.
  *
@@ -109,379 +72,6 @@ typedef ap_uint<MHA_TILE_PACK * 16> T_MhaBankColWord;   /* MHA_TILE_PACK uint16 
  * @param[out] out_packed    Packed output.
  */
 
-/**
- * @brief Unpack one weight entry from a bank word: {block-local column, POT value}.
- */
-static inline void bank_entry(T_MhaTileWord word, int lane, T_MhaWVal &val, T_MhaTileCol &col) {
-#pragma HLS INLINE
-    const int lo = lane * MHA_TILE_ENTRY_BITS;
-    val = (T_MhaWVal)   word.range(lo + 3, lo);
-    col = (T_MhaTileCol) word.range(lo + 9, lo + 4);
-}
-
-/**
- * @brief Compute the first DDR word of every column block of one weight matrix.
- *
- * Called once per weight matrix.  Each column block is padded to a whole packed word, so block t
- * starts after the padded lengths of blocks 0..t-1, which requires the counts of all their rows.
- *
- * @param[in] w_counts    Nonzeros per (column block, row), block-major: w_counts[t * rows + r].
- * @param[in] feature_dim Output rows of the projection.
- * @param[in] which       Weight matrix index (0..MHA_N_WEIGHTS-1).
- */
-static void load_weight_bases (int* w_counts, int feature_dim, int which) {
-#pragma HLS INLINE off
-    int next_word = 0;
-    BASE_TILE:
-    for (int t = 0; t < MHA_TILES; t++) {
-        #pragma HLS LOOP_TRIPCOUNT min=MHA_TILES max=MHA_TILES
-        int len = 0;
-        BASE_ROW:
-        for (int r = 0; r < feature_dim; r++) {
-            #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_FEATURE max=MHA_TC_FEATURE
-            #pragma HLS PIPELINE II=1
-            len += w_counts[t * feature_dim + r];
-        }
-        g_block_word0[which][t] = next_word;
-        g_slice_entry[which][t] = 0;
-        next_word              += (len + MHA_TILE_PACK - 1) / MHA_TILE_PACK;
-    }
-}
-
-/**
- * @brief Read the entries of output rows [row_base, row_base + rows) into the per-column-block banks.
- *
- * Within a column block the entries are ordered by row, so the rows of one row block are
- * contiguous and one burst per column block is sufficient: 977 entries worst case against 9704
- * for a whole column block.  Two passes at one read per cycle: values, then column indices merged
- * into the same packed word, so the second pass reads back the word it updates.
- *
- * @param[in] w_val       Weight values in DDR (POT bytes, block order).
- * @param[in] w_col        Block-local column indices in DDR (block order).
- * @param[in] w_counts     Nonzeros per (column block, row), block-major.
- * @param[in] feature_dim  Output rows of the weight matrix (row stride of w_counts).
- * @param[in] which        Weight matrix index (0..MHA_N_WEIGHTS-1).
- * @param[in] row_base     First output row of this stage.
- * @param[in] rows         Output rows in this stage.
- */
-static void load_weight_slice (T_Activation* w_val, T_MhaIndex* w_col, int* w_counts,
-                               int feature_dim, int which, int row_base, int rows) {
-#pragma HLS INLINE off
-    /* A bank is 64-bit words, MHA_TILE_BANK_WORDS deep: one URAM each (72 b x 4096), where BRAM
-     * would need ~12 BRAM18 per bank for the same data (18 b per port, 1024 deep). */
-    #pragma HLS BIND_STORAGE variable=g_bank type=ram_t2p impl=uram
-    #pragma HLS ARRAY_PARTITION variable=g_bank_count complete dim=1
-    int slice_words[MHA_TILES], slice_word0[MHA_TILES];
-    #pragma HLS ARRAY_PARTITION variable=slice_words complete dim=1
-    #pragma HLS ARRAY_PARTITION variable=slice_word0 complete dim=1
-
-    /* Nonzero counts of this row block, which the MAC loop uses to index the banks, and their sum
-     * per column block, which is the length of the DDR read.  One column block at a time: the
-     * counts of one block are contiguous in DDR, and reading all MHA_TILES of a row in the same
-     * cycle would need 12 concurrent reads on one AXI port. */
-    int slice_len[MHA_TILES];
-    #pragma HLS ARRAY_PARTITION variable=slice_len complete dim=1
-    SLICE_COUNT_TILE:
-    for (int t = 0; t < MHA_TILES; t++) {
-        #pragma HLS LOOP_TRIPCOUNT min=MHA_TILES max=MHA_TILES
-        int len = 0;
-        SLICE_COUNT_ROW:
-        for (int r = 0; r < rows; r++) {
-            #pragma HLS LOOP_TRIPCOUNT min=MHA_FEATURE_HEAD max=MHA_FEATURE_HEAD
-            #pragma HLS PIPELINE II=1
-            const int n = w_counts[t * feature_dim + row_base + r];
-            g_bank_count[t][r] = (T_MhaTileCount) n;
-            len += n;
-        }
-        slice_len[t] = len;
-    }
-
-    SLICE_PLAN:
-    for (int t = 0; t < MHA_TILES; t++) {
-        #pragma HLS UNROLL
-        const int start = g_slice_entry[which][t];
-        const int lane  = start % MHA_TILE_PACK;   /* lane of the first entry in its word */
-#ifndef __SYNTHESIS__
-        assert(lane + slice_len[t] <= MHA_TILE_NNZ_MAX &&
-               "weight row block exceeds MHA_TILE_NNZ_MAX (raise the cap)");
-#endif
-        g_slice_cursor0[t]      = lane;
-        g_slice_entry[which][t] = start + slice_len[t];
-        slice_word0[t]          = g_block_word0[which][t] + start / MHA_TILE_PACK;
-        slice_words[t]     = (lane + slice_len[t] + MHA_TILE_PACK - 1) / MHA_TILE_PACK;
-    }
-
-    /* Values: one read holds exactly one bank word's worth of entries. */
-    T_MhaBankValWord* val_words = reinterpret_cast<T_MhaBankValWord*>(w_val);
-    BANK_VALUES_TILE:
-    for (int t = 0; t < MHA_TILES; t++) {
-        #pragma HLS LOOP_TRIPCOUNT min=MHA_TILES max=MHA_TILES
-        const int words = slice_words[t];
-        BANK_VALUES_WORD:
-        for (int w = 0; w < words; w++) {
-            #pragma HLS LOOP_TRIPCOUNT min=64 avg=104 max=MHA_TILE_BANK_WORDS
-            #pragma HLS PIPELINE II=1
-            T_MhaBankValWord raw = val_words[slice_word0[t] + w];
-            T_MhaTileWord    packed = 0;
-            BANK_VALUE_LANE:
-            for (int l = 0; l < MHA_TILE_PACK; l++) {
-                #pragma HLS UNROLL
-                const ap_uint<8> b  = (ap_uint<8>) raw.range(l * 8 + 7, l * 8);
-                const int        lo = l * MHA_TILE_ENTRY_BITS;
-#ifdef POT_SHIFT_MAC
-                /* POT weight: DDR byte is {sign(bit7), exponent(bits0..6)}; repack to the
-                 * on-chip {sign(bit3), exponent(bits0..2)} the shift-MAC reads. */
-                packed.range(lo + 3, lo) = (ap_uint<4>)((b[7] << 3) | (b & 0x7));
-#else
-                packed.range(lo + 3, lo) = (ap_uint<4>) b;
-#endif
-            }
-            g_bank[t][w] = packed;
-        }
-    }
-
-    /* Columns: same word layout, merged into the values already stored. */
-    T_MhaBankColWord* col_words = reinterpret_cast<T_MhaBankColWord*>(w_col);
-    BANK_COLUMNS_TILE:
-    for (int t = 0; t < MHA_TILES; t++) {
-        #pragma HLS LOOP_TRIPCOUNT min=MHA_TILES max=MHA_TILES
-        const int words = slice_words[t];
-        BANK_COLUMNS_WORD:
-        for (int w = 0; w < words; w++) {
-            #pragma HLS LOOP_TRIPCOUNT min=64 avg=104 max=MHA_TILE_BANK_WORDS
-            #pragma HLS PIPELINE II=1
-            T_MhaBankColWord raw    = col_words[slice_word0[t] + w];
-            T_MhaTileWord    packed = g_bank[t][w];
-            BANK_COLUMN_LANE:
-            for (int l = 0; l < MHA_TILE_PACK; l++) {
-                #pragma HLS UNROLL
-                const int lo = l * MHA_TILE_ENTRY_BITS;
-                packed.range(lo + 9, lo + 4) = (ap_uint<6>) raw.range(l * 16 + 5, l * 16);
-            }
-            g_bank[t][w] = packed;
-        }
-    }
-}
-
-/**
- * @brief Split the packed activation into the per-block tiles the lanes read.
- *
- * Feature f lives in block f / MHA_TILE_FEATURES, and the bank is feature-major, so block t is
- * simply the contiguous word range [t * MHA_TILE_WORDS, (t+1) * MHA_TILE_WORDS).  One copy is
- * made, not one per lane.
- *
- * @param[in] packed_input  Packed activation bank (feature-major, MHA_BANK_PACK tokens/word).
- */
-static void load_activation_tiles (T_MhaBankWord* packed_input) {
-#pragma HLS INLINE off
-#pragma HLS ARRAY_PARTITION variable=g_act_tile complete dim=1
-    /* One tile is 448 words x 64 b, which fits a single BRAM36; keep them out of URAM, which the
-     * weight banks need. */
-    #pragma HLS BIND_STORAGE variable=g_act_tile type=ram_t2p impl=bram
-
-    ACTIVATION_TILE:
-    for (int t = 0; t < MHA_TILES; t++) {
-        #pragma HLS LOOP_TRIPCOUNT min=MHA_TILES max=MHA_TILES
-        ACTIVATION_TILE_WORD:
-        for (int w = 0; w < MHA_TILE_WORDS; w++) {
-            #pragma HLS LOOP_TRIPCOUNT min=MHA_TILE_WORDS max=MHA_TILE_WORDS
-            #pragma HLS PIPELINE II=1
-            g_act_tile[t][w] = packed_input[t * MHA_TILE_WORDS + w];
-        }
-    }
-}
-
-/**
- * @brief Unpack one int8 activation from a packed word, multiply with given weight
- * and accumulate it into an output row.
- *
- * @param[in]     input       Packed input
- * @param[in]     weight      Weight used for multiplication
- * @param[in]     token_idx   Token index this chunk maps to
- * @param[in]     chunk       Chunk of packed input to be used
- * @param[in]     tokens_dim  Number of tokens, used to skip padding
- * @param[in,out] out_row     Output row
- */
-static inline void mac_pe (
-    T_MhaBankWord input,
-    T_MhaWVal     weight,
-    int           token_idx,
-    int           chunk,
-    int           tokens_dim,
-    T_MhaAcc      out_row[MHA_TOKEN_W_MAX]
-) {
-#pragma HLS INLINE
-    if (token_idx < tokens_dim) {
-        /* Unpack */
-        T_Activation input_word = (T_Activation) input.range(chunk * 8 + 7, chunk * 8);
-#ifdef POT_SHIFT_MAC
-        /* POT weight is {sign(bit3), exponent(bits0..2)}. LUTs are
-         * a scarce resource at this point, so we bind this operation
-         * to a DSP, as these are underutilized.
-         */
-        ap_uint<3> e   = weight.range(2, 0);
-        bool       neg = weight[3];
-        T_MhaAcc   pot = neg ? (T_MhaAcc)(-(1 << e)) : (T_MhaAcc)(1 << e);
-        T_MhaAcc   prod = (T_MhaAcc) input_word * pot;
-        #pragma HLS BIND_OP variable=prod op=mul impl=dsp
-        out_row[token_idx] += prod;
-#else
-        /* Multiply - Accumulate */
-        out_row[token_idx] += weight * input_word;
-#endif
-    }
-}
-
-/**
- * @brief One step of the tiled SpMM: MHA_ROWS_PER_STEP output rows across MHA_TILES lanes.
- *
- * Lane t reads only block t's weight bank and only block t's activation tile, so the lanes
- * never contend for a memory and no copy of the activation is needed.  Each lane accumulates
- * into its own partial row; the partials are summed once at the end of the step.  The lanes
- * advance together, so a step costs the busiest lane -- grouping several output rows lets a
- * light row in one block offset a heavy one in another.
- *
- * @param[in]     row_base     First output row of this step.
- * @param[in]     rows_in_step Output rows in this step (<= MHA_ROWS_PER_STEP).
- * @param[in]     tokens_dim   Number of tokens.
- *
- * Reads g_bank / g_act_tile / g_bank_count, advances g_bank_cursor and writes g_proj_rows.
- */
-static void tiled_rows_compute (
-    int row_local,
-    int rows_in_step,
-    int tokens_dim
-) {
-#pragma HLS INLINE off
-#pragma HLS ARRAY_PARTITION variable=g_act_tile   complete dim=1
-#pragma HLS ARRAY_PARTITION variable=g_bank       complete dim=1
-#pragma HLS ARRAY_PARTITION variable=g_bank_count complete dim=1
-#pragma HLS ARRAY_PARTITION variable=g_bank_cursor complete dim=1
-#pragma HLS ARRAY_PARTITION variable=g_proj_rows   complete dim=1
-#pragma HLS ARRAY_PARTITION variable=g_proj_rows   cyclic factor=MHA_BANK_PACK dim=2
-
-    /* One partial row per lane: lane t only ever touches partial[t], so the lanes' updates
-     * are independent. */
-    static T_MhaAcc partial[MHA_TILES][MHA_ROWS_PER_STEP][MHA_TOKEN_W_MAX];
-    #pragma HLS ARRAY_PARTITION variable=partial complete dim=1
-    #pragma HLS ARRAY_PARTITION variable=partial complete dim=2
-    #pragma HLS ARRAY_PARTITION variable=partial cyclic factor=MHA_BANK_PACK dim=3
-
-    const int row_words = (tokens_dim + MHA_BANK_PACK - 1) / MHA_BANK_PACK;
-
-    CLEAR_PARTIAL_WORD:
-    for (int w = 0; w < row_words; w++) {
-        #pragma HLS LOOP_TRIPCOUNT min=MHA_BANK_ROW_WORDS max=MHA_BANK_ROW_WORDS
-        #pragma HLS PIPELINE II=1
-        for (int t = 0; t < MHA_TILES; t++) {
-            #pragma HLS UNROLL
-            for (int r = 0; r < MHA_ROWS_PER_STEP; r++) {
-                #pragma HLS UNROLL
-                for (int p = 0; p < MHA_BANK_PACK; p++) {
-                    #pragma HLS UNROLL
-                    const int token = w * MHA_BANK_PACK + p;
-                    if (token < tokens_dim) {
-                        partial[t][r][token] = (T_MhaAcc) 0;
-                    }
-                }
-            }
-        }
-    }
-
-    /* Per-lane walk: how many nonzeros this step holds, and where each row starts within them
-     * (prefix[r] is compared against the walk index instead of re-reading the counts). */
-    int lane_len[MHA_TILES];
-    int prefix[MHA_TILES][MHA_ROWS_PER_STEP];
-    #pragma HLS ARRAY_PARTITION variable=lane_len complete dim=1
-    #pragma HLS ARRAY_PARTITION variable=prefix   complete dim=0
-    int max_len = 0;
-    LANE_INIT:
-    for (int t = 0; t < MHA_TILES; t++) {
-        #pragma HLS UNROLL
-        int len = 0;
-        for (int r = 0; r < MHA_ROWS_PER_STEP; r++) {
-            #pragma HLS UNROLL
-            prefix[t][r] = len;
-            if (r < rows_in_step) {
-                len += (int) g_bank_count[t][row_local + r];
-            }
-        }
-        lane_len[t] = len;
-        if (len > max_len) {
-            max_len = len;
-        }
-    }
-
-    /* Walk the step's nonzeros; every lane covers one nonzero's worth of tokens per pass. */
-    MAC_ENTRY:
-    for (int k = 0; k < max_len; k++) {
-        #pragma HLS LOOP_TRIPCOUNT min=(MHA_TC_W_NNZ*MHA_ROWS_PER_STEP/MHA_TILES) max=(MHA_TC_W_NNZ*MHA_ROWS_PER_STEP/MHA_TILES)
-        MAC_WORD:
-        for (int w = 0; w < row_words; w++) {
-            #pragma HLS LOOP_TRIPCOUNT min=MHA_BANK_ROW_WORDS max=MHA_BANK_ROW_WORDS
-            #pragma HLS PIPELINE II=1
-            MAC_LANE:
-            for (int t = 0; t < MHA_TILES; t++) {
-                #pragma HLS UNROLL
-                if (k < lane_len[t]) {
-                    const int    entry = g_bank_cursor[t] + k;
-                    T_MhaWVal    val;
-                    T_MhaTileCol col;
-                    bank_entry(g_bank[t][entry / MHA_TILE_PACK], entry % MHA_TILE_PACK, val, col);
-
-                    /* Which of the step's rows this nonzero belongs to. */
-                    int row_sel = 0;
-                    for (int r = 1; r < MHA_ROWS_PER_STEP; r++) {
-                        #pragma HLS UNROLL
-                        if (k >= prefix[t][r]) {
-                            row_sel = r;
-                        }
-                    }
-
-                    const T_MhaBankWord act = g_act_tile[t][(int) col * MHA_BANK_ROW_WORDS + w];
-                    const int           tok = w * MHA_BANK_PACK;
-                    mac_pe(act, val, tok + 0, 0, tokens_dim, partial[t][row_sel]);
-                    mac_pe(act, val, tok + 1, 1, tokens_dim, partial[t][row_sel]);
-                    mac_pe(act, val, tok + 2, 2, tokens_dim, partial[t][row_sel]);
-                    mac_pe(act, val, tok + 3, 3, tokens_dim, partial[t][row_sel]);
-                    mac_pe(act, val, tok + 4, 4, tokens_dim, partial[t][row_sel]);
-                    mac_pe(act, val, tok + 5, 5, tokens_dim, partial[t][row_sel]);
-                    mac_pe(act, val, tok + 6, 6, tokens_dim, partial[t][row_sel]);
-                    mac_pe(act, val, tok + 7, 7, tokens_dim, partial[t][row_sel]);
-                }
-            }
-        }
-    }
-
-    /* Sum the lanes into the output rows, MHA_BANK_PACK tokens per cycle. */
-    MERGE_ROW:
-    for (int r = 0; r < rows_in_step; r++) {
-        #pragma HLS LOOP_TRIPCOUNT min=MHA_ROWS_PER_STEP max=MHA_ROWS_PER_STEP
-        MERGE_WORD:
-        for (int w = 0; w < row_words; w++) {
-            #pragma HLS LOOP_TRIPCOUNT min=MHA_BANK_ROW_WORDS max=MHA_BANK_ROW_WORDS
-            #pragma HLS PIPELINE II=1
-            for (int p = 0; p < MHA_BANK_PACK; p++) {
-                #pragma HLS UNROLL
-                const int token = w * MHA_BANK_PACK + p;
-                if (token < tokens_dim) {
-                    T_MhaAcc sum = (T_MhaAcc) 0;
-                    for (int t = 0; t < MHA_TILES; t++) {
-                        #pragma HLS UNROLL
-                        sum += partial[t][r][token];
-                    }
-                    g_proj_rows[r][token] = sum;
-                }
-            }
-        }
-    }
-
-    CURSOR_ADVANCE:
-    for (int t = 0; t < MHA_TILES; t++) {
-        #pragma HLS UNROLL
-        g_bank_cursor[t] += lane_len[t];
-    }
-}
 
 static void head_core (
     int             enable,
@@ -683,14 +273,6 @@ static void project_rows (
     int            *k_ptr
 ) {
 #pragma HLS INLINE off
-    /* Reads start at a packed-word boundary, so the first entry of the row block is at lane
-     * g_slice_cursor0[t], not at 0. */
-    CURSOR_INIT:
-    for (int t = 0; t < MHA_TILES; t++) {
-        #pragma HLS UNROLL
-        g_bank_cursor[t] = g_slice_cursor0[t];
-    }
-
     /* The sparse outputs are this head's CSR, so they are written from index 0 on every call. */
     int nnz = 0;
     if (mode == MHA_PROJ_FEATMAJOR) {
@@ -704,7 +286,7 @@ static void project_rows (
         #pragma HLS LOOP_TRIPCOUNT min=(MHA_FEATURE_HEAD/MHA_ROWS_PER_STEP) max=(MHA_FEATURE_HEAD/MHA_ROWS_PER_STEP)
         const int rows_in_step = (rows - i < MHA_ROWS_PER_STEP) ? (rows - i) : MHA_ROWS_PER_STEP;
 
-        tiled_rows_compute(i, rows_in_step, tokens_dim);
+        tiled_rows_compute(i, rows_in_step, tokens_dim, 0);
 
         PROJECTION_TAIL_ROW:
         for (int p = 0; p < MHA_ROWS_PER_STEP; p++) {
@@ -793,10 +375,10 @@ static void project_rows (
 void mha(
     T_MhaBankWord* input_packed,
     int            tokens_dim,
-    T_Activation* wq_values, T_MhaIndex* wq_col_idx, int* wq_row_ptr,
-    T_Activation* wk_values, T_MhaIndex* wk_col_idx, int* wk_row_ptr,
-    T_Activation* wv_values, T_MhaIndex* wv_col_idx, int* wv_row_ptr,
-    T_Activation* wo_values, T_MhaIndex* wo_col_idx, int* wo_row_ptr,
+    T_MhaTileWord* wq_bank, int* wq_counts,
+    T_MhaTileWord* wk_bank, int* wk_counts,
+    T_MhaTileWord* wv_bank, int* wv_counts,
+    T_MhaTileWord* wo_bank, int* wo_counts,
     const T_Scale* scales,
     T_Activation*  output
 ) {
@@ -836,7 +418,7 @@ void mha(
     #pragma HLS ARRAY_PARTITION variable=attn_output cyclic factor=MHA_BANK_CYCLIC dim=1
 
     /* Activation tiles for Q, K and V: one copy of the layer input, split per column block. */
-    load_activation_tiles(input_packed);
+    load_activation_tiles(input_packed, 0, MHA_TILE_WORDS);
 
     /* Phase 1, stages 0..3*MHA_N_HEADS-1: K, Q and V of one head, then that head's attention, so
      * only one head's projections are live at any time.  Phase 2: the output projection, in
@@ -861,22 +443,22 @@ void mha(
 
         /* The output projection multiplies the attention result, not the layer input. */
         if (which == 3 && first) {
-            load_activation_tiles(attn_output);
+            load_activation_tiles(attn_output, 0, MHA_TILE_WORDS);
         }
 
         /* Weight matrix of this stage; one branch each, all in this scope. */
         if (which == 0) {
-            if (first) { load_weight_bases(wk_row_ptr, feature_dim, 0); }
-            load_weight_slice(wk_values, wk_col_idx, wk_row_ptr, feature_dim, 0, row_base, MHA_FEATURE_HEAD);
+            if (first) { load_weight_bases(wk_counts, feature_dim, SPMM_W_K); }
+            load_weight_slice(wk_bank, wk_counts, feature_dim, SPMM_W_K, row_base, MHA_FEATURE_HEAD);
         } else if (which == 1) {
-            if (first) { load_weight_bases(wq_row_ptr, feature_dim, 1); }
-            load_weight_slice(wq_values, wq_col_idx, wq_row_ptr, feature_dim, 1, row_base, MHA_FEATURE_HEAD);
+            if (first) { load_weight_bases(wq_counts, feature_dim, SPMM_W_Q); }
+            load_weight_slice(wq_bank, wq_counts, feature_dim, SPMM_W_Q, row_base, MHA_FEATURE_HEAD);
         } else if (which == 2) {
-            if (first) { load_weight_bases(wv_row_ptr, feature_dim, 2); }
-            load_weight_slice(wv_values, wv_col_idx, wv_row_ptr, feature_dim, 2, row_base, MHA_FEATURE_HEAD);
+            if (first) { load_weight_bases(wv_counts, feature_dim, SPMM_W_V); }
+            load_weight_slice(wv_bank, wv_counts, feature_dim, SPMM_W_V, row_base, MHA_FEATURE_HEAD);
         } else {
-            if (first) { load_weight_bases(wo_row_ptr, feature_dim, 3); }
-            load_weight_slice(wo_values, wo_col_idx, wo_row_ptr, feature_dim, 3, row_base, MHA_FEATURE_HEAD);
+            if (first) { load_weight_bases(wo_counts, feature_dim, SPMM_W_O); }
+            load_weight_slice(wo_bank, wo_counts, feature_dim, SPMM_W_O, row_base, MHA_FEATURE_HEAD);
         }
 
         /* K' is emitted feature-major, Q' dense to a scratch and then token-major, V stays dense,

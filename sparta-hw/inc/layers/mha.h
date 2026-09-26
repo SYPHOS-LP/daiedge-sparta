@@ -36,30 +36,26 @@
 /**
  * @brief Linear multi-head attention (softmax-free).
  *
- * @param[in]  input_packed  Packed input activations
+ * @param[in]  input_packed  Packed input activations.
  * @param[in]  tokens_dim    Number of tokens.
- * @param[in]  wq_values     Q projection weight values.
- * @param[in]  wq_col_idx    Q projection weight column indices.
- * @param[in]  wq_row_ptr    Q projection weight row pointer.
- * @param[in]  wk_values     K projection weight values.
- * @param[in]  wk_col_idx    K projection weight column indices.
- * @param[in]  wk_row_ptr    K projection weight row pointer.
- * @param[in]  wv_values     V projection weight values.
- * @param[in]  wv_col_idx    V projection weight column indices.
- * @param[in]  wv_row_ptr    V projection weight row pointer.
- * @param[in]  wo_values     Output projection weight values.
- * @param[in]  wo_col_idx    Output projection weight column indices.
- * @param[in]  wo_row_ptr    Output projection weight row pointer.
+ * @param[in]  wq_bank       Q projection weight: packed {column, value} entries, column-block order.
+ * @param[in]  wq_counts     Q projection weight: nonzeros per (column block, row), block-major.
+ * @param[in]  wk_bank       K projection weight entries.
+ * @param[in]  wk_counts     K projection weight counts.
+ * @param[in]  wv_bank       V projection weight entries.
+ * @param[in]  wv_counts     V projection weight counts.
+ * @param[in]  wo_bank       Output projection weight entries.
+ * @param[in]  wo_counts     Output projection weight counts.
  * @param[in]  scales        Folded scales for requantization.
  * @param[out] output        Dense attention output.
  */
 void mha(
     T_MhaBankWord *input_packed,
     int            tokens_dim,
-    T_Activation *wq_values, T_MhaIndex *wq_col_idx, int *wq_row_ptr,
-    T_Activation *wk_values, T_MhaIndex *wk_col_idx, int *wk_row_ptr,
-    T_Activation *wv_values, T_MhaIndex *wv_col_idx, int *wv_row_ptr,
-    T_Activation *wo_values, T_MhaIndex *wo_col_idx, int *wo_row_ptr,
+    T_MhaTileWord *wq_bank, int *wq_counts,
+    T_MhaTileWord *wk_bank, int *wk_counts,
+    T_MhaTileWord *wv_bank, int *wv_counts,
+    T_MhaTileWord *wo_bank, int *wo_counts,
     const T_Scale *scales,
     T_Activation  *output
 );

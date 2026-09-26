@@ -137,6 +137,40 @@ static std::vector<double> reference_mlp_block(
     return y;
 }
 
+// Convert a CSR weight [rows x D] into the kernel's tiled bank layout: MHA_TILES column blocks,
+// entries of each row in order within a block, packed MHA_TILE_PACK per word with the value in
+// bits 0..3 and the block-local column in bits 4..9; each block padded to a whole word.  counts
+// holds the nonzeros per (block, row), block-major.  Mirrors compile_model.pack_tiled_bank().
+static void csr_to_tiled_bank(const std::vector<T_Activation>& val,
+                              const std::vector<T_MhaIndex>& col,
+                              const std::vector<int>& rowptr, int rows,
+                              std::vector<T_MhaTileWord>& bank, std::vector<int>& counts) {
+    const int width = MHA_FEATURE_W_MAX / MHA_TILES;
+    counts.assign(MHA_TILES * rows, 0);
+    std::vector<uint64_t> entries;
+    for (int t = 0; t < MHA_TILES; t++) {
+        size_t block_begin = entries.size();
+        for (int r = 0; r < rows; r++) {
+            int n = 0;
+            for (int s = rowptr[r]; s < rowptr[r + 1]; s++) {
+                const int c = (int) col[s];
+                if (c / width != t) continue;
+                const int v = (int) val[s];
+                // POT byte {sign bit7, exponent bits0..6} -> nibble {sign bit3, exponent bits0..2}
+                const uint64_t nibble = (uint64_t)((((v >> 7) & 1) << 3) | (v & 0x7));
+                entries.push_back(nibble | ((uint64_t)(c % width) << 4));
+                n++;
+            }
+            counts[t * rows + r] = n;
+        }
+        while ((entries.size() - block_begin) % MHA_TILE_PACK) entries.push_back(0);
+    }
+    bank.assign(entries.size() / MHA_TILE_PACK + MHA_TILE_PACK, (T_MhaTileWord) 0);
+    for (size_t e = 0; e < entries.size(); e++) {
+        bank[e / MHA_TILE_PACK] |= (T_MhaTileWord) entries[e] << (16 * (e % MHA_TILE_PACK));
+    }
+}
+
 struct TestResult{ bool passed; const char* name; };
 
 static TestResult run_case(
@@ -163,6 +197,12 @@ static TestResult run_case(
     auto padWm=[&](std::vector<T_Activation>&v,std::vector<T_MlpIndex>&c,std::vector<int>&p){
         v.resize(MAX_NNZ,(T_Activation)0); c.resize(MAX_NNZ,(T_MlpIndex)0); p.resize(WPTR,0);
     };
+    std::vector<T_MhaTileWord> wqb, wkb, wvb, wob;
+    std::vector<int> wqn, wkn, wvn, won;
+    csr_to_tiled_bank(wqv, wqc, wqp, D, wqb, wqn);
+    csr_to_tiled_bank(wkv, wkc, wkp, D, wkb, wkn);
+    csr_to_tiled_bank(wvv, wvc, wvp, D, wvb, wvn);
+    csr_to_tiled_bank(wov, woc, wop, D, wob, won);
     padW(wqv,wqc,wqp); padW(wkv,wkc,wkp); padW(wvv,wvc,wvp); padW(wov,woc,wop);
     padWm(w1v,w1c,w1p); padWm(w2v,w2c,w2p);
     x.resize(XY,(T_Activation)0);
@@ -189,10 +229,10 @@ static TestResult run_case(
     encoder_layer_top(
         x.data(),
         D, N, d_h,
-        wqv.data(),wqc.data(),wqp.data(),
-        wkv.data(),wkc.data(),wkp.data(),
-        wvv.data(),wvc.data(),wvp.data(),
-        wov.data(),woc.data(),wop.data(),
+        wqb.data(),wqn.data(),
+        wkb.data(),wkn.data(),
+        wvb.data(),wvn.data(),
+        wob.data(),won.data(),
         w1v.data(),w1c.data(),w1p.data(),
         w2v.data(),w2c.data(),w2p.data(),
         scales.data(),

@@ -49,12 +49,10 @@
  * @param[in]  tokens_dim       Number of tokens.
  * @param[in]  feature_dim      Feature width.
  * @param[in]  intermediate_dim MLP inner width.
- * @param[in]  w1_values        CSR values for the fc1 weight.
- * @param[in]  w1_col_idx       CSR column indices for the fc1 weight.
- * @param[in]  w1_row_ptr       CSR row pointers for the fc1 weight.
- * @param[in]  w2_values        CSR values for the fc2 weight.
- * @param[in]  w2_col_idx       CSR column indices for the fc2 weight.
- * @param[in]  w2_row_ptr       CSR row pointers for the fc2 weight.
+ * @param[in]  w1_bank          fc1 weight: packed {column, value} entries, column-block order.
+ * @param[in]  w1_counts        fc1 weight: nonzeros per (column block, row), block-major.
+ * @param[in]  w2_bank          fc2 weight entries.
+ * @param[in]  w2_counts        fc2 weight counts.
  * @param[in]  scales           Per-layer folded scales.
  * @param[out] output           Block output, feature-major.
  */
@@ -63,11 +61,10 @@ void encoder_mlp_block(
     int                 tokens_dim,
     int                 feature_dim,
     int                 intermediate_dim,
-    T_Activation* w1_values, T_MlpIndex* w1_col_idx, int* w1_row_ptr,
-    T_Activation* w2_values, T_MlpIndex* w2_col_idx, int* w2_row_ptr,
+    T_MhaTileWord* w1_bank, int* w1_counts,
+    T_MhaTileWord* w2_bank, int* w2_counts,
     const T_Scale*      scales,
-    T_Activation*       output,
-    bool                w2_prestaged = false
+    T_Activation*       output
 );
 
 /**
@@ -78,8 +75,8 @@ void encoder_mlp_block_top(
     int                 tokens_dim,
     int                 feature_dim,
     int                 intermediate_dim,
-    T_Activation* w1_values, T_MlpIndex* w1_col_idx, int* w1_row_ptr,
-    T_Activation* w2_values, T_MlpIndex* w2_col_idx, int* w2_row_ptr,
+    T_MhaTileWord* w1_bank, int* w1_counts,
+    T_MhaTileWord* w2_bank, int* w2_counts,
     const T_Scale*      scales,
     T_Activation*       output
 );

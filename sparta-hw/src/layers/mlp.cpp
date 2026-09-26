@@ -5,872 +5,94 @@
  *********************************************************************************/
 
 #include "mlp.h"
+#include "spmm_tiled.h"
 #include "quantize.h"
+#ifndef __SYNTHESIS__
 #include <cassert>
-#include <hls_stream.h>
-
-/* H streamed producer->consumer in the DATAFLOW MLP over ONE channel using a count-first
- * per-row protocol: for each hidden row the producer emits a HEADER token (is_header=1,
- * count = that row's surviving-nonzero count), then `count` VALUE tokens {val, token}.
- * The header lets the consumer walk each row with a BOUNDED for-loop (for s in 0..count),
- * which HLS pipelines/flattens with the inner W2 scatter — a data-dependent while(!last)
- * cannot be, and measured ~1.5x slower.  A single stream (vs two) keeps the DATAFLOW
- * producer/consumer coupling to one channel, which HLS's "produced/consumed exactly once"
- * dataflow check requires.  This replaces the DDR H CSR entirely, so H never touches DDR. */
-struct T_MlpHTok {
-    T_Activation val;        /* int8 hidden activation (value token) */
-    T_MlpHCol    token;      /* token index (value token) */
-    int          count;      /* row nnz count (header token) */
-    bool         is_header;  /* 1 => header (count valid); 0 => value token */
-};
-
-#if !defined(MLP_SPARSE_FORMAT_CSR)
-#error "mlp requires MLP_SPARSE_FORMAT_CSR."
 #endif
 
-/* The fused MAC has no unroll-1 fallback. */
-#if MLP_MAC_UNROLL < 2
-#error "MLP_MAC_UNROLL must be >= 2 (fused_sdmm_relu_streaming has no unroll-1 path)."
-#endif
-
-/* On-chip narrowed types must cover the values they hold, else the store wraps. */
-static_assert(MLP_TOKEN_W_MAX <= (1 << T_MlpHCol::width),  "MLP_TOKEN_W_MAX exceeds T_MlpHCol range");
-static_assert(MLP_FEATURE_W_MAX  <= (1 << T_MlpW1Col::width), "MLP_FEATURE_W_MAX exceeds T_MlpW1Col range");
-static_assert(MLP_HIDDEN_FEATURE_W_MAX   <= (1 << T_MlpW2Col::width), "MLP_HIDDEN_FEATURE_W_MAX exceeds T_MlpW2Col range");
-static_assert(MLP_FEATURE_OUT_W_MAX <= (1 << T_MlpW2Row::width), "MLP_FEATURE_OUT_W_MAX exceeds T_MlpW2Row range (W2 CSC row idx)");
-static_assert((int)T_MlpWVal::width >= 4,                "T_MlpWVal must hold w4 (-7..+7)");
-
-/* Per-row weight-decode buffers must cover the densest emitted row (rows are sparse). */
-static_assert(MLP_MAX_W1_NNZ <= MLP_FEATURE_W_MAX, "W1 decode depth should not exceed dense row width D");
-static_assert(MLP_MAX_W2_NNZ <= MLP_HIDDEN_FEATURE_W_MAX,  "W2 decode depth should not exceed dense row width d_h");
-
-/* Second linear layer output-row parallelism. */
-static_assert(MLP_OUT_ROW_PARALLEL >= 1, "MLP_OUT_ROW_PARALLEL must be >= 1");
-
-/* fused_sdmm_relu_streaming manually unrolls the 8 packed lanes of a bank word. */
-static_assert(MLP_BANK_PACK == 8, "code assumes MLP_BANK_PACK == 8");
+// Both stages run one output row at a time on the shared engine.
+static_assert(MHA_ROWS_PER_STEP == 1, "the MLP tails assume one output row per engine step");
+// A W1 row block must fall inside one hidden tile, so that the row's packed words go to one memory.
+static_assert(MHA_H_TILE_FEATURES % MHA_FEATURE_HEAD == 0,
+              "MHA_H_TILE_FEATURES must be a multiple of MHA_FEATURE_HEAD");
+static_assert(MLP_HIDDEN_FEATURE_W_MAX == MHA_TILES * MHA_H_TILE_FEATURES,
+              "hidden width != MHA_TILES * MHA_H_TILE_FEATURES");
 
 /**
- * @brief Burst-read one CSR weight row from DDR into on-chip buffers, narrowing the
- *        value/column to their on-chip widths.
+ * @brief Compute output rows [row_base, row_base + MHA_FEATURE_HEAD) of one of the two linears.
  *
- * @tparam T_OCVal  On-chip value type.
- * @tparam T_OCCol  On-chip column type.
+ * Requires the banks to hold this row block's entries (load_weight_slice).  The engine accumulates
+ * the MHA_TILES column blocks of one output row; this then either requantizes the row with ReLU and
+ * writes it packed into the hidden region of the activation tiles (W1), or requantizes it into the
+ * layer output (W2).
  *
- * @param[in]  in_val   DDR CSR values.
- * @param[in]  in_col   DDR CSR column indices.
- * @param[in]  in_ptr   DDR CSR row pointers.
- * @param[in]  row_id   Row to decode.
- * @param[out] out_val  On-chip row values.
- * @param[out] out_col  On-chip row column indices.
- * @param[out] out_len  Number of nonzeros written to the row.
+ * Both stages call it from here, so the engine has one call site in the MLP.
+ *
+ * @param[in]  to_hidden   Non-zero for the first linear (write H), zero for the second (write Y).
+ * @param[in]  row_base    First output row of this block.
+ * @param[in]  tokens_dim  Number of tokens.
+ * @param[in]  scale       Folded requantization scale of this linear.
+ * @param[out] output      Layer output in DDR (second linear only).
  */
-template <typename T_OCVal, typename T_OCCol>
-static inline void mlp_decode(
-    T_Activation *in_val,
-    T_MlpIndex   *in_col,
-    int          *in_ptr,
-    int           row_id,
-    T_OCVal      *out_val,
-    T_OCCol      *out_col,
-    int          &out_len
-) {
-#pragma HLS INLINE
-    int row_start = in_ptr[row_id];
-    int row_end   = in_ptr[row_id + 1];
-    out_len       = row_end - row_start;
-
-    /* Burst the CSR slice from DDR; the stores narrow the value and the 16-bit column
-     * to the on-chip widths. */
-    CSR_ROW_LOAD_LOOP:
-    for (int i = 0; i < out_len; i++) {
-        #pragma HLS LOOP_TRIPCOUNT min=MLP_TC_W1_NNZ max=MLP_TC_W2_NNZ
-        #pragma HLS PIPELINE II=1
-#ifdef POT_SHIFT_MAC
-        /* POT weight: DDR byte is {sign(bit7), exponent(bits0..6)}; repack to the
-         * on-chip {sign(bit3), exponent(bits0..2)} the shift-MAC reads. */
-        ap_uint<8> b = (ap_uint<8>) in_val[row_start + i];
-        out_val[i]   = (T_OCVal)((ap_uint<4>)((b[7] << 3) | (b & 0x7)));
-#else
-        out_val[i] = (T_OCVal) in_val[row_start + i];   /* narrow int8 -> w4 */
-#endif
-        out_col[i] = (T_OCCol) in_col[row_start + i];
-    }
-}
-
-// Wide DDR read words for better bursts on the AXI ports.
-#define MLP_W1_WIDE_BITS  128
-#define MLP_W1_VAL_LANES  (MLP_W1_WIDE_BITS / 8)    /* 16 int8 values per beat  */
-#define MLP_W1_COL_LANES  (MLP_W1_WIDE_BITS / 16)   /* 8 uint16 columns per beat */
-typedef ap_uint<MLP_W1_WIDE_BITS> T_MlpW1WideWord;
-
-/* Max nnz in one group's contiguous span (P consecutive W1 rows).  Sized to the exact
- * measured max group(P=4) nnz across all 12 layers (= 571, static weight), rounded up to
- * 572 to satisfy the P-way cyclic partition. */
-#define MLP_W1_GROUP_NNZ_MAX 572   // exact max group(P)-nnz = 571, rounded up to a multiple of P=4 (static weight)
-#if (MLP_W1_GROUP_NNZ_MAX % MLP_ROW_PARALLEL) != 0
-#error "MLP_W1_GROUP_NNZ_MAX must be a multiple of MLP_ROW_PARALLEL (cyclic partition)."
-#endif
-
-/**
- * @brief Coalesced group decode: burst the contiguous nnz span of
- *        P consecutive W1 rows [ptr[i], ptr[i+P]) through a 128-bit wide 
- *        word into one flat group buffer, and return each row's base offset 
- *        within it.
- *
- * @param[in]  in_val    DDR CSR values (int8, POT byte when POT_SHIFT_MAC).
- * @param[in]  in_col    DDR CSR column indices (uint16).
- * @param[in]  rptr      On-chip W1 row-pointer copy.
- * @param[in]  base_row  First hidden row of the group.
- * @param[in]  n_rows    Rows in this group.
- * @param[out] flat_val  Flat group value buffer (cyclic-partitioned by P in the caller).
- * @param[out] flat_col  Flat group column buffer (cyclic-partitioned by P in the caller).
- * @param[out] row_base  Per-row base offset within the flat buffers (P+1 entries; the MAC
- *                       reads flat[row_base[pe] + k] for k in [0, out_len[pe])).
- * @param[out] out_len   Per-row nnz counts.
- */
-static inline void mlp_decode_group_wide(
-    T_Activation *in_val,
-    T_MlpIndex   *in_col,
-    int          *rptr,
-    int           base_row,
-    int           n_rows,
-    T_MlpWVal     flat_val[MLP_W1_GROUP_NNZ_MAX],
-    T_MlpW1Col    flat_col[MLP_W1_GROUP_NNZ_MAX],
-    int           row_base[MLP_ROW_PARALLEL + 1],
-    int           out_len[MLP_ROW_PARALLEL]
-) {
-#pragma HLS INLINE off
-    const int grp_start = rptr[base_row];
-    const int grp_end   = rptr[base_row + n_rows];
-    const int grp_nnz   = grp_end - grp_start;
-#ifndef __SYNTHESIS__
-    assert(grp_nnz <= MLP_W1_GROUP_NNZ_MAX && "W1 group nnz exceeds MLP_W1_GROUP_NNZ_MAX (raise the cap)");
-#endif
-
-    /* Per-row span bases within the flat group span (buffer-local offsets). */
-    ROW_BASE_INIT:
-    for (int pe = 0; pe <= MLP_ROW_PARALLEL; pe++) {
-        #pragma HLS UNROLL
-        if (pe <= n_rows) row_base[pe] = rptr[base_row + pe] - grp_start;
-        else              row_base[pe] = grp_nnz;
-    }
-    LEN_SET:
-    for (int pe = 0; pe < MLP_ROW_PARALLEL; pe++) {
-        #pragma HLS UNROLL
-        out_len[pe] = (pe < n_rows) ? (row_base[pe + 1] - row_base[pe]) : 0;
-    }
-
-    /* Wide views of the same contiguous DDR CSR streams, based at the group's start.
-     * grp_start need not be 16-elem aligned, so start at the aligned word that CONTAINS
-     * grp_start and skip the leading lanes (guard idx in [0, grp_nnz)).  Each in-range
-     * lane is written to the single flat buffer at its buffer-local index, so that there
-     * is no per-lane P-way route.  The flat buffer is cyclic-partitioned by P, so consecutive
-     * indices land in distinct banks leading the lane writes to co-schedule at II=1. */
-    T_MlpW1WideWord *val_wide = reinterpret_cast<T_MlpW1WideWord*>(in_val);
-    T_MlpW1WideWord *col_wide = reinterpret_cast<T_MlpW1WideWord*>(in_col);
-
-    const int val_word0 =  grp_start / MLP_W1_VAL_LANES;
-    const int val_word1 = (grp_end + MLP_W1_VAL_LANES - 1) / MLP_W1_VAL_LANES;
-    GROUP_VAL_WIDE:
-    for (int wq = val_word0; wq < val_word1; wq++) {
-        #pragma HLS LOOP_TRIPCOUNT min=1 max=(MLP_W1_GROUP_NNZ_MAX/MLP_W1_VAL_LANES+2)
-        #pragma HLS PIPELINE II=1
-        T_MlpW1WideWord word = val_wide[wq];
-        GROUP_VAL_LANE:
-        for (int lane = 0; lane < MLP_W1_VAL_LANES; lane++) {
-            #pragma HLS UNROLL
-            int idx = wq * MLP_W1_VAL_LANES + lane - grp_start;   /* buffer-local */
-            if (idx >= 0 && idx < grp_nnz) {
-                ap_uint<8> b = (ap_uint<8>) word.range(lane * 8 + 7, lane * 8);
-#ifdef POT_SHIFT_MAC
-                flat_val[idx] = (T_MlpWVal)((ap_uint<4>)((b[7] << 3) | (b & 0x7)));
-#else
-                flat_val[idx] = (T_MlpWVal)(ap_int<8>) b;
-#endif
-            }
-        }
-    }
-
-    const int col_word0 =  grp_start / MLP_W1_COL_LANES;
-    const int col_word1 = (grp_end + MLP_W1_COL_LANES - 1) / MLP_W1_COL_LANES;
-    GROUP_COL_WIDE:
-    for (int wq = col_word0; wq < col_word1; wq++) {
-        #pragma HLS LOOP_TRIPCOUNT min=1 max=(MLP_W1_GROUP_NNZ_MAX/MLP_W1_COL_LANES+2)
-        #pragma HLS PIPELINE II=1
-        T_MlpW1WideWord word = col_wide[wq];
-        GROUP_COL_LANE:
-        for (int lane = 0; lane < MLP_W1_COL_LANES; lane++) {
-            #pragma HLS UNROLL
-            int idx = wq * MLP_W1_COL_LANES + lane - grp_start;   /* buffer-local */
-            if (idx >= 0 && idx < grp_nnz) {
-                ap_uint<16> c = (ap_uint<16>) word.range(lane * 16 + 15, lane * 16);
-                flat_col[idx] = (T_MlpW1Col)(T_MlpIndex) c;
-            }
-        }
-    }
-}
-
-/**
- * @brief Unpack one int8 activation from a packed word, multiply with given weight
- * and accumulate it into an output row.
- *
- * @param[in]     input       Packed input
- * @param[in]     weight      Weight used for multiplication
- * @param[in]     token_idx   Token index this chunk maps to
- * @param[in]     chunk       Chunk of packed input to be used
- * @param[in]     tokens_dim  Number of tokens, used to skip padding
- * @param[in,out] out_row     Output row
- */
-static inline void mac_pe(
-    T_MlpBankWord input,
-    T_MlpWVal     weight,
-    int           token_idx,
-    int           chunk,
+static void mlp_rows (
+    int           to_hidden,
+    int           row_base,
     int           tokens_dim,
-    T_MlpAcc      out_row[MLP_TOKEN_W_MAX]
-) {
-#pragma HLS INLINE
-    if (token_idx < tokens_dim) {
-        /* Unpack */
-        T_Activation input_word = (T_Activation) input.range(chunk * 8 + 7, chunk * 8);
-#ifdef POT_SHIFT_MAC
-        /* POT weight is {sign(bit3), exponent(bits0..2)}.LUTs are
-         * a scarce resource at this point, so we bind this operation
-         * to a DSP, as these are underutilized. */
-        ap_uint<3> e   = weight.range(2, 0);
-        bool       neg = weight[3];
-        T_MlpAcc   pot = neg ? (T_MlpAcc)(-(1 << e)) : (T_MlpAcc)(1 << e);
-        T_MlpAcc   prod = (T_MlpAcc) input_word * pot;
-        #pragma HLS BIND_OP variable=prod op=mul impl=dsp
-        out_row[token_idx] += prod;
-#else
-        /* Multiply - Accumulate */
-        out_row[token_idx] += weight * input_word;
-#endif
-    }
-}
-
-/**
- * @brief First linear layer fused with ReLU on its output, so that the output is sparse.
- *
- * Each hidden row's surviving nonzeros are pushed to `h_stream` using a count-first
- * per-row protocol (see T_MlpHTok).  Used as the DATAFLOW producer so stage-2 consumes
- * H as it is produced (H never round-trips through DDR).
- *
- * @param[in]  input_packed  Packed input activation banks.
- * @param[in]  w1_values     W1 weight values.
- * @param[in]  w1_col_idx    W1 column indices.
- * @param[in]  w1_row_ptr    W1 row pointers.
- * @param[in]  hidden_dim    Hidden dimension.
- * @param[in]  feature_dim   Input feature dimension.
- * @param[in]  batch         Token count.
- * @param[in]  scale         Requantization scale.
- * @param[out] h_stream      Hidden-activation token stream to the consumer.
- */
-static void fused_sdmm_relu_streaming (
-    T_MlpBankWord *input_packed,
-    T_Activation  *w1_values,
-    T_MlpIndex    *w1_col_idx,
-    int           *w1_row_ptr,
-    int            hidden_dim,
-    int            feature_dim,
-    int            batch,
-    T_Scale        scale,
-    hls::stream<T_MlpHTok> &h_stream
-) {
-    #pragma HLS ARRAY_PARTITION variable=input_packed cyclic factor=MLP_BANK_CYCLIC dim=1
-#ifndef __SYNTHESIS__
-    assert(batch       <= MLP_TOKEN_W_MAX && "batch exceeds MLP_TOKEN_W_MAX");
-    assert(feature_dim <= MLP_FEATURE_W_MAX  && "feature_dim exceeds MLP_FEATURE_W_MAX");
-    assert(feature_dim <= MAX_ROWS      && "feature_dim exceeds MAX_ROWS");
-#endif
-
-    /* Flat-buffer group decode scratch: one flat value/column buffer holds the whole
-     * group's contiguous nnz span (sized to the measured group-nnz max + margin),
-     * replacing the P per-row buffers.  Cyclic-partitioned by P.*/
-    T_MlpWVal  w_flat_val[MLP_W1_GROUP_NNZ_MAX];
-    T_MlpW1Col w_flat_col[MLP_W1_GROUP_NNZ_MAX];
-    int        w_base[MLP_ROW_PARALLEL + 1];   /* per-row base offset within the flat buffers */
-    int        w_len[MLP_ROW_PARALLEL];
-    T_MlpAcc   h_row[MLP_ROW_PARALLEL][MLP_TOKEN_W_MAX];
-    #pragma HLS ARRAY_PARTITION variable=w_flat_val cyclic factor=MLP_ROW_PARALLEL dim=1
-    #pragma HLS ARRAY_PARTITION variable=w_flat_col cyclic factor=MLP_ROW_PARALLEL dim=1
-    #pragma HLS ARRAY_PARTITION variable=w_base complete dim=1
-    #pragma HLS ARRAY_PARTITION variable=w_len complete dim=1
-    #pragma HLS ARRAY_PARTITION variable=h_row complete dim=1
-    #pragma HLS ARRAY_PARTITION variable=h_row cyclic factor=MLP_MAC_UNROLL dim=2
-
-    const T_MlpAcc ZERO = (T_MlpAcc) 0;
-
-    /* Bulk-load the whole W1 row-pointer array on-chip once, up front, via a tight
-     * pipelined burst -- mlp_decode() below then reads per-row spans from this on-chip
-     * copy instead of taking a second, isolated trip to DDR for every one of the
-     * hidden_dim rows.  Same "fine in C-sim, hangs on real hardware" bare-scalar-m_axi-
-     * read pattern already fixed for W2 by stage_w2_csc(); ported from
-     * sparta-hw-armagedon-kr260-v3 (9df179a). */
-    static int w1_rptr_buffer[MLP_HIDDEN_FEATURE_W_MAX + 1];
-    #pragma HLS BIND_STORAGE variable=w1_rptr_buffer type=ram_t2p impl=bram
-    W1_ROW_POINTER_LOAD:
-    for (int h = 0; h <= hidden_dim; h++) {
-        #pragma HLS LOOP_TRIPCOUNT min=(MLP_TC_HIDDEN_FEATURE+1) max=(MLP_TC_HIDDEN_FEATURE+1)
-        #pragma HLS PIPELINE II=1
-        w1_rptr_buffer[h] = w1_row_ptr[h];
-    }
-
-    HIDDEN_ROW_GROUP:
-    for (int i = 0; i < hidden_dim; i += MLP_ROW_PARALLEL) {
-        #pragma HLS LOOP_TRIPCOUNT min=(MLP_TC_HIDDEN_FEATURE/MLP_ROW_PARALLEL) max=(MLP_TC_HIDDEN_FEATURE/MLP_ROW_PARALLEL)
-
-        /* Wide group decode: one 128-bit burst of the group's contiguous [ptr[i], ptr[i+P]) 
-         * span into the flat buffer. */
-        const int rows_in_group = (hidden_dim - i < MLP_ROW_PARALLEL) ? (hidden_dim - i) : MLP_ROW_PARALLEL;
-        mlp_decode_group_wide(w1_values, w1_col_idx, w1_rptr_buffer,
-                              i, rows_in_group, w_flat_val, w_flat_col, w_base, w_len);
-
-        DECODE_AND_CLEAR:
-        for (int pe = 0; pe < MLP_ROW_PARALLEL; pe++) {
-            #pragma HLS UNROLL
-            CLEAR_ACCUMULATOR:
-            for (int j = 0; j < batch; j++) {
-                #pragma HLS LOOP_TRIPCOUNT min=MLP_TC_BATCH max=MLP_TC_BATCH
-                #pragma HLS PIPELINE II=1
-                #pragma HLS UNROLL factor=MLP_MAC_UNROLL
-                h_row[pe][j] = ZERO;
-            }
-        }
-
-        int max_nnz = 0;
-        LONGEST_ROW_SPAN:
-        for (int pe = 0; pe < MLP_ROW_PARALLEL; pe++) {
-            #pragma HLS UNROLL
-            if (w_len[pe] > max_nnz) {
-                max_nnz = w_len[pe];
-            }
-        }
-
-        const int n_tiles = (batch + MLP_MAC_UNROLL - 1) / MLP_MAC_UNROLL;
-        const int walk_total = max_nnz * n_tiles;
-        int k = 0;
-        int tile = 0;
-        NONZERO_WALK_FLAT:
-        for (int kt = 0; kt < walk_total; kt++) {
-            #pragma HLS LOOP_TRIPCOUNT min=(MLP_TC_W1_NNZ*(MLP_TC_BATCH/MLP_MAC_UNROLL+1)) max=(MLP_TC_W1_NNZ*(MLP_TC_BATCH/MLP_MAC_UNROLL+1))
-            #pragma HLS PIPELINE II=1
-            const int token_base = tile * MLP_MAC_UNROLL;
-
-            PARALLEL_HIDDEN_ROWS:
-            for (int pe = 0; pe < MLP_ROW_PARALLEL; pe++) {
-                #pragma HLS UNROLL
-                if (k < w_len[pe]) {
-                    const int fk             = w_base[pe] + k;   /* flat-buffer index for row pe, nnz k */
-                    T_MlpWVal weight         = w_flat_val[fk];
-                    int       xrow_word_base = (int)w_flat_col[fk] * MLP_BANK_ROW_WORDS;
-                    int       tile_word_base = xrow_word_base + (token_base / MLP_BANK_PACK);
-
-                    TILE_WORDS:
-                    for (int wo = 0; wo < MLP_BANK_CYCLIC; wo++) {
-                        #pragma HLS UNROLL
-                        T_MlpBankWord packed_x = input_packed[tile_word_base + wo];
-                        int token0 = token_base + wo * MLP_BANK_PACK;
-                        mac_pe(packed_x, weight, token0 + 0, 0, batch, h_row[pe]);
-                        mac_pe(packed_x, weight, token0 + 1, 1, batch, h_row[pe]);
-                        mac_pe(packed_x, weight, token0 + 2, 2, batch, h_row[pe]);
-                        mac_pe(packed_x, weight, token0 + 3, 3, batch, h_row[pe]);
-                        mac_pe(packed_x, weight, token0 + 4, 4, batch, h_row[pe]);
-                        mac_pe(packed_x, weight, token0 + 5, 5, batch, h_row[pe]);
-                        mac_pe(packed_x, weight, token0 + 6, 6, batch, h_row[pe]);
-                        mac_pe(packed_x, weight, token0 + 7, 7, batch, h_row[pe]);
-                    }
-                }
-            }
-
-            /* Advance the (k, tile) counters instead of decoding them from kt via divide/
-             * modulo by the runtime n_tiles. */
-            if (tile + 1 == n_tiles) { tile = 0; k++; }
-            else                     { tile++; }
-        }
-
-        /* ReLU + emit each hidden row's nonzeros to the stream (row-sequential). */
-        DRAIN_PE:
-        for (int pe = 0; pe < MLP_ROW_PARALLEL; pe++) {
-            int row = i + pe;
-            if (row >= hidden_dim) {
-                continue;
-            }
-
-            /* Buffer this row's surviving nonzeros so the count is known before the
-             * header token is written (count-first protocol). */
-            T_Activation row_val[MLP_TOKEN_W_MAX];
-            T_MlpHCol    row_tok[MLP_TOKEN_W_MAX];
-            int          row_nnz = 0;
-
-            SPARSIFY:
-            for (int j = 0; j < batch; j++) {
-                #pragma HLS LOOP_TRIPCOUNT min=MLP_TC_BATCH max=MLP_TC_BATCH
-                #pragma HLS PIPELINE II=1
-                T_MlpAcc acc_val = h_row[pe][j];
-                if (acc_val > ZERO) {
-                    T_Activation hv = requant_to_int8(acc_val, scale);
-                    if (hv > (T_Activation) 0) {
-                        row_val[row_nnz] = hv;
-                        row_tok[row_nnz] = (T_MlpHCol) j;
-                        row_nnz++;
-                    }
-                }
-            }
-
-            /* Count-first protocol: emit a HEADER token with this row's nnz count, then its
-             * value tokens.  An empty row emits just the header (count 0). */
-            T_MlpHTok hdr;
-            hdr.val = (T_Activation) 0;
-            hdr.token = (T_MlpHCol) 0;
-            hdr.count = row_nnz;
-            hdr.is_header = true;
-            h_stream.write(hdr);
-
-            EMIT_ROW:
-            for (int s = 0; s < row_nnz; s++) {
-                #pragma HLS LOOP_TRIPCOUNT min=MLP_TC_HIDDEN_NNZ max=MLP_TC_HIDDEN_NNZ
-                #pragma HLS PIPELINE II=1
-                T_MlpHTok t;
-                t.val       = row_val[s];
-                t.token     = row_tok[s];
-                t.count     = 0;
-                t.is_header = false;
-                h_stream.write(t);
-            }
-        }
-    }
-}
-
-/* Global W2 CSC staging (whole W2, column-major, staged on-chip ONCE per layer -> URAM).
- * W2 is a STATIC weight so its nnz is exact/compile-time known.  To use URAM efficiently
- * (HLS stores 1 elem/URAM-row = 72b), each nonzero {val 4b, row 10b}=14b is PACKED
- * MLP_W2_PACK per word: g_w2_csc[word] lane k = {row(10b) : val(4b)} at bit k*14.
- *   g_w2_csc_ptr : per-hidden-column span [ptr[h], ptr[h+1]) in NONZERO units.
- * The H-driven stage-2 walks H sequentially and, per hidden column h, scatters that
- * column's nonzeros into the output accumulators. */
-/* Per-slice W2 CSC: PE p holds ONLY the nonzeros whose out_row is in its contiguous slice
- * [p*MLP_OUT_ROW_SLICE, (p+1)*MLP_OUT_ROW_SLICE).  g_w2_csc_ptr[p][h] is the per-column span
- * (nonzero units) within slice p's own packed value array g_w2_csc[p].  Packing is contiguous
- * across columns per slice (no per-column flush).  Splitting the nonzero WORK per PE (not just
- * predicating one shared walk) is what makes the P scatter lanes overlap. */
-static T_MlpW2Word g_w2_csc[MLP_OUT_ROW_PARALLEL][MLP_W2_WORDS_PE];
-static int         g_w2_csc_ptr[MLP_OUT_ROW_PARALLEL][MLP_HIDDEN_FEATURE_W_MAX + 1];
-
-/* Staging scratch (mlp_stage_w2 only): on-chip copy of the DDR column pointers, and the list of
- * non-empty columns with their end offsets (+1 sentinel entry for the look-ahead read). */
-static int g_w2_col_ptr[MLP_HIDDEN_FEATURE_W_MAX + 1];
-static int g_w2_nonempty_col[MLP_HIDDEN_FEATURE_W_MAX + 1];
-static int g_w2_nonempty_end[MLP_HIDDEN_FEATURE_W_MAX + 1];
-
-/* Unpack a W2 nonzero from an ALREADY-FETCHED packed word (word = g_w2_csc[s/PACK]).
- * The caller fetches the word once per PACK consecutive nonzeros (cuts URAM reads +
- * the per-nonzero shift LUT). */
-static inline void w2_lane_from_word(T_MlpW2Word word, int lane_idx,
-                                     T_MlpWVal &val, T_MlpW2Row &row) {
-#pragma HLS INLINE
-    const int lane = lane_idx * MLP_W2_LANE_BITS;
-    val = (T_MlpWVal)  word.range(lane + 3,  lane);
-    row = (T_MlpW2Row) word.range(lane + 13, lane + 4);
-}
-
-/* Packed acc lane read/modify-write: acc word holds MLP_ACC_PACK int20 lanes along token.
- * lane = token % PACK (runtime -> a small PACK-way barrel insert on the write). */
-static inline T_MlpAccLane acc_get(T_MlpAccWord word, int lane_idx) {
-#pragma HLS INLINE
-    const int lo = lane_idx * MLP_ACC_BITS;
-    return (T_MlpAccLane) word.range(lo + MLP_ACC_BITS - 1, lo);
-}
-static inline void acc_set(T_MlpAccWord &word, int lane_idx, T_MlpAccLane v) {
-#pragma HLS INLINE
-    const int lo = lane_idx * MLP_ACC_BITS;
-    word.range(lo + MLP_ACC_BITS - 1, lo) = (ap_uint<MLP_ACC_BITS>) v;
-}
-
-/**
- * @brief Burst-stage the whole W2 (column-major CSC) from DDR into on-chip PACKED URAM once.
- *
- * DDR is touched by exactly two sequential, unconditional loops (the burstable pattern): one over
- * the column pointers and one over all nonzeros.  Column boundaries are tracked on-chip, instead of
- * re-reading w2_col_ptr from DDR per column inside a nested loop (which cannot burst, and is the
- * isolated-scalar m_axi read pattern known to misbehave on the board).  w2_values and w2_row_idx
- * must sit on different m_axi bundles so the nonzero loop can burst both.
- *
- * @param[in]  w2_values   W2 CSC values in DDR
- * @param[in]  w2_row_idx  W2 CSC row indices
- * @param[in]  w2_col_ptr  W2 CSC column pointers
- * @param[in]  hidden_dim  Number of hidden columns
- */
-void mlp_stage_w2(
-    T_Activation *w2_values,
-    T_MlpIndex   *w2_row_idx,
-    int          *w2_col_ptr,
-    int           hidden_dim
-) {
-#pragma HLS INLINE off
-    #pragma HLS BIND_STORAGE variable=g_w2_csc type=ram_t2p impl=uram
-    #pragma HLS ARRAY_PARTITION variable=g_w2_csc     complete dim=1
-    #pragma HLS ARRAY_PARTITION variable=g_w2_csc_ptr complete dim=1
-    #pragma HLS BIND_STORAGE variable=g_w2_col_ptr      type=ram_t2p impl=bram
-    #pragma HLS BIND_STORAGE variable=g_w2_nonempty_col type=ram_t2p impl=bram
-    #pragma HLS BIND_STORAGE variable=g_w2_nonempty_end type=ram_t2p impl=bram
-
-    /* 1. Column pointers: one sequential burst into on-chip memory. */
-    W2_COL_PTR_LOAD:
-    for (int h = 0; h <= hidden_dim; h++) {
-        #pragma HLS LOOP_TRIPCOUNT min=(MLP_HIDDEN_FEATURE_W_MAX+1) max=(MLP_HIDDEN_FEATURE_W_MAX+1)
-        #pragma HLS PIPELINE II=1
-        g_w2_col_ptr[h] = w2_col_ptr[h];
-    }
-
-    /* 2. Non-empty columns and where each one ends (on-chip only). */
-    int n_nonempty = 0;
-    int prev_end   = g_w2_col_ptr[0];
-    W2_NONEMPTY_COLS:
-    for (int h = 0; h < hidden_dim; h++) {
-        #pragma HLS LOOP_TRIPCOUNT min=MLP_HIDDEN_FEATURE_W_MAX max=MLP_HIDDEN_FEATURE_W_MAX
-        #pragma HLS PIPELINE II=1
-        const int end = g_w2_col_ptr[h + 1];
-        if (end > prev_end) {
-            g_w2_nonempty_col[n_nonempty] = h;
-            g_w2_nonempty_end[n_nonempty] = end;
-            n_nonempty++;
-        }
-        prev_end = end;
-    }
-    const int total_nnz = prev_end;
-    g_w2_nonempty_col[n_nonempty] = 0;    /* sentinel for the look-ahead read, never matched */
-    g_w2_nonempty_end[n_nonempty] = -1;
-#ifndef __SYNTHESIS__
-    assert(total_nnz <= MLP_MAX_W2_TOTAL_NNZ && "W2 nnz exceeds MLP_MAX_W2_TOTAL_NNZ");
-#endif
-
-    /* Per-slice packing cursors: partial word, lane-in-word, and word index for each PE. */
-    T_MlpW2Word word[MLP_OUT_ROW_PARALLEL];
-    int         lane[MLP_OUT_ROW_PARALLEL];
-    int         w[MLP_OUT_ROW_PARALLEL];
-    #pragma HLS ARRAY_PARTITION variable=word complete dim=1
-    #pragma HLS ARRAY_PARTITION variable=lane complete dim=1
-    #pragma HLS ARRAY_PARTITION variable=w    complete dim=1
-    W2_SLICE_INIT:
-    for (int p = 0; p < MLP_OUT_ROW_PARALLEL; p++) {
-        #pragma HLS UNROLL
-        word[p] = 0; lane[p] = 0; w[p] = 0;
-        g_w2_csc_ptr[p][0] = 0;
-    }
-
-    /* 3. One pass over all nonzeros (column-major): route each to its out_row slice, appending to that
-     * slice's packed array.  At the end of each non-empty column, record every slice's per-column
-     * pointer.  The next boundary is read one entry ahead so the crossing costs no extra state. */
-    int cur_end = g_w2_nonempty_end[0];
-    int cur_col = g_w2_nonempty_col[0];
-    int k       = 0;
-    W2_CSC_NZ:
-    for (int i = 0; i < total_nnz; i++) {
-        #pragma HLS LOOP_TRIPCOUNT min=MLP_MAX_W2_TOTAL_NNZ max=MLP_MAX_W2_TOTAL_NNZ
-        #pragma HLS PIPELINE II=1
-        const int next_end = g_w2_nonempty_end[k + 1];
-        const int next_col = g_w2_nonempty_col[k + 1];
-#ifdef POT_SHIFT_MAC
-        ap_uint<8> b  = (ap_uint<8>) w2_values[i];
-        T_MlpWVal  v  = (T_MlpWVal)((ap_uint<4>)((b[7] << 3) | (b & 0x7)));
-#else
-        T_MlpWVal  v  = (T_MlpWVal) w2_values[i];
-#endif
-        const int  r  = (int) w2_row_idx[i];
-        const int  p  = r / MLP_OUT_ROW_SLICE;   /* which contiguous out_row slice owns it */
-        const int  lo = lane[p] * MLP_W2_LANE_BITS;
-        word[p].range(lo + 3,  lo)     = (ap_uint<4>)  v;
-        word[p].range(lo + 13, lo + 4) = (ap_uint<10>) (T_MlpW2Row) r;
-        lane[p]++;
-        if (lane[p] == MLP_W2_PACK) { g_w2_csc[p][w[p]++] = word[p]; word[p] = 0; lane[p] = 0; }
-
-        if (i + 1 == cur_end) {
-            /* Per-column span in NONZERO units, per slice (contiguous packing across columns). */
-            W2_COL_PTR:
-            for (int q = 0; q < MLP_OUT_ROW_PARALLEL; q++) {
-                #pragma HLS UNROLL
-                g_w2_csc_ptr[q][cur_col + 1] = w[q] * MLP_W2_PACK + lane[q];
-            }
-            k++;
-            cur_end = next_end;
-            cur_col = next_col;
-        }
-    }
-
-    /* 4. Empty columns span nothing: they inherit the previous column's pointer. */
-    int prev_ptr[MLP_OUT_ROW_PARALLEL];
-    #pragma HLS ARRAY_PARTITION variable=prev_ptr complete dim=1
-    for (int p = 0; p < MLP_OUT_ROW_PARALLEL; p++) {
-        #pragma HLS UNROLL
-        prev_ptr[p] = 0;
-    }
-    prev_end = g_w2_col_ptr[0];
-    W2_EMPTY_COLS:
-    for (int h = 0; h < hidden_dim; h++) {
-        #pragma HLS LOOP_TRIPCOUNT min=MLP_HIDDEN_FEATURE_W_MAX max=MLP_HIDDEN_FEATURE_W_MAX
-        #pragma HLS PIPELINE II=1
-        const int  end   = g_w2_col_ptr[h + 1];
-        const bool empty = (end == prev_end);
-        for (int p = 0; p < MLP_OUT_ROW_PARALLEL; p++) {
-            #pragma HLS UNROLL
-            const int ptr = empty ? prev_ptr[p] : g_w2_csc_ptr[p][h + 1];
-            if (empty) {
-                g_w2_csc_ptr[p][h + 1] = ptr;
-            }
-            prev_ptr[p] = ptr;
-        }
-        prev_end = end;
-    }
-
-    /* Flush each slice's final partial word. */
-    W2_SLICE_FLUSH:
-    for (int p = 0; p < MLP_OUT_ROW_PARALLEL; p++) {
-        #pragma HLS UNROLL
-        if (lane[p] != 0) g_w2_csc[p][w[p]] = word[p];
-    }
-}
-
-/**
- * @brief H-driven second linear layer: Y = W2 . H, reformulated so H is read ONCE,
- *        SEQUENTIALLY, and scattered through W2's COLUMNS (CSC).
- *
- * Y[out,tok] = sum_h W2[out,h] * H[h,tok].  Walk hidden row h (H storage order, sequential)
- * and, per H[h] nonzero (token,val), scatter W2 column h's (out_row, weight) into
- * acc[out_row][token].  H arrives from `h_stream` rather than DDR, so it is consumed as the
- * producer emits it; acc holds the full Y (feature-major).  Used as the DATAFLOW consumer.
- * g_w2_csc / g_w2_csc_ptr are staged (read-only here) before the DATAFLOW region.
- *
- * The scatter's acc update has a data-dependent address but consecutive iterations (walking
- * a W2 column) target DISTINCT out_row, so the inter-iteration acc dependence is false
- * (asserted) — restoring II~1.
- *
- * @param[in]  h_stream     Hidden-activation token stream from the producer
- * @param[in]  feature_dim  Output feature dimension
- * @param[in]  hidden_dim   Hidden dimension
- * @param[in]  batch        Token count
- * @param[in]  scale        Requantization scale
- * @param[out] output       Y = W2 . H, feature-major int8
- */
-static void spmm_dense_streaming(
-    hls::stream<T_MlpHTok> &h_stream,
-    int           feature_dim,
-    int           hidden_dim,
-    int           batch,
     T_Scale       scale,
-    T_Activation* output
+    T_Activation *output
 ) {
 #pragma HLS INLINE off
-    /* Full Y accumulator (feature-major), PACKED int20 lanes per URAM word (token axis).
-     * Split into P disjoint banks by out_row slice: acc[p] owns rows [p*SLICE, (p+1)*SLICE),
-     * indexed LOCALLY (out_row - p*SLICE).  Distinct URAMs -> the P scatter lanes write in the
-     * same II=1 iteration without a shared port. */
-    static T_MlpAccWord acc[MLP_OUT_ROW_PARALLEL][MLP_OUT_ROW_SLICE][MLP_ACC_ROW_WORDS];
-    #pragma HLS BIND_STORAGE variable=acc type=ram_t2p impl=uram
-    #pragma HLS ARRAY_PARTITION variable=acc complete dim=1
+    const int row_words = (tokens_dim + MHA_BANK_PACK - 1) / MHA_BANK_PACK;
+    /* W1 reads the layer input in the first region of each tile, W2 reads H in the second. */
+    const int act_base = to_hidden ? 0 : MHA_H_TILE_BASE;
+    /* Hidden feature f lives in tile f / MHA_H_TILE_FEATURES at local feature f % that. */
+    const int h_tile  = row_base / MHA_H_TILE_FEATURES;
+    const int h_local = row_base % MHA_H_TILE_FEATURES;
 
-    CLEAR_ACC_ROW:
-    for (int r = 0; r < MLP_OUT_ROW_SLICE; r++) {
-        #pragma HLS LOOP_TRIPCOUNT min=MLP_OUT_ROW_SLICE max=MLP_OUT_ROW_SLICE
-        CLEAR_ACC_WORD:
-        for (int wd = 0; wd < MLP_ACC_ROW_WORDS; wd++) {
-            #pragma HLS LOOP_TRIPCOUNT min=MLP_ACC_ROW_WORDS max=MLP_ACC_ROW_WORDS
-            #pragma HLS PIPELINE II=1
-            CLEAR_ACC_PE:
-            for (int p = 0; p < MLP_OUT_ROW_PARALLEL; p++) {
-                #pragma HLS UNROLL
-                acc[p][r][wd] = (T_MlpAccWord) 0;
-            }
-        }
-    }
+    MLP_ROW:
+    for (int i = 0; i < MHA_FEATURE_HEAD; i++) {
+        #pragma HLS LOOP_TRIPCOUNT min=MHA_FEATURE_HEAD max=MHA_FEATURE_HEAD
 
-    /* Walk hidden rows in storage order; H nonzeros arrive from the stream. */
-    HIDDEN_ROW:
-    for (int h = 0; h < hidden_dim; h++) {
-        #pragma HLS LOOP_TRIPCOUNT min=MLP_TC_HIDDEN_FEATURE max=MLP_TC_HIDDEN_FEATURE
+        tiled_rows_compute(i, 1, tokens_dim, act_base);
 
-        /* Per-slice W2 column span (nonzero units) and the longest across slices. */
-        int  w_begin[MLP_OUT_ROW_PARALLEL], w_span[MLP_OUT_ROW_PARALLEL];
-        #pragma HLS ARRAY_PARTITION variable=w_begin complete dim=1
-        #pragma HLS ARRAY_PARTITION variable=w_span  complete dim=1
-        int  max_span = 0;
-        SPAN_PE:
-        for (int p = 0; p < MLP_OUT_ROW_PARALLEL; p++) {
-            #pragma HLS UNROLL
-            w_begin[p] = g_w2_csc_ptr[p][h];
-            w_span[p]  = g_w2_csc_ptr[p][h + 1] - w_begin[p];
-            if (w_span[p] > max_span) max_span = w_span[p];
-        }
-
-        /* Count-first: read this column's HEADER (nnz count), then buffer exactly that many H
-         * value tokens.  Buffering decouples the single H stream from the P per-slice scatter
-         * walks (which have different lengths), so H is read ONCE and broadcast to all lanes. */
-        const T_MlpHTok hdr = h_stream.read();
-        const int row_nnz = hdr.count;
-
-        T_Activation h_val_buf[MLP_TOKEN_W_MAX];
-        int          h_wd_buf[MLP_TOKEN_W_MAX];   /* packed-acc word index (token / PACK) */
-        int          h_ln_buf[MLP_TOKEN_W_MAX];   /* packed-acc lane (token % PACK) */
-        #pragma HLS ARRAY_PARTITION variable=h_val_buf cyclic factor=2 dim=1
-        #pragma HLS ARRAY_PARTITION variable=h_wd_buf  cyclic factor=2 dim=1
-        #pragma HLS ARRAY_PARTITION variable=h_ln_buf  cyclic factor=2 dim=1
-        H_TOKEN_LOAD:
-        for (int s = 0; s < row_nnz; s++) {
-            #pragma HLS LOOP_TRIPCOUNT min=MLP_TC_HIDDEN_NNZ max=MLP_TC_HIDDEN_NNZ
-            #pragma HLS PIPELINE II=1
-            T_MlpHTok t = h_stream.read();
-            const int token = (int) t.token;
-            h_val_buf[s] = t.val;
-            h_wd_buf[s]  = token / MLP_ACC_PACK;
-            h_ln_buf[s]  = token % MLP_ACC_PACK;
-        }
-
-        /* FUSED scatter: one II=1 pipeline over (token, wpos) pairs, P lanes UNROLLED in the
-         * body.  Each lane p walks its OWN slice's span w_span[p] into its OWN acc bank acc[p]
-         * -> the P read-modify-writes are on distinct URAMs and co-schedule in the same
-         * iteration (the proven PARALLEL_HIDDEN_ROWS shape).  wpos runs to max_span; a lane
-         * predicates on wpos < w_span[p] so shorter slices idle their tail.  Wall-clock per
-         * column = row_nnz * max_span ~= row_nnz * (w_span / P) when the slices are balanced. */
-        int          token_i = 0, wpos = 0;
-        T_Activation hval = (T_Activation) 0;
-        int          acc_wd = 0, acc_ln = 0;
-
-        /* Per-lane W2-word cache + accumulator-forwarding register (same-word RMW bypass). */
-        T_MlpW2Word  w2word[MLP_OUT_ROW_PARALLEL];
-        int          cur_wword[MLP_OUT_ROW_PARALLEL];
-        int          prev_lr[MLP_OUT_ROW_PARALLEL], prev_wd[MLP_OUT_ROW_PARALLEL];
-        T_MlpAccWord prev_aw[MLP_OUT_ROW_PARALLEL];
-        #pragma HLS ARRAY_PARTITION variable=w2word    complete dim=1
-        #pragma HLS ARRAY_PARTITION variable=cur_wword complete dim=1
-        #pragma HLS ARRAY_PARTITION variable=prev_lr   complete dim=1
-        #pragma HLS ARRAY_PARTITION variable=prev_wd   complete dim=1
-        #pragma HLS ARRAY_PARTITION variable=prev_aw   complete dim=1
-        SCATTER_INIT:
-        for (int p = 0; p < MLP_OUT_ROW_PARALLEL; p++) {
-            #pragma HLS UNROLL
-            cur_wword[p] = -1; prev_lr[p] = -1; prev_wd[p] = -1; prev_aw[p] = 0;
-        }
-
-        const int total = row_nnz * max_span;
-        H_SCATTER:
-        for (int idx = 0; idx < total; idx++) {
-            #pragma HLS LOOP_TRIPCOUNT min=(MLP_TC_HIDDEN_NNZ*MLP_TC_W2COL_NNZ) max=(MLP_TC_HIDDEN_NNZ*MLP_TC_W2COL_NNZ)
-            #pragma HLS PIPELINE II=1
-            #pragma HLS DEPENDENCE variable=acc type=inter direction=RAW false
-            #pragma HLS DEPENDENCE variable=acc type=inter direction=WAR false
-
-            if (wpos == 0) {
-                /* New token: fetch its buffered value + packed-acc address, reset W2 caches. */
-                hval   = h_val_buf[token_i];
-                acc_wd = h_wd_buf[token_i];
-                acc_ln = h_ln_buf[token_i];
-                SCATTER_WWORD_RESET:
-                for (int p = 0; p < MLP_OUT_ROW_PARALLEL; p++) {
+        if (to_hidden) {
+            /* ReLU and requantize into int8, packed MHA_BANK_PACK tokens per word, straight into
+             * the hidden region of this block's tile: the second stage reads it there, so H is
+             * never copied and never leaves the chip. */
+            H_PACK_WORD:
+            for (int w = 0; w < row_words; w++) {
+                #pragma HLS LOOP_TRIPCOUNT min=MHA_BANK_ROW_WORDS max=MHA_BANK_ROW_WORDS
+                #pragma HLS PIPELINE II=1
+                T_MhaBankWord word = 0;
+                H_PACK_LANE:
+                for (int p = 0; p < MHA_BANK_PACK; p++) {
                     #pragma HLS UNROLL
-                    cur_wword[p] = -1;   /* force W2 word re-fetch at the start of each token */
+                    const int    j = w * MHA_BANK_PACK + p;
+                    T_Activation v = (T_Activation) 0;
+                    if (j < tokens_dim) {
+                        const T_MhaAcc acc = g_proj_rows[0][j];
+                        if (acc > (T_MhaAcc) 0) {
+                            const T_Activation q = requant_to_int8(acc, scale);
+                            if (q > (T_Activation) 0) {
+                                v = q;
+                            }
+                        }
+                    }
+                    word.range(p * MHA_ACT_ELEM_BITS + MHA_ACT_ELEM_BITS - 1,
+                               p * MHA_ACT_ELEM_BITS) = (ap_uint<MHA_ACT_ELEM_BITS>) v;
                 }
+                g_act_tile[h_tile][MHA_H_TILE_BASE + (h_local + i) * MHA_BANK_ROW_WORDS + w] = word;
             }
-
-            PARALLEL_OUT_ROWS:
-            for (int p = 0; p < MLP_OUT_ROW_PARALLEL; p++) {
-                #pragma HLS UNROLL
-                if (wpos < w_span[p]) {
-                    const int w     = w_begin[p] + wpos;
-                    const int wword = w / MLP_W2_PACK;
-                    if (wword != cur_wword[p]) { w2word[p] = g_w2_csc[p][wword]; cur_wword[p] = wword; }
-
-                    T_MlpWVal  weight;
-                    T_MlpW2Row w2row;
-                    w2_lane_from_word(w2word[p], w % MLP_W2_PACK, weight, w2row);
-                    const int  local_row = (int) w2row - p * MLP_OUT_ROW_SLICE;  /* index into acc[p] */
-
-                    /* Stage A: URAM read (or forward the previous write if same word). */
-                    const bool   same_word = (local_row == prev_lr[p]) && (acc_wd == prev_wd[p]);
-                    T_MlpAccWord aw = same_word ? prev_aw[p] : acc[p][local_row][acc_wd];
-
-                    /* Stage B: extract lane, shift-add, insert lane, write back. */
-                    T_MlpAcc a = (T_MlpAcc) acc_get(aw, acc_ln);
-#ifdef POT_SHIFT_MAC
-                    ap_uint<3> e   = weight.range(2, 0);
-                    bool       neg = weight[3];
-                    T_MlpAcc   pot = neg ? (T_MlpAcc)(-(1 << e)) : (T_MlpAcc)(1 << e);
-                    T_MlpAcc   prod = (T_MlpAcc) hval * pot;
-                    #pragma HLS BIND_OP variable=prod op=mul impl=dsp
-                    a += prod;
-#else
-                    a += weight * hval;
-#endif
-                    acc_set(aw, acc_ln, (T_MlpAccLane) a);
-                    acc[p][local_row][acc_wd] = aw;
-
-                    prev_lr[p] = local_row;
-                    prev_wd[p] = acc_wd;
-                    prev_aw[p] = aw;
-                }
+        } else {
+            Y_TOKEN:
+            for (int j = 0; j < tokens_dim; j++) {
+                #pragma HLS LOOP_TRIPCOUNT min=MLP_TC_BATCH max=MLP_TC_BATCH
+                #pragma HLS PIPELINE II=1
+                output[(row_base + i) * tokens_dim + j] = requant_to_int8(g_proj_rows[0][j], scale);
             }
-
-            if (wpos + 1 == max_span) { wpos = 0; token_i++; }
-            else                      { wpos++; }
         }
     }
-
-    /* Requantize + write Y feature-major (unpack the acc lanes).  Global output row r maps to
-     * slice p = r / SLICE, local row r % SLICE within that slice's acc bank. */
-    WRITE_Y_ROW:
-    for (int r = 0; r < feature_dim; r++) {
-        #pragma HLS LOOP_TRIPCOUNT min=MLP_TC_FEATURE_OUT max=MLP_TC_FEATURE_OUT
-        const int p         = r / MLP_OUT_ROW_SLICE;
-        const int local_row = r % MLP_OUT_ROW_SLICE;
-        WRITE_Y_TOK:
-        for (int j = 0; j < batch; j++) {
-            #pragma HLS LOOP_TRIPCOUNT min=MLP_TC_BATCH max=MLP_TC_BATCH
-            #pragma HLS PIPELINE II=1
-            T_MlpAcc a = (T_MlpAcc) acc_get(acc[p][local_row][j / MLP_ACC_PACK], j % MLP_ACC_PACK);
-            output[r * batch + j] = requant_to_int8(a, scale);
-        }
-    }
-}
-
-/**
- * @brief DATAFLOW region: overlap the streaming stage-1 producer and stage-2 consumer.
- *
- * Isolated in its own function so #pragma HLS DATAFLOW scopes ONLY the two streaming
- * stages (W2 staging must complete before this, so it stays in the caller).
- */
-static void mlp_stage12_dataflow(
-    T_MlpBankWord *input_packed,
-    T_Activation  *w1_values,
-    T_MlpIndex    *w1_col_idx,
-    int           *w1_row_ptr,
-    int            feature_dim,
-    int            hidden_dim,
-    int            batch,
-    T_Scale        scale_fc1,
-    T_Scale        scale_fc2,
-    T_Activation  *output
-) {
-#pragma HLS INLINE off
-#pragma HLS DATAFLOW
-    /* Single H channel (header + value tokens).  Deep FIFO so the producer can run ahead
-     * while the consumer is busy scattering (the consumer is the slower stage). */
-    hls::stream<T_MlpHTok> h_stream;
-    #pragma HLS STREAM variable=h_stream depth=512
-
-    fused_sdmm_relu_streaming(
-        input_packed,
-        w1_values, w1_col_idx, w1_row_ptr,
-        hidden_dim, feature_dim, batch,
-        scale_fc1,
-        h_stream
-    );
-    spmm_dense_streaming(
-        h_stream,
-        feature_dim, hidden_dim, batch,
-        scale_fc2,
-        output
-    );
 }
 
 
@@ -879,37 +101,52 @@ void mlp(
     int            feature_dim,
     int            hidden_dim,
     int            batch,
-    T_Activation*  w1_values,
-    T_MlpIndex*    w1_col_idx,
-    int*           w1_row_ptr,
-    T_Activation*  w2_values,
-    T_MlpIndex*    w2_col_idx,
-    int*           w2_row_ptr,
-    const T_Scale* scales,
-    T_Activation*  output,
-    bool           w2_prestaged
+    T_MhaTileWord *w1_bank,
+    int           *w1_counts,
+    T_MhaTileWord *w2_bank,
+    int           *w2_counts,
+    const T_Scale *scales,
+    T_Activation  *output
 ) {
+#pragma HLS INLINE off
 #ifndef __SYNTHESIS__
     assert(hidden_dim <= MLP_HIDDEN_FEATURE_W_MAX && "hidden_dim exceeds MLP_HIDDEN_FEATURE_W_MAX");
+    assert(batch <= MLP_TOKEN_W_MAX && "batch exceeds MLP_TOKEN_W_MAX");
 #endif
 
-    /* Stage the whole W2 (CSC) into on-chip URAM once, BEFORE the DATAFLOW region: the
-     * consumer reads g_w2_csc read-only inside the region (read-only shared access is
-     * allowed; a producer/consumer on a shared static RAM would not be).
-     * When w2_prestaged is true, encoder_layer_top already ran mlp_stage_w2()
-     * concurrently with the MHA block, so skip it here. */
-    if (!w2_prestaged) {
-        mlp_stage_w2(w2_values, w2_col_idx, w2_row_ptr, hidden_dim);
-    }
+    /* The layer input, split per column block, read by every row block of the first linear. */
+    load_activation_tiles(input_packed, 0, MHA_TILE_WORDS);
 
-    /* Overlap stage-1 (W1 MAC, produces H) and stage-2 (H-driven scatter, consumes H) as a
-     * producer/consumer pair.  H streams on-chip so stage-2 scatters row h as soon as
-     * stage-1 emits it -> the two ~22.5ms / ~38.7ms stages overlap instead of summing. */
-    mlp_stage12_dataflow(
-        input_packed,
-        w1_values, w1_col_idx, w1_row_ptr,
-        feature_dim, hidden_dim, batch,
-        scales[SCALE_FC1_IDX], scales[SCALE_FC2_IDX],
-        output
-    );
+    const int w1_blocks = hidden_dim / MHA_FEATURE_HEAD;    /* 48 blocks of 64 hidden rows */
+    const int w2_blocks = feature_dim / MHA_FEATURE_HEAD;   /* 12 blocks of 64 output rows */
+
+    /* One loop over both linears, so mlp_rows and the weight loaders have one call site each and
+     * HLS instantiates one of each.  H is complete once the first linear's blocks are done, which
+     * is why the second linear's blocks follow rather than interleave. */
+    #pragma HLS ALLOCATION instances=mlp_rows           limit=1 function
+    #pragma HLS ALLOCATION instances=load_weight_slice  limit=1 function
+    #pragma HLS ALLOCATION instances=load_weight_bases  limit=1 function
+
+    MLP_STAGE:
+    for (int stage = 0; stage < w1_blocks + w2_blocks; stage++) {
+        #pragma HLS LOOP_TRIPCOUNT min=(MLP_HIDDEN_FEATURE_W_MAX/MHA_FEATURE_HEAD + MLP_FEATURE_W_MAX/MHA_FEATURE_HEAD) max=(MLP_HIDDEN_FEATURE_W_MAX/MHA_FEATURE_HEAD + MLP_FEATURE_W_MAX/MHA_FEATURE_HEAD)
+        #pragma HLS LOOP_FLATTEN off
+
+        const int to_hidden = (stage < w1_blocks);
+        const int block     = to_hidden ? stage : (stage - w1_blocks);
+        const int row_base  = block * MHA_FEATURE_HEAD;
+        const int first     = (block == 0);
+
+        if (to_hidden) {
+            if (first) { load_weight_bases(w1_counts, hidden_dim, SPMM_W_MLP1); }
+            load_weight_slice(w1_bank, w1_counts, hidden_dim, SPMM_W_MLP1, row_base, MHA_FEATURE_HEAD);
+        } else {
+            if (first) { load_weight_bases(w2_counts, feature_dim, SPMM_W_MLP2); }
+            load_weight_slice(w2_bank, w2_counts, feature_dim, SPMM_W_MLP2, row_base, MHA_FEATURE_HEAD);
+        }
+
+        mlp_rows(to_hidden, row_base, batch,
+                 to_hidden ? scales[SCALE_FC1_IDX] : scales[SCALE_FC2_IDX],
+                 output);
+    }
 }

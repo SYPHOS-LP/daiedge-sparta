@@ -23,11 +23,10 @@ void encoder_mlp_block(
     int                 tokens_dim,
     int                 feature_dim,
     int                 intermediate_dim,
-    T_Activation* w1_values, T_MlpIndex* w1_col_idx, int* w1_row_ptr,
-    T_Activation* w2_values, T_MlpIndex* w2_col_idx, int* w2_row_ptr,
+    T_MhaTileWord* w1_bank, int* w1_counts,
+    T_MhaTileWord* w2_bank, int* w2_counts,
     const T_Scale*      scales,
-    T_Activation*       output,
-    bool                w2_prestaged
+    T_Activation*       output
 ) {
 #ifndef __SYNTHESIS__
     assert(feature_dim <= ENC_MLP_FEATURE_W_MAX && "feature_dim exceeds ENC_MLP_FEATURE_W_MAX");
@@ -49,15 +48,12 @@ void encoder_mlp_block(
         feature_dim,
         intermediate_dim,
         tokens_dim,
-        w1_values,
-        w1_col_idx,
-        w1_row_ptr,
-        w2_values,
-        w2_col_idx,
-        w2_row_ptr,
+        w1_bank,
+        w1_counts,
+        w2_bank,
+        w2_counts,
         scales,
-        output,
-        w2_prestaged);
+        output);
 
     residual_add(input,
                  output,
@@ -72,8 +68,8 @@ void encoder_mlp_block_top(
     int                 tokens_dim,
     int                 feature_dim,
     int                 intermediate_dim,
-    T_Activation* w1_values, T_MlpIndex* w1_col_idx, int* w1_row_ptr,
-    T_Activation* w2_values, T_MlpIndex* w2_col_idx, int* w2_row_ptr,
+    T_MhaTileWord* w1_bank, int* w1_counts,
+    T_MhaTileWord* w2_bank, int* w2_counts,
     const T_Scale*      scales,
     T_Activation*       output
 ) {
@@ -83,24 +79,20 @@ void encoder_mlp_block_top(
     #pragma HLS INTERFACE s_axilite port=intermediate_dim bundle=control
     #pragma HLS INTERFACE m_axi port=input      bundle=x_mem    depth=(ENC_MLP_FEATURE_W_MAX*ENC_MLP_TOKEN_W_MAX)
     #pragma HLS INTERFACE m_axi port=scales     bundle=sc_mem   depth=SCALE_IDX_MAX
-    #pragma HLS INTERFACE m_axi port=w1_values  bundle=w1_mem   depth=MAX_NNZ
-    #pragma HLS INTERFACE m_axi port=w1_col_idx bundle=w1_mem   depth=MAX_NNZ
-    #pragma HLS INTERFACE m_axi port=w1_row_ptr bundle=w1_mem   depth=MAX_ROWS+1
-    #pragma HLS INTERFACE m_axi port=w2_values  bundle=w2_mem   depth=MAX_NNZ
-    #pragma HLS INTERFACE m_axi port=w2_col_idx bundle=w2i_mem  depth=MAX_NNZ
-    #pragma HLS INTERFACE m_axi port=w2_row_ptr bundle=w2_mem   depth=MAX_ROWS+1
+    #pragma HLS INTERFACE m_axi port=w1_bank  bundle=w1_mem   depth=MAX_NNZ
+    #pragma HLS INTERFACE m_axi port=w1_counts bundle=w1_mem   depth=(MHA_TILES*MLP_HIDDEN_FEATURE_W_MAX)
+    #pragma HLS INTERFACE m_axi port=w2_bank  bundle=w2_mem   depth=MAX_NNZ
+    #pragma HLS INTERFACE m_axi port=w2_counts bundle=w2_mem   depth=(MHA_TILES*MAX_ROWS)
     #pragma HLS INTERFACE m_axi port=output     bundle=y_mem    depth=(ENC_MLP_FEATURE_W_MAX*ENC_MLP_TOKEN_W_MAX)
 
     encoder_mlp_block(input,
                       tokens_dim,
                       feature_dim,
                       intermediate_dim,
-                      w1_values,
-                      w1_col_idx,
-                      w1_row_ptr,
-                      w2_values,
-                      w2_col_idx,
-                      w2_row_ptr,
+                      w1_bank,
+                      w1_counts,
+                      w2_bank,
+                      w2_counts,
                       scales,
                       output);
 }

@@ -43,18 +43,14 @@
  * @param[in]  input        Input activations, feature-major.
  * @param[in]  tokens_dim   Number of tokens.
  * @param[in]  feature_dim  Feature width.
- * @param[in]  wq_values    CSR values for the Q projection weight.
- * @param[in]  wq_col_idx   CSR column indices for the Q projection weight.
- * @param[in]  wq_row_ptr   CSR row pointers for the Q projection weight.
- * @param[in]  wk_values    CSR values for the K projection weight.
- * @param[in]  wk_col_idx   CSR column indices for the K projection weight.
- * @param[in]  wk_row_ptr   CSR row pointers for the K projection weight.
- * @param[in]  wv_values    CSR values for the V projection weight.
- * @param[in]  wv_col_idx   CSR column indices for the V projection weight.
- * @param[in]  wv_row_ptr   CSR row pointers for the V projection weight.
- * @param[in]  wo_values    CSR values for the output projection weight.
- * @param[in]  wo_col_idx   CSR column indices for the output projection weight.
- * @param[in]  wo_row_ptr   CSR row pointers for the output projection weight.
+ * @param[in]  wq_bank      Q projection weight: packed {column, value} entries, column-block order.
+ * @param[in]  wq_counts    Q projection weight: nonzeros per (column block, row), block-major.
+ * @param[in]  wk_bank      K projection weight entries.
+ * @param[in]  wk_counts    K projection weight counts.
+ * @param[in]  wv_bank      V projection weight entries.
+ * @param[in]  wv_counts    V projection weight counts.
+ * @param[in]  wo_bank      Output projection weight entries.
+ * @param[in]  wo_counts    Output projection weight counts.
  * @param[in]  scales       Per-layer folded scales.
  * @param[out] hidden       Block output, feature-major.
  */
@@ -62,10 +58,10 @@ void encoder_mha_block(
     const T_Activation *input,
     int                 tokens_dim,
     int                 feature_dim,
-    T_Activation *wq_values, T_MhaIndex *wq_col_idx, int *wq_row_ptr,
-    T_Activation *wk_values, T_MhaIndex *wk_col_idx, int *wk_row_ptr,
-    T_Activation *wv_values, T_MhaIndex *wv_col_idx, int *wv_row_ptr,
-    T_Activation *wo_values, T_MhaIndex *wo_col_idx, int *wo_row_ptr,
+    T_MhaTileWord *wq_bank, int *wq_counts,
+    T_MhaTileWord *wk_bank, int *wk_counts,
+    T_MhaTileWord *wv_bank, int *wv_counts,
+    T_MhaTileWord *wo_bank, int *wo_counts,
     const T_Scale *scales,
     T_Activation  *hidden
 );
@@ -77,10 +73,10 @@ void encoder_mha_block_top(
     const T_Activation* input,
     int                 tokens_dim,
     int                 feature_dim,
-    T_Activation* wq_values, T_MhaIndex* wq_col_idx, int* wq_row_ptr,
-    T_Activation* wk_values, T_MhaIndex* wk_col_idx, int* wk_row_ptr,
-    T_Activation* wv_values, T_MhaIndex* wv_col_idx, int* wv_row_ptr,
-    T_Activation* wo_values, T_MhaIndex* wo_col_idx, int* wo_row_ptr,
+    T_MhaTileWord* wq_bank, int* wq_counts,
+    T_MhaTileWord* wk_bank, int* wk_counts,
+    T_MhaTileWord* wv_bank, int* wv_counts,
+    T_MhaTileWord* wo_bank, int* wo_counts,
     const T_Scale* scales,
     T_Activation*  hidden
 );

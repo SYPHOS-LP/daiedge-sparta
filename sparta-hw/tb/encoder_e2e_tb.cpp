@@ -5,7 +5,7 @@
 // on real per-layer POT4 weights + a real SW-embedded image, in ONE csim process.
 // POT4 model = fused gammas (none read) + int8 weights + ap_fixed<32,16> scales.
 //
-//   model.bin       : per-layer CSR weights (POT byte val, u16 col, i32 rowptr, i32 s_row)
+//   model.bin       : per layer, MHA weights as packed bank words + counts, MLP as CSR/CSC
 //                     + 15 ap_fixed scales.  NO gammas.  (scripts/compile_model.py
 //                     --scales fixed: pot=True, pot_scales=False, fused=True)
 //   model_index.bin : per-layer (nnz, n_rows) so we stream model.bin without JSON.
@@ -42,10 +42,11 @@ struct WMeta { int nnz; int n_rows; };
 struct LayerMeta { WMeta w[6]; };   // w_q,w_k,w_v,out_proj,linear_1,linear_2
 
 struct LayerW {
-    std::vector<T_Activation> val[6];
-    std::vector<uint16_t>     col[6];
-    std::vector<int>          ptr[6];
-    std::vector<T_Scale>      scales;   // 15
+    // All six weights are pre-packed bank words ({column, value} per slot) plus the nonzero counts
+    // per (column block, row).
+    std::vector<T_MhaTileWord> bank[6];
+    std::vector<int>           ptr[6];
+    std::vector<T_Scale>       scales;   // 15
 };
 
 int main(int argc, char** argv) {
@@ -82,20 +83,21 @@ int main(int argc, char** argv) {
     if (N > ENC_TOKEN_W_MAX) die("N > ENC_TOKEN_W_MAX (raise ENC_TOKEN_W_MAX)");
     const int XY = D * N;
 
-    // ---- model.bin: per layer, 6 weights (val i8, col u16, ptr i32, s_row i32) + 15 scales ----
+    // ---- model.bin: per layer, 6 weights (bank u64, counts i32, s_row i32), then 15 scales ----
     FILE* fm = std::fopen((g_dir + "model.bin").c_str(), "rb");
     if (!fm) die("cannot open model.bin");
     std::vector<LayerW> LW(n_layers);
     for (int L = 0; L < n_layers; L++) {
         for (int w = 0; w < 6; w++) {
             const int nnz = lm[L].w[w].nnz, nr = lm[L].w[w].n_rows;
-            const int padded = (nnz + WIDE_READ_PAD - 1) / WIDE_READ_PAD * WIDE_READ_PAD;
-            LW[L].val[w].resize(padded); LW[L].col[w].resize(padded); LW[L].ptr[w].resize(nr + 1);
-            { std::vector<int8_t> t(nnz); read_raw(fm, t.data(), nnz, "w.val");
-              for (int i = 0; i < nnz; i++) LW[L].val[w][i] = (T_Activation)t[i]; }
-            read_raw(fm, LW[L].col[w].data(), nnz, "w.col");
-            { std::vector<int32_t> t(nr + 1); read_raw(fm, t.data(), nr + 1, "w.ptr");
-              for (int i = 0; i <= nr; i++) LW[L].ptr[w][i] = (int)t[i]; }
+            if (nnz % MHA_TILE_PACK) die("weight nnz is not a multiple of MHA_TILE_PACK");
+            const int words = nnz / MHA_TILE_PACK;
+            LW[L].bank[w].assign(words + MHA_TILE_PACK, (T_MhaTileWord) 0);
+            std::vector<uint64_t> t(words); read_raw(fm, t.data(), words, "w.bank");
+            for (int i = 0; i < words; i++) LW[L].bank[w][i] = (T_MhaTileWord) t[i];
+            LW[L].ptr[w].resize(nr + 1);
+            std::vector<int32_t> tp(nr + 1); read_raw(fm, tp.data(), nr + 1, "w.counts");
+            for (int i = 0; i <= nr; i++) LW[L].ptr[w][i] = (int) tp[i];
             (void)read_i32(fm);   // s_row (per-row scale, ignored; scalar scales used)
         }
         // 15 scales: int32 raw ap_fixed<32,16> bit pattern -> reinterpret
@@ -105,16 +107,6 @@ int main(int argc, char** argv) {
               T_Scale s; s.range() = (ap_int<32>)t[i]; LW[L].scales[i] = s; } }
     }
     std::fclose(fm);
-
-    // widened column buffers (T_MhaIndex / T_MlpIndex)
-    std::vector<std::vector<T_MhaIndex>> mha_col(n_layers * 4);
-    std::vector<std::vector<T_MlpIndex>> mlp_col(n_layers * 2);
-    for (int L = 0; L < n_layers; L++) {
-        for (int w = 0; w < 4; w++) { auto& d = mha_col[L*4+w]; d.resize(LW[L].col[w].size());
-            for (size_t i = 0; i < d.size(); i++) d[i] = (T_MhaIndex)LW[L].col[w][i]; }
-        for (int w = 0; w < 2; w++) { auto& d = mlp_col[L*2+w]; d.resize(LW[L].col[4+w].size());
-            for (size_t i = 0; i < d.size(); i++) d[i] = (T_MlpIndex)LW[L].col[4+w][i]; }
-    }
 
     // ---- output file ----
     FILE* fo = std::fopen((g_dir + "hw_out.bin").c_str(), "wb");
@@ -136,12 +128,12 @@ int main(int argc, char** argv) {
             LayerW& w = LW[L];
             encoder_layer_top(
                 cur.data(), D, N, d_h,
-                w.val[0].data(), mha_col[L*4+0].data(), w.ptr[0].data(),   // w_q
-                w.val[1].data(), mha_col[L*4+1].data(), w.ptr[1].data(),   // w_k
-                w.val[2].data(), mha_col[L*4+2].data(), w.ptr[2].data(),   // w_v
-                w.val[3].data(), mha_col[L*4+3].data(), w.ptr[3].data(),   // out_proj
-                w.val[4].data(), mlp_col[L*2+0].data(), w.ptr[4].data(),   // linear_1
-                w.val[5].data(), mlp_col[L*2+1].data(), w.ptr[5].data(),   // linear_2
+                w.bank[0].data(), w.ptr[0].data(),   // w_q
+                w.bank[1].data(), w.ptr[1].data(),   // w_k
+                w.bank[2].data(), w.ptr[2].data(),   // w_v
+                w.bank[3].data(), w.ptr[3].data(),   // out_proj
+                w.bank[4].data(), w.ptr[4].data(),   // linear_1
+                w.bank[5].data(), w.ptr[5].data(),   // linear_2
                 w.scales.data(),
                 nxt.data());
             if (fdbg) {
