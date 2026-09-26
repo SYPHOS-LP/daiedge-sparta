@@ -70,21 +70,10 @@ def main(n_images=4):
     print("Emitting HYBRID model.bin (pot=True, pot_scales=False, fused=True) ...")
     C.emit_model(qm, qm.layers(), OUT, verify=False, pot=True, pot_scales=False, fused=True)
 
-    # model_index.bin: magic + (n_layers, D, d_h, n_heads) + per-layer 6x(nnz, n_rows).
-    # Read the per-weight nnz/n_rows straight from the manifest compile_model just wrote.
+    # model_index.bin: per-weight nnz / pointer lengths, straight from the manifest just written.
     man = json.load(open(os.path.join(OUT, "manifest.json")))
-    layer_ids = sorted(int(k) for k in man["layers"].keys())
-    WORDER = ["w_q", "w_k", "w_v", "out_proj", "linear_1", "linear_2"]
-    D, d_h, n_heads = 768, 3072, 12
-    with open(os.path.join(OUT, "model_index.bin"), "wb") as f:
-        f.write(struct.pack("<I", MAGIC_INDEX))
-        f.write(struct.pack("<4i", len(layer_ids), D, d_h, n_heads))
-        for L in layer_ids:
-            for tag in WORDER:
-                w = man["layers"][str(L)]["weights"][tag]
-                # ptr array length-1: CSR -> rows (shape[0]); CSC (W2) -> cols (shape[1]).
-                n_ptr = int(w["shape"][1]) if w.get("layout") == "csc" else int(w["shape"][0])
-                f.write(struct.pack("<2i", int(w["nnz"]), n_ptr))
+    C.emit_model_index(man, OUT)
+    D, d_h = 768, 3072
 
     # --- 2) per-image: SW forward -> capture feature-major int8 encoder input + sw_pred + truth ---
     enc_inputs, meta_imgs = [], []

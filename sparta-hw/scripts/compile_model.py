@@ -59,6 +59,15 @@ the zeros.  Biases are IGNORED (unused in the network).
 Usage:
     python scripts/compile_model.py -i <quant_values.txt> [--out out/model]
                                     [--layers 0,1 | all] [--verify]
+                                    [--scales auto|fixed|shift] [--model-index]
+                                    [--permute none|random] [--seed S]
+
+    # the shipping kernel's HYBRID payload (POT weights + ap_fixed scales) + model_index.bin:
+    python scripts/compile_model.py -i <path> --out sim/e2e --scales fixed --model-index
+
+    # the same model in a randomly permuted feature basis (see apply_permutations):
+    python scripts/compile_model.py -i <path> --out sim/e2e/perm --scales fixed --model-index \
+                                    --permute random --seed 1
 
     # inspection only (no emit):
     python scripts/compile_model.py -i <path> --summary
@@ -77,6 +86,7 @@ import argparse
 import json
 import os
 import re
+import struct
 import sys
 from dataclasses import dataclass, field
 
@@ -336,6 +346,13 @@ GAMMA_BITS = 8    # T_RmsGamma = ap_int<8> (int8 code; gamma_scale folded into i
 
 # The six weights: tag -> module suffix.  Per-row fold s_in/s_out resolved per layer.
 WEIGHTS = ["w_q", "w_k", "w_v", "out_proj", "linear_1", "linear_2"]
+# The MHA projections share one tiled SpMM engine, so they are the weights emitted per column
+# block (see dense_to_tiled_csr).  The MLP weights keep their row-/column-major CSR for now.
+TILED_WEIGHTS = ["w_q", "w_k", "w_v", "out_proj"]
+# Weight entries per kernel memory word (MHA_TILE_PACK in mha_cfg.h): 4 entries of
+# {6-bit block-local column, 4-bit value} in a 16-bit lane fill a 64-bit word, so one bank is
+# one URAM (72-bit words) and each load reads whole words.
+TILE_PACK = 4
 WMODULE = {
     "w_q": "mha.w_q", "w_k": "mha.w_k", "w_v": "mha.w_v",
     "out_proj": "mha.out_proj", "linear_1": "mlp.linear_1", "linear_2": "mlp.linear_2",
@@ -395,17 +412,24 @@ def pot_shift(scale_vec):
     return s.astype("<i1")
 
 
-def pot_weight_signexp(vals_int):
+def pot_weight_signexp(vals_int, allow_zero=False):
     """Encode POT weight ints (+/- 2^e) as one byte per nonzero: (sign<<7)|exponent,
-    exponent = log2(|w|) in 0..6, sign 1=negative. Asserts every value is +/- POT, nonzero."""
+    exponent = log2(|w|) in 0..6, sign 1=negative. Asserts every value is +/- POT, nonzero.
+
+    allow_zero=True permits zeros, which a tiled emit uses to pad a block out to a whole
+    memory word; they are encoded as byte 0 and never read back (a row's span comes from the
+    per-row counts, which exclude padding)."""
     v = np.asarray(vals_int, dtype=np.int64)
-    if np.any(v == 0):
+    padding = (v == 0)
+    if padding.any() and not allow_zero:
         raise ValueError("pot_weight_signexp got a zero (CSR should only hold nonzeros)")
-    exp = _log2_exact(v)                       # log2(|w|)
+    exp = _log2_exact(np.where(padding, 1, v))   # padding slots stand in as 2^0
     if np.any((exp < 0) | (exp > 7)):
         raise ValueError(f"weight exponent out of 0..7: {exp.min()}..{exp.max()}")
     sign = (v < 0).astype(np.int64)
-    return ((sign << 7) | exp).astype("<u1")   # uint8: bit7=sign, bits0..6=exponent
+    encoded = ((sign << 7) | exp).astype("<u1")   # uint8: bit7=sign, bits0..6=exponent
+    encoded[padding] = 0
+    return encoded
 
 
 def dense_to_csr(wint):
@@ -446,6 +470,61 @@ def dense_to_csc(wint):
     vals = np.concatenate(vals) if vals else np.zeros(0, np.int64)
     rowidx = np.concatenate(rowidx) if rowidx else np.zeros(0, np.uint16)
     return vals, rowidx.astype("<u2"), colptr.astype("<i4")
+
+
+def dense_to_tiled_csr(wint, n_tiles, pad_to=1):
+    """Split a weight into `n_tiles` column blocks and return each block as a CSR matrix.
+
+    Column `j` of the weight multiplies row `j` of the activation, so a block of columns only
+    ever reads its own block of activation rows.  The kernel keeps each activation block in a
+    separate on-chip memory and gives each block of the weight its own bank, so one lane per
+    block can read a nonzero in the same cycle.
+
+    Parameters
+    ----------
+    wint : ndarray, shape (rows, cols)
+        Dense weight matrix. Only its nonzeros are kept.
+    n_tiles : int
+        Number of column blocks. Must divide `cols`.
+    pad_to : int, optional
+        Pad each block with zero entries so its length is a multiple of this. The kernel packs
+        `pad_to` entries per memory word, so padded blocks start on a word boundary and load
+        with one read per word. Padding is never read back: a row's span comes from `indptr`.
+
+    Returns
+    -------
+    data : ndarray of int64, shape (nnz,)
+        Nonzero values: all of block 0 first, then block 1, and so on. Within a block the
+        values are in row order, as CSR requires, followed by any padding.
+    indices : ndarray of uint16, shape (nnz,)
+        Column of each value inside its own block, so 0 .. cols // n_tiles - 1.
+    indptr : ndarray of int32, shape (n_tiles, rows + 1)
+        One CSR row-pointer array per block. Row `r` of block `t` is the slice
+        `indptr[t, r] : indptr[t, r + 1]` of that block's values, and block `t` starts at
+        `sum(indptr[u, rows] for u < t)` in `data` / `indices`.
+
+    Raises
+    ------
+    ValueError
+        If `n_tiles` does not divide the number of columns.
+    """
+    rows, cols = wint.shape
+    if cols % n_tiles:
+        raise ValueError(f"n_tiles={n_tiles} does not divide {cols} columns")
+    width = cols // n_tiles
+
+    data, indices, indptr = [], [], []
+    for t in range(n_tiles):
+        block = wint[:, t * width:(t + 1) * width]
+        row, col = np.nonzero(block)            # row-major order == CSR order
+        pad = -row.size % pad_to
+        data.append(np.concatenate([block[row, col], np.zeros(pad, block.dtype)]))
+        indices.append(np.concatenate([col, np.zeros(pad, col.dtype)]))
+        indptr.append(np.concatenate(([0], np.cumsum(np.bincount(row, minlength=rows)))))
+
+    return (np.concatenate(data).astype(np.int64),
+            np.concatenate(indices).astype("<u2"),
+            np.stack(indptr).astype("<i4"))
 
 
 def _act_signed_scale(model, name):
@@ -562,7 +641,7 @@ def emit_gamma(model, layer, ln, bw, verify):
     return entry
 
 
-def emit_layer(model, layer, bw, verify, pot=False, fused=None, pot_scales=None):
+def emit_layer(model, layer, bw, verify, pot=False, fused=None, pot_scales=None, n_tiles=0):
     """Append one layer's blobs to the single-file writer `bw`; return its manifest.
 
     pot=True (POT4 model): WEIGHTS are emitted as one sign+exponent byte per nonzero
@@ -591,20 +670,38 @@ def emit_layer(model, layer, bw, verify, pot=False, fused=None, pot_scales=None)
         # (values, ROW index per nonzero, COLUMN pointer) -- the HW reads the triple as a
         # column-major CSR.  All other weights stay row-major CSR.
         csc = (tag == "linear_2")
-        if csc:
+        tiled = (n_tiles > 0 and tag in TILED_WEIGHTS)
+        if tiled:
+            # One CSR per column block.  The "rowptr" slot carries each block's per-row nonzero
+            # counts (block-major), which is what the kernel needs to advance one cursor per block.
+            vals, idx, indptr = dense_to_tiled_csr(wi, n_tiles, pad_to=TILE_PACK)
+            ptr = np.diff(indptr, axis=1).astype("<i4").ravel()
+        elif csc:
             vals, idx, ptr = dense_to_csc(wi)   # idx = row index, ptr = column pointer
         else:
             vals, idx, ptr = dense_to_csr(wi)   # idx = col index, ptr = row pointer
-        val_blob = bw.put(pot_weight_signexp(vals)) if pot else bw.put(vals.astype(np.int8))
+        val_blob = (bw.put(pot_weight_signexp(vals, allow_zero=tiled)) if pot
+                    else bw.put(vals.astype(np.int8)))
         ent = {"shape": list(wi.shape), "nnz": int(vals.size),
-               "max_row_nnz": int(np.diff(ptr.astype(np.int64)).max()),  # CSC: max COLUMN nnz
-               "layout": "csc" if csc else "csr",
+               "max_row_nnz": int(ptr.max() if tiled else np.diff(ptr.astype(np.int64)).max()),
+               "layout": "tiled_csr" if tiled else ("csc" if csc else "csr"),
                "values": val_blob,
                "col": bw.put(idx),
                "rowptr": bw.put(ptr)}
+        if tiled:
+            ent["n_tiles"] = n_tiles
+            ent["tile_nnz"] = [int(n) for n in indptr[:, -1]]   # nonzeros per block
         if verify:
             recon = np.zeros_like(wi)
-            if csc:
+            if tiled:
+                width, pos = wi.shape[1] // n_tiles, 0
+                for t in range(n_tiles):
+                    for r in range(wi.shape[0]):
+                        n = int(ptr[t * wi.shape[0] + r])
+                        recon[r, idx[pos:pos + n].astype(np.int64) + t * width] = vals[pos:pos + n]
+                        pos += n
+                    pos += -pos % TILE_PACK          # skip this block's padding
+            elif csc:
                 for c in range(wi.shape[1]):
                     s, e = int(ptr[c]), int(ptr[c + 1])
                     recon[idx[s:e].astype(np.int64), c] = vals[s:e]
@@ -643,8 +740,13 @@ def _is_pot_model(model):
     return gamma_fused and ("weight=po2" in scale_ty)
 
 
-def emit_model(model, layers, out_dir, verify=False, pot=None, fused=None, pot_scales=None):
+def emit_model(model, layers, out_dir, verify=False, pot=None, fused=None, pot_scales=None,
+               perms=None, n_tiles=0):
     """Emit ONE concatenated model.bin (all layers, all blobs) + manifest.json.
+
+    perms: the permutations already applied to `model` (apply_permutations), if any. They are
+    saved next to model.bin and recorded in the manifest so the host can permute the encoder
+    input / un-permute its output.
 
     pot: None -> auto-detect POT4 (fused gamma + po2 scales); True/False to force. POT
     WEIGHTS are one sign+exp byte/nonzero (shift-MAC kernel).
@@ -679,7 +781,8 @@ def emit_model(model, layers, out_dir, verify=False, pot=None, fused=None, pot_s
     with open(bin_path, "wb") as fh:
         bw = BlobWriter(fh)
         for layer in layers:
-            ld = emit_layer(model, layer, bw, verify, pot=pot, fused=fused, pot_scales=pot_scales)
+            ld = emit_layer(model, layer, bw, verify, pot=pot, fused=fused, pot_scales=pot_scales,
+                            n_tiles=n_tiles)
             manifest["layers"][str(layer)] = ld
             w = ld["weights"]
             vtxt = ""
@@ -692,10 +795,221 @@ def emit_model(model, layers, out_dir, verify=False, pot=None, fused=None, pot_s
         total = bw.offset
     manifest["total_bytes"] = total
     manifest["format_detected"] = "pot" if pot else "int"
+    if perms is not None:
+        np.savez(os.path.join(out_dir, PERM_FILE), **perms)
+        manifest["permutation"] = {
+            "file": PERM_FILE,
+            "convention": "perm[old] = new; X_perm = X[inverse(pi)] at the encoder input, "
+                          "Y = Y_perm[pi] at the encoder output",
+        }
     with open(os.path.join(out_dir, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
     print(f"  model.bin = {total} bytes ({total/1e6:.1f} MB)")
     return manifest
+
+
+MODEL_INDEX_MAGIC = 0x45324D49   # 'IM2E', checked by tb/encoder_e2e_tb.cpp
+
+
+def emit_model_index(manifest, out_dir, n_heads=12):
+    """Write model_index.bin for tb/encoder_e2e_tb.cpp from an emitted manifest.
+
+    Layout: magic + (n_layers, D, d_h, n_heads) + per layer, per weight in WEIGHTS order,
+    (nnz, n_ptr) where n_ptr = pointer-array length - 1: rows for CSR, columns for CSC, and
+    n_tiles * rows for tiled_csr, whose pointer blob holds per-row counts for every block."""
+    ids = sorted(int(k) for k in manifest["layers"])
+    w0 = manifest["layers"][str(ids[0])]["weights"]
+    d_model, d_hidden = int(w0["w_q"]["shape"][1]), int(w0["linear_1"]["shape"][0])
+    path = os.path.join(out_dir, "model_index.bin")
+    with open(path, "wb") as f:
+        f.write(struct.pack("<I", MODEL_INDEX_MAGIC))
+        f.write(struct.pack("<4i", len(ids), d_model, d_hidden, n_heads))
+        for L in ids:
+            for tag in WEIGHTS:
+                w = manifest["layers"][str(L)]["weights"][tag]
+                layout = w.get("layout")
+                if layout == "tiled_csr":
+                    n_ptr = int(w["n_tiles"]) * int(w["shape"][0]) - 1
+                elif layout == "csc":
+                    n_ptr = int(w["shape"][1])
+                else:
+                    n_ptr = int(w["shape"][0])
+                f.write(struct.pack("<2i", int(w["nnz"]), n_ptr))
+    return path
+
+
+# ----------------------------------------------------------------------------
+# Feature permutations: run the encoder in a reordered feature basis, bit-exactly.
+# ----------------------------------------------------------------------------
+# RMSNorm (gamma fused) normalizes each token over ALL its features, so it is invariant to their
+# order; every other encoder operation is elementwise or a linear map, computed in integer /
+# fixed-point with order-independent sums.  Reordering features consistently therefore leaves
+# every value unchanged, just stored at a different index.  Four independent orders:
+#
+#   pi     (D,)                  residual stream, shared by ALL layers: columns of w_q/w_k/w_v/
+#                                linear_1, rows of out_proj/linear_2.  The host applies it at the
+#                                encoder boundary (input permuted, output un-permuted).
+#   sigma  (layers, d_h)         MLP hidden features: rows of linear_1, columns of linear_2.
+#   rho    (layers, heads, d_hd) Q'/K' features within each head band: rows of w_q AND w_k.
+#   nu     (layers, heads, d_hd) V/Zhat features within each head band: rows of w_v, cols of out_proj.
+#
+# Convention: perm[old] = new.  Head permutations stay inside their band, so the attention's
+# per-head split is untouched.
+PERM_FILE = "permutations.npz"
+
+
+def _inverse(perm):
+    inv = np.empty_like(perm)
+    inv[perm] = np.arange(len(perm))
+    return inv
+
+
+def _band_perm(local):
+    """(heads, d_head) per-band permutations -> one (heads*d_head,) permutation."""
+    heads, d_head = local.shape
+    return (np.arange(heads)[:, None] * d_head + local).reshape(-1)
+
+
+def balanced_order(load, n_bins):
+    """Order items so that `n_bins` equal-sized, contiguous bins carry a similar total load.
+
+    The tiled SpMM gives each column block one lane, and the lanes wait for the busiest block,
+    so the emitted column order should spread the nonzeros evenly. Heaviest item first into the
+    lightest bin that still has room.
+
+    Parameters
+    ----------
+    load : ndarray, shape (n_items,)
+        Weight of each item, e.g. the nonzeros in each column.
+    n_bins : int
+        Number of bins. Must divide `n_items`.
+
+    Returns
+    -------
+    perm : ndarray of int, shape (n_items,)
+        New position of each item, i.e. `perm[old] = new`, with bin `b` holding the positions
+        `b * n_items // n_bins` onwards.
+    """
+    load = np.asarray(load, dtype=float)
+    n_items = load.size
+    capacity = n_items // n_bins
+    totals, filled = np.zeros(n_bins), np.zeros(n_bins, dtype=int)
+    members = [[] for _ in range(n_bins)]
+    for item in np.argsort(-load, kind="stable"):
+        open_bins = np.flatnonzero(filled < capacity)
+        b = open_bins[np.argmin(totals[open_bins])]
+        members[b].append(item)
+        filled[b] += 1
+        totals[b] += load[item]
+    perm = np.empty(n_items, dtype=int)
+    for b, items in enumerate(members):
+        perm[np.asarray(items)] = b * capacity + np.arange(len(items))
+    return perm
+
+
+def balanced_permutations(model, n_tiles, n_heads=12):
+    """Permutations that even out the per-column-block load of the tiled weights.
+
+    Same four orders as `random_permutations` (see `apply_permutations`), but chosen rather than
+    random: the residual-stream order balances the columns of w_q/w_k/w_v/linear_1 summed over
+    every layer, and the hidden order balances linear_1's rows against linear_2's columns.
+
+    Parameters
+    ----------
+    model : QuantModel
+        Parsed model; every encoder layer is balanced together for the shared stream order.
+    n_tiles : int
+        Number of column blocks the kernel will use.
+    n_heads : int, optional
+        Attention heads, for the per-head orders.
+
+    Returns
+    -------
+    dict
+        Same layout as `random_permutations`: layers, pi, sigma, rho, nu.
+    """
+    layers = model.layers()
+    nnz_cols = lambda lin: (lin.weight_int != 0).sum(0) / (lin.weight_int != 0).sum()
+    nnz_rows = lambda lin: (lin.weight_int != 0).sum(1) / (lin.weight_int != 0).sum()
+    lin = lambda layer, tag: model.linears[f"encoder.encoder_layer_{layer}." + WMODULE[tag]]
+
+    stream = sum(nnz_cols(lin(L, t)) for L in layers for t in ("w_q", "w_k", "w_v", "linear_1"))
+    stream += sum(nnz_rows(lin(L, t)) for L in layers for t in ("out_proj", "linear_2"))
+    pi = balanced_order(stream, n_tiles)
+
+    d_head = lin(layers[0], "w_q").shape[1] // n_heads
+    identity_band = np.tile(np.arange(d_head), (n_heads, 1))
+    sigma = [balanced_order(nnz_rows(lin(L, "linear_1")) + nnz_cols(lin(L, "linear_2")), n_tiles)
+             for L in layers]
+    return {"layers": np.asarray(layers), "pi": pi, "sigma": np.stack(sigma),
+            "rho": np.stack([identity_band] * len(layers)),
+            "nu": np.stack([identity_band] * len(layers))}
+
+
+def _fit_group_cap(row_nnz, perm, group, cap, rng):
+    """Repair a row permutation so every `group` consecutive rows (in the new order) hold at
+    most `cap` nonzeros, by swapping rows between the heaviest and lightest groups.
+
+    The kernel's MLP stage 1 bursts W1 `group` rows at a time into a fixed-size buffer
+    (MLP_W1_GROUP_NNZ_MAX / MLP_ROW_PARALLEL in src/layers/mlp.cpp); an arbitrary hidden
+    order can overflow it."""
+    order = _inverse(perm)                          # order[new] = old
+    n_groups = len(order) // group
+    for _ in range(100 * len(order)):
+        loads = row_nnz[order[:n_groups * group]].reshape(n_groups, group).sum(1)
+        heavy = int(loads.argmax())
+        if loads[heavy] <= cap:
+            return _inverse(order)
+        light = int(loads.argmin())
+        h = heavy * group + int(row_nnz[order[heavy * group:(heavy + 1) * group]].argmax())
+        l = light * group + int(rng.integers(group))
+        order[h], order[l] = order[l], order[h]
+    raise ValueError(f"could not fit W1 groups of {group} rows under {cap} nonzeros")
+
+
+def random_permutations(model, seed, n_heads=12, w1_group_cap=None, w1_group=4):
+    """Random pi/sigma/rho/nu for every encoder layer in `model`.
+
+    w1_group_cap: if set, each layer's sigma is repaired so no `w1_group` consecutive W1 rows
+    exceed it (see _fit_group_cap)."""
+    rng = np.random.default_rng(seed)
+    layers = model.layers()
+    P0 = f"encoder.encoder_layer_{layers[0]}."
+    d_model = model.linears[P0 + WMODULE["w_q"]].shape[1]
+    d_hidden = model.linears[P0 + WMODULE["linear_1"]].shape[0]
+    d_head = d_model // n_heads
+    band = lambda: np.stack([rng.permutation(d_head) for _ in range(n_heads)])
+    sigma = []
+    for layer in layers:
+        s = rng.permutation(d_hidden)
+        if w1_group_cap is not None:
+            w1 = model.linears[f"encoder.encoder_layer_{layer}." + WMODULE["linear_1"]].weight_int
+            s = _fit_group_cap((w1 != 0).sum(1), s, w1_group, w1_group_cap, rng)
+        sigma.append(s)
+    return {
+        "layers": np.asarray(layers),
+        "pi": rng.permutation(d_model),
+        "sigma": np.stack(sigma),
+        "rho": np.stack([band() for _ in layers]),
+        "nu": np.stack([band() for _ in layers]),
+    }
+
+
+def apply_permutations(model, perms):
+    """Reorder every encoder weight (in place) into the basis given by `perms`."""
+    pi = perms["pi"]
+    for i, layer in enumerate(perms["layers"]):
+        P = f"encoder.encoder_layer_{int(layer)}."
+        rho, nu, sigma = _band_perm(perms["rho"][i]), _band_perm(perms["nu"][i]), perms["sigma"][i]
+        row_col = {"w_q": (rho, pi), "w_k": (rho, pi), "w_v": (nu, pi),
+                   "out_proj": (pi, nu), "linear_1": (sigma, pi), "linear_2": (pi, sigma)}
+        for tag, (row_perm, col_perm) in row_col.items():
+            lin = model.linears[P + WMODULE[tag]]
+            inv_row = _inverse(row_perm)
+            # W_new[row_perm[r], col_perm[c]] = W[r, c]
+            lin.weight_int = lin.weight_int[np.ix_(inv_row, _inverse(col_perm))]
+            if lin.weight_scale is not None and lin.weight_scale.size > 1:   # per-row scales
+                lin.weight_scale = lin.weight_scale[inv_row]
 
 
 # ----------------------------------------------------------------------------
@@ -761,6 +1075,22 @@ def main():
                     help="inspect only: print a structural summary + layer-0 scale table")
     ap.add_argument("--module", default=None,
                     help="inspect only: print one module's parsed contents")
+    ap.add_argument("--scales", choices=["auto", "fixed", "shift"], default="auto",
+                    help="scale blob format: 'fixed' = ap_fixed<32,16> (the shipping kernel), "
+                         "'shift' = int8 POT shifts, 'auto' = shift for POT models, else fixed")
+    ap.add_argument("--model-index", action="store_true",
+                    help="also write model_index.bin (for tb/encoder_e2e_tb.cpp)")
+    ap.add_argument("--permute", choices=["none", "random", "balanced"], default="none",
+                    help="emit the model in a permuted feature basis (saves permutations.npz): "
+                         "'balanced' evens out the per-column-block load for the tiled engine, "
+                         "'random' is the bit-exactness test")
+    ap.add_argument("--seed", type=int, default=0, help="seed for --permute random")
+    ap.add_argument("--mha-tiles", type=int, default=0,
+                    help="emit the MHA projection weights as this many per-column-block CSRs "
+                         "(0 = one row-major CSR, the original layout)")
+    ap.add_argument("--w1-group-cap", type=int, default=572,
+                    help="--permute: max nonzeros per group of 4 W1 rows; mirrors "
+                         "MLP_W1_GROUP_NNZ_MAX in src/layers/mlp.cpp (0 = no limit)")
     args = ap.parse_args()
 
     print(f"Reading {args.input} ...", file=sys.stderr)
@@ -778,7 +1108,24 @@ def main():
     all_layers = model.layers()
     layers = (all_layers if args.layers == "all"
               else [int(x) for x in args.layers.split(",") if x.strip()])
-    emit_model(model, layers, args.out, args.verify)
+    perms = None
+    if args.permute == "random":
+        perms = random_permutations(model, args.seed, w1_group_cap=args.w1_group_cap or None)
+    elif args.permute == "balanced":
+        perms = balanced_permutations(model, args.mha_tiles or 12)
+        if args.w1_group_cap:
+            rng = np.random.default_rng(args.seed)
+            for i, layer in enumerate(perms["layers"]):
+                w1 = model.linears[f"encoder.encoder_layer_{int(layer)}." + WMODULE["linear_1"]]
+                perms["sigma"][i] = _fit_group_cap((w1.weight_int != 0).sum(1), perms["sigma"][i],
+                                                   4, args.w1_group_cap, rng)
+    if perms is not None:
+        apply_permutations(model, perms)
+    pot_scales = {"auto": None, "fixed": False, "shift": True}[args.scales]
+    manifest = emit_model(model, layers, args.out, args.verify, pot_scales=pot_scales, perms=perms,
+                          n_tiles=args.mha_tiles)
+    if args.model_index:
+        emit_model_index(manifest, args.out)
     print(f"\nWrote {len(layers)} layer(s) to {args.out}/", file=sys.stderr)
 
 

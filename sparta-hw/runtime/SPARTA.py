@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import os
+import re
 import sys
 
 import numpy as np
@@ -47,12 +48,6 @@ from SPARTALoader import Loader
 ENC_D = 768          # feature width           (ENC_D)
 ENC_N = 50           # tokens                  (ENC_MAX_BATCH)
 ACT_ELEMS = ENC_D * ENC_N   # feature-major int8 activation buffer size
-
-# Q'/K' DDR scratch, allocated once and reused across all 12 layers.
-# MHA_MAX_QK_NNZ (config/inc/mha_cfg.h) = MHA_D * MHA_N_TOKENS = 768*50, i.e.
-# the full dense grid -- overflow-proof at any sparsity rather than an assumed
-# density.  q_col/k_col are T_MhaHeadIndex (8-bit) on this baseline.
-MHA_MAX_QK_NNZ = 38400
 
 
 # ============================================================================
@@ -85,8 +80,6 @@ class SpartaLayerArgs(ctypes.Structure):
         ("w1_values", ctypes.c_uint64), ("w1_col_idx", ctypes.c_uint64), ("w1_row_ptr", ctypes.c_uint64),
         ("w2_values", ctypes.c_uint64), ("w2_col_idx", ctypes.c_uint64), ("w2_row_ptr", ctypes.c_uint64),
         ("scales", ctypes.c_uint64),
-        ("q_val", ctypes.c_uint64), ("q_col", ctypes.c_uint64),
-        ("k_val", ctypes.c_uint64), ("k_col", ctypes.c_uint64),
         ("output", ctypes.c_uint64),
     ]
 
@@ -124,10 +117,28 @@ REGMAP = {
     "w1_values": (0x0c4, True), "w1_col_idx": (0x0d0, True), "w1_row_ptr": (0x0dc, True),
     "w2_values": (0x0e8, True), "w2_col_idx": (0x0f4, True), "w2_row_ptr": (0x100, True),
     "scales":    (0x10c, True),
-    "q_val":     (0x118, True), "q_col":      (0x124, True),
-    "k_val":     (0x130, True), "k_col":      (0x13c, True),
-    "output":    (0x148, True),
+    "output":    (0x118, True),
 }
+
+
+def load_regmap(hw_header):
+    """Register map from the HLS-generated x<top>_hw.h (e.g. xencoder_layer_top_hw.h).
+
+    Reads each '#define X..._CONTROL_ADDR_<NAME>_DATA <offset>' with its matching
+    '..._BITS_<NAME>_DATA <width>'.  HLS appends _R to names that are reserved in
+    C/RTL (output -> OUTPUT_R), which is stripped to recover the argument name."""
+    define = re.compile(r"#define\s+\w+_CONTROL_(ADDR|BITS)_(\w+)_DATA\s+(\w+)")
+    addr, bits = {}, {}
+    with open(hw_header) as f:
+        for line in f:
+            m = define.match(line.strip())
+            if not m:
+                continue
+            name = m.group(2).lower()
+            if name.endswith("_r"):
+                name = name[:-2]
+            (addr if m.group(1) == "ADDR" else bits)[name] = int(m.group(3), 0)
+    return {name: (off, bits.get(name, 32) > 32) for name, off in addr.items()}
 
 
 def _cma_total_bytes(default=1 << 30):
@@ -170,8 +181,14 @@ class HwKernel:
     TMR_TCSR0_RUN = (1 << 7) | (1 << 4)
 
     def __init__(self, bitstream=None, instance=None, download=True,
-                 timeout_s=60.0, base_addr=None, timer_base=None):
+                 timeout_s=60.0, base_addr=None, timer_base=None, regmap=None):
         self.timeout_s = timeout_s
+        # Register map: from the generated header (load_regmap) when given, else REGMAP.
+        self.regmap = regmap if regmap is not None else REGMAP
+        missing = [name for name, _ in SpartaLayerArgs._fields_ if name not in self.regmap]
+        if missing:
+            raise ValueError(f"register map has no offsets for kernel arguments {missing}; "
+                             "is the header from a different kernel build?")
         self.overlay = None
         # Optional diagnostic AXI timer: a free-running counter on the
         # kernel's ap_clk. When present, invoke() returns fabric cycles too.
@@ -298,7 +315,7 @@ class HwKernel:
         return getattr(self.overlay, matches[0].split("/")[-1])
 
     def _write_arg(self, name, value):
-        off, is64 = REGMAP[name]
+        off, is64 = self.regmap[name]
         if is64:
             self.ip.write(off,     value        & 0xFFFFFFFF)
             self.ip.write(off + 4, (value >> 32) & 0xFFFFFFFF)
@@ -307,7 +324,7 @@ class HwKernel:
 
     def read_arg(self, name):
         """Read one argument register back (all data registers are Read/Write)."""
-        off, is64 = REGMAP[name]
+        off, is64 = self.regmap[name]
         lo = self.ip.read(off)
         return (self.ip.read(off + 4) << 32 | lo) if is64 else lo
 
@@ -343,7 +360,7 @@ class HwKernel:
         # Per-32-bit-word view: a 64-bit arg is two independently addressed
         # words, and only testing the pair together would hide a dead high word.
         words = []
-        for name, (off, is64) in REGMAP.items():
+        for name, (off, is64) in self.regmap.items():
             words.append((f"{name}.lo" if is64 else name, off))
             if is64:
                 words.append((f"{name}.hi", off + 4))
@@ -378,7 +395,7 @@ class HwKernel:
                 print("               ^ done is LATCHED from an earlier run "
                       "(ap_ctrl_chain); invoke() clears it before starting.")
             print(f"registers    : {len(words)} 32-bit words "
-                  f"({len(REGMAP)} kernel arguments)")
+                  f"({len(self.regmap)} kernel arguments)")
             print(f"patterns     : 5 (4 uniform + 1 unique/aliasing)")
             if failures:
                 print(f"\nFAIL -- {len(failures)} register(s) did not read back:")
@@ -400,7 +417,7 @@ class HwKernel:
         return "unknown"
 
     def invoke(self, args):
-        """Write all 29 arguments, start the kernel, block until it completes.
+        """Write every kernel argument, start the kernel, block until it completes.
 
         `args` is a SpartaLayerArgs -- kept as the argument-carrying type so the
         buffer-address plumbing is shared with the XRT path it replaces.
@@ -425,7 +442,7 @@ class HwKernel:
         # ---- 1+2: make sure the kernel is idle and not parked in done -------
         self._drain_done()
 
-        for name in REGMAP:
+        for name, _ in SpartaLayerArgs._fields_:
             self._write_arg(name, getattr(args, name))
 
         # ---- 3: start ------------------------------------------------------
@@ -525,14 +542,22 @@ def _allocate(pynq_allocate, nbytes, dtype=np.uint8):
     return pynq_allocate(shape=(nbytes,), dtype=dtype)
 
 
+# The kernel bursts weight values/columns in wide words (up to 256 bits) and reads the
+# final word whole, so every weight buffer must stay readable up to the next word boundary.
+WIDE_READ_ALIGN = 64   # bytes
+
+
 def _stage_layer(alloc, layer):
     """Copy one layer's payload blobs into fresh PYNQ DDR buffers and sync to card.
     Returns a dict of named device buffers used to wire the kernel args."""
     bufs = {}
 
     def stage(name, arr):
-        b = _allocate(alloc, arr.nbytes, np.uint8)
-        b[:] = np.frombuffer(np.ascontiguousarray(arr).tobytes(), dtype=np.uint8)
+        raw = np.frombuffer(np.ascontiguousarray(arr).tobytes(), dtype=np.uint8)
+        padded = -(-raw.size // WIDE_READ_ALIGN) * WIDE_READ_ALIGN
+        b = _allocate(alloc, padded, np.uint8)
+        b[:raw.size] = raw
+        b[raw.size:] = 0
         b.sync_to_device()
         bufs[name] = b
 
@@ -549,12 +574,26 @@ def _stage_layer(alloc, layer):
     return bufs
 
 
+def stage_model(alloc, loader):
+    """Stage every layer's payload into DDR once: {layer: named device buffers}.
+
+    The whole 12-layer model is ~26 MB, so it stays resident for the lifetime of the
+    kernel and per-image work is only activation I/O.  Free with free_staged()."""
+    return {L: _stage_layer(alloc, loader.layer(L)) for L in loader.layer_indices()}
+
+
+def free_staged(staged):
+    for bufs in staged.values():
+        for buf in bufs.values():
+            buf.freebuffer()
+
+
 def _addr(buf):
     """Physical DDR address of a PYNQ buffer (what the C invoke ABI wants)."""
     return int(buf.device_address)
 
 
-def _build_args(x_buf, y_buf, lb, scratch, n_tokens, d, d_h):
+def _build_args(x_buf, y_buf, lb, n_tokens, d, d_h):
     """Fill a SpartaLayerArgs from PYNQ buffer device addresses.
 
     Field order matches encoder_layer_top()'s signature.  The weight tag names
@@ -570,14 +609,12 @@ def _build_args(x_buf, y_buf, lb, scratch, n_tokens, d, d_h):
         w1_values=_addr(lb["linear_1.values"]), w1_col_idx=_addr(lb["linear_1.col"]), w1_row_ptr=_addr(lb["linear_1.rowptr"]),
         w2_values=_addr(lb["linear_2.values"]), w2_col_idx=_addr(lb["linear_2.col"]), w2_row_ptr=_addr(lb["linear_2.rowptr"]),
         scales=_addr(lb["scales"]),
-        q_val=_addr(scratch["q_val"]), q_col=_addr(scratch["q_col"]),
-        k_val=_addr(scratch["k_val"]), k_col=_addr(scratch["k_col"]),
         output=_addr(y_buf),
     )
 
 
 def run_encoder(model_dir, image=None, bitstream=None, instance=None,
-                download=True, base_addr=None):
+                download=True, base_addr=None, hw_header=None):
     """Load payload, run the 12 encoder layers on the FPGA, return postprocess(Y).
 
     Python allocates/fills all DDR buffers (PYNQ) and drives the loop; HwKernel
@@ -588,21 +625,15 @@ def run_encoder(model_dir, image=None, bitstream=None, instance=None,
     layers = mp.layer_indices()
 
     kernel = HwKernel(bitstream, instance=instance, download=download,
-                      base_addr=base_addr)
+                      base_addr=base_addr,
+                      regmap=load_regmap(hw_header) if hw_header else None)
 
     # activation ping-pong: X (in) / Y (out).
     a = _allocate(allocate, ACT_ELEMS, np.int8)
     b = _allocate(allocate, ACT_ELEMS, np.int8)
 
-    # Q'/K' scratch: written and read entirely by the kernel, never by the
-    # host, so it is allocated once and reused across all 12 layers rather
-    # than re-staged per layer.
-    scratch = {
-        "q_val": _allocate(allocate, MHA_MAX_QK_NNZ, np.int8),
-        "q_col": _allocate(allocate, MHA_MAX_QK_NNZ, np.uint8),
-        "k_val": _allocate(allocate, MHA_MAX_QK_NNZ, np.int8),
-        "k_col": _allocate(allocate, MHA_MAX_QK_NNZ, np.uint8),
-    }
+    # ---- all layers' weights staged into DDR once ----
+    staged = stage_model(allocate, mp)
 
     # ---- preprocess -> X into buffer `a` ----
     x0 = preprocess(image)
@@ -612,25 +643,20 @@ def run_encoder(model_dir, image=None, bitstream=None, instance=None,
 
     try:
         for L in layers:
-            layer = mp.layer(L)
-            d_h = layer.weights["linear_1"].shape[0]
-            lb = _stage_layer(allocate, layer)
-            args = _build_args(x_buf, y_buf, lb, scratch, ENC_N, ENC_D, d_h)
+            d_h = mp.layer(L).weights["linear_1"].shape[0]
+            args = _build_args(x_buf, y_buf, staged[L], ENC_N, ENC_D, d_h)
             try:
                 kernel.invoke(args)
             except TimeoutError as e:
                 raise RuntimeError(f"encoder layer {L} hung: {e}") from e
             y_buf.sync_from_device()
-            # free this layer's weight buffers before the next (weights
-            # dominate DDR; all 12 layers resident at once would not fit).
-            for buf in lb.values():
-                buf.freebuffer()
             x_buf, y_buf = y_buf, x_buf     # output becomes next input
 
         # after the loop the last output is in x_buf (post-swap).
         x_buf.sync_from_device()
         y = np.array(x_buf[:ACT_ELEMS], dtype=np.int8)
     finally:
+        free_staged(staged)
         kernel.close()
 
     return postprocess(y)
@@ -659,7 +685,11 @@ def main():
                          "checks the AXI-Lite control path only (no DDR, no "
                          "ap_start). Run this first on a new bitstream.")
     ap.add_argument("--image", default=None, help="input image (preprocess stub ignores it)")
+    ap.add_argument("--hw-header", default=None,
+                    help="HLS-generated xencoder_layer_top_hw.h to read the register "
+                         "offsets from (default: the built-in REGMAP)")
     args = ap.parse_args()
+    regmap = load_regmap(args.hw_header) if args.hw_header else None
 
     if not args.bitstream and not args.no_download:
         ap.error("-b/--bitstream is required unless --no-download is given")
@@ -667,7 +697,7 @@ def main():
 
     if args.selftest:
         kernel = HwKernel(args.bitstream, instance=args.instance,
-                          download=not args.no_download, base_addr=base)
+                          download=not args.no_download, base_addr=base, regmap=regmap)
         failures = kernel.selftest()
         return 1 if failures else 0
 
@@ -676,7 +706,7 @@ def main():
 
     result = run_encoder(args.model_dir, image=args.image, bitstream=args.bitstream,
                          instance=args.instance, download=not args.no_download,
-                         base_addr=base)
+                         base_addr=base, hw_header=args.hw_header)
     print(f"encoder done; postprocess -> {result}")
     return 0
 

@@ -169,10 +169,9 @@ def run_head(model, enc_out_int8, out_scale):
 class HwEncoder:
     """Runs the 12 encoder layers on the FPGA, holding device state open.
 
-    The kernel handle and the activation/scratch buffers are set up once, so
-    per-image cost is only the weight staging plus the 12 kernel invocations.
-    Weight buffers are freed per layer because all 12 layers' weights do not
-    fit in DDR simultaneously.
+    The kernel handle, the activation buffers and every layer's weights
+    (~26 MB for the 12-layer model) are staged into DDR once, so per-image cost
+    is only the activation I/O plus the 12 kernel invocations.
 
     By default this ATTACHES to a PL programmed elsewhere (xmutil) rather than
     programming it -- see HwKernel.
@@ -180,7 +179,7 @@ class HwEncoder:
 
     def __init__(self, model_dir, bitstream=None, instance=None, download=False,
                  base_addr=None, debug_dir=None, verbose=False, dbg_nnz=False,
-                 timer_base=None):
+                 timer_base=None, hw_header=None):
         from pynq import allocate
         from SPARTALoader import Loader
 
@@ -195,9 +194,10 @@ class HwEncoder:
             os.makedirs(debug_dir, exist_ok=True)
         # HwKernel is the hardware seam: attaches to (or programs) the PL and
         # owns the AXI-Lite control registers.
+        regmap = SPARTA.load_regmap(hw_header) if hw_header else None
         self.kernel = SPARTA.HwKernel(bitstream, instance=instance,
                                       download=download, base_addr=base_addr,
-                                      timer_base=timer_base)
+                                      timer_base=timer_base, regmap=regmap)
         self.overlay = self.kernel.overlay      # None on the attach path
         if verbose:
             print(f"  control base {self.kernel._base_addr_str()}, "
@@ -214,16 +214,16 @@ class HwEncoder:
         n = SPARTA.ACT_ELEMS
         self.a = allocate(shape=(n,), dtype=np.int8)
         self.b = allocate(shape=(n,), dtype=np.int8)
-        q = SPARTA.MHA_MAX_QK_NNZ
-        self.scratch = {
-            "q_val": allocate(shape=(q,), dtype=np.int8),
-            "q_col": allocate(shape=(q,), dtype=np.uint8),
-            "k_val": allocate(shape=(q,), dtype=np.int8),
-            "k_col": allocate(shape=(q,), dtype=np.uint8),
-        }
         if verbose:
-            mb = (3 * n + 4 * q) / (1024 * 1024)
-            print(f" {mb:.1f} MB (act 3x{n}, scratch 4x{q})", flush=True)
+            mb = (3 * n) / (1024 * 1024)
+            print(f" {mb:.1f} MB (act 3x{n})", flush=True)
+            print("  staging all layers' weights...", end="", flush=True)
+        t0 = time.monotonic()
+        self.staged = SPARTA.stage_model(allocate, self.mp)
+        self.d_h = {L: self.mp.layer(L).weights["linear_1"].shape[0] for L in self.layers}
+        if verbose:
+            mb = sum(b.nbytes for bufs in self.staged.values() for b in bufs.values()) / (1024 * 1024)
+            print(f" {mb:.1f} MB in {time.monotonic() - t0:.1f}s", flush=True)
 
     def __call__(self, enc_in, n_layers=None, debug_tag=None):
         """enc_in : (D, N) int8 feature-major  ->  (D, N) int8 feature-major.
@@ -250,17 +250,10 @@ class HwEncoder:
         x_buf, y_buf = self.a, self.b
 
         for L in layers:
-            layer = self.mp.layer(L)
-            d_h = layer.weights["linear_1"].shape[0]
+            args = SPARTA._build_args(x_buf, y_buf, self.staged[L],
+                                      SPARTA.ENC_N, SPARTA.ENC_D, self.d_h[L])
             if self.verbose:
-                print(f"  L{L:02d}: staging weights...", end="", flush=True)
-            t0 = time.monotonic()
-            lb = SPARTA._stage_layer(self._allocate, layer)
-            t_stage = time.monotonic() - t0
-            args = SPARTA._build_args(x_buf, y_buf, lb, self.scratch,
-                                      SPARTA.ENC_N, SPARTA.ENC_D, d_h)
-            if self.verbose:
-                print(f" {t_stage:.1f}s; invoking kernel...", end="", flush=True)
+                print(f"  L{L:02d}: invoking kernel...", end="", flush=True)
 
             try:
                 t_run = self.kernel.invoke(args)
@@ -281,8 +274,6 @@ class HwEncoder:
             y_buf.sync_from_device()
             if debug_tag is not None and self.debug_dir is not None:
                 self._dump(debug_tag, L, y_buf)
-            for buf in lb.values():
-                buf.freebuffer()
             x_buf, y_buf = y_buf, x_buf
 
         x_buf.sync_from_device()
@@ -298,7 +289,8 @@ class HwEncoder:
 
     def close(self):
         self.kernel.close()
-        for b in (self.a, self.b, *self.scratch.values()):
+        SPARTA.free_staged(self.staged)
+        for b in (self.a, self.b):
             b.freebuffer()
 
 
@@ -342,6 +334,9 @@ def main():
                          "only suppresses the comparison)")
     ap.add_argument("--timer-base", default=None,
                     help="base address of the diagnostic AXI timer, if present.")
+    ap.add_argument("--hw-header", default=None,
+                    help="HLS-generated xencoder_layer_top_hw.h to read the register "
+                         "offsets from (default: SPARTA.REGMAP)")
     args = ap.parse_args()
 
     if args.download and not args.bitstream:
@@ -376,7 +371,8 @@ def main():
                    base_addr=int(args.base_addr, 0) if args.base_addr else None,
                    debug_dir=args.debug_dir if args.debug else None,
                    verbose=args.verbose,
-                   timer_base=int(args.timer_base, 0) if args.timer_base else None)
+                   timer_base=int(args.timer_base, 0) if args.timer_base else None,
+                   hw_header=args.hw_header)
     step("FPGA ready")
 
     if args.layers is not None:
