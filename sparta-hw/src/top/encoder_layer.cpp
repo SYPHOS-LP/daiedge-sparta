@@ -10,12 +10,12 @@
 #include <cassert>
 #endif
 
-// The layer dims are the single source of truth for both sub-blocks; assert the
-// per-block config literals agree so they cannot drift across the config headers.
-static_assert(ENC_FEATURE_W_MAX == ENC_MHA_FEATURE_W_MAX && ENC_FEATURE_W_MAX == ENC_MLP_FEATURE_W_MAX,
-              "ENC_FEATURE_W_MAX must match ENC_MHA_FEATURE_W_MAX / ENC_MLP_FEATURE_W_MAX");
-static_assert(ENC_TOKEN_W_MAX == ENC_MHA_TOKEN_W_MAX && ENC_TOKEN_W_MAX == ENC_MLP_TOKEN_W_MAX,
-              "ENC_TOKEN_W_MAX must match ENC_MHA_TOKEN_W_MAX / ENC_MLP_TOKEN_W_MAX");
+// The layer dims are the single source of truth; assert the layer-core config literals agree so
+// they cannot drift across the config headers.
+static_assert(ENC_FEATURE_W_MAX == MHA_FEATURE_W_MAX && ENC_FEATURE_W_MAX == MLP_FEATURE_W_MAX,
+              "ENC_FEATURE_W_MAX must match MHA_FEATURE_W_MAX / MLP_FEATURE_W_MAX");
+static_assert(ENC_TOKEN_W_MAX == MHA_TOKEN_W_MAX && ENC_TOKEN_W_MAX == MLP_TOKEN_W_MAX,
+              "ENC_TOKEN_W_MAX must match MHA_TOKEN_W_MAX / MLP_TOKEN_W_MAX");
 
 void encoder_layer_top(
     const T_Activation*   input,
@@ -75,22 +75,16 @@ void encoder_layer_top(
     static T_Activation hidden_oc[ENC_FEATURE_W_MAX * ENC_TOKEN_W_MAX];
     #pragma HLS BIND_STORAGE variable=hidden_oc type=ram_t2p impl=bram
 
-    /* hidden = input + MHA(RMSNorm(input)) */
-    encoder_mha_block(input, tokens_dim, feature_dim,
-                      wq_bank, wq_counts,
-                      wk_bank, wk_counts,
-                      wv_bank, wv_counts,
-                      wo_bank, wo_counts,
-                      layer_scales,
-                      hidden_oc);
-
-    /* output = hidden + MLP(RMSNorm(hidden)) */
-    encoder_mlp_block(hidden_oc,
-                      tokens_dim,
-                      feature_dim,
-                      intermediate_dim,
-                      w1_bank, w1_counts,
-                      w2_bank, w2_counts,
-                      layer_scales,
-                      output);
+    /* The whole layer: RMSNorm, the attention half's stages, its residual, RMSNorm again, the
+     * feed-forward stages and its residual -- one stage loop, so one SpMM engine. */
+    encoder_layer_stages(input, tokens_dim, feature_dim, intermediate_dim,
+                         wq_bank, wq_counts,
+                         wk_bank, wk_counts,
+                         wv_bank, wv_counts,
+                         wo_bank, wo_counts,
+                         w1_bank, w1_counts,
+                         w2_bank, w2_counts,
+                         layer_scales,
+                         hidden_oc,
+                         output);
 }

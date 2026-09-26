@@ -34,30 +34,40 @@
 #include "encoder_scales.h"
 
 /**
- * @brief Linear multi-head attention (softmax-free).
+ * @brief Linear (softmax-free) attention for one head.
  *
- * @param[in]  input_packed  Packed input activations.
- * @param[in]  tokens_dim    Number of tokens.
- * @param[in]  wq_bank       Q projection weight: packed {column, value} entries, column-block order.
- * @param[in]  wq_counts     Q projection weight: nonzeros per (column block, row), block-major.
- * @param[in]  wk_bank       K projection weight entries.
- * @param[in]  wk_counts     K projection weight counts.
- * @param[in]  wv_bank       V projection weight entries.
- * @param[in]  wv_counts     V projection weight counts.
- * @param[in]  wo_bank       Output projection weight entries.
- * @param[in]  wo_counts     Output projection weight counts.
- * @param[in]  scales        Folded scales for requantization.
- * @param[out] output        Dense attention output.
+ * A = K' . V^T over this head's features, then Z = Q' . A normalized by Q' . sum(K'), requantized
+ * and written packed into the attention output at this head's feature rows.  Q' and K' arrive as
+ * this head's CSR, V as its dense rows; all three are on-chip.
+ *
+ * @param[in]  enable      Zero returns immediately.  The caller passes a flag rather than guarding
+ *                         the call, because a call inside an `if` makes HLS specialise the
+ *                         enclosing loop body for that case and duplicate its other functions.
+ * @param[in]  head        Head index, which selects the output's feature rows.
+ * @param[in]  tokens_dim  Number of tokens.
+ * @param[in]  quant_scale Folded requantization scale of the attention output.
+ * @param[in]  k_val       K' values / columns / row pointers for this head (feature-major).
+ * @param[in]  k_col
+ * @param[in]  k_ptr
+ * @param[in]  q_val       Q' values / columns / row pointers for this head (token-major).
+ * @param[in]  q_col
+ * @param[in]  q_ptr
+ * @param[in]  v_head      This head's dense V (MHA_FEATURE_HEAD x N).
+ * @param[out] out_packed  Packed attention output, all heads.
  */
-void mha(
-    T_MhaBankWord *input_packed,
-    int            tokens_dim,
-    T_MhaTileWord *wq_bank, int *wq_counts,
-    T_MhaTileWord *wk_bank, int *wk_counts,
-    T_MhaTileWord *wv_bank, int *wv_counts,
-    T_MhaTileWord *wo_bank, int *wo_counts,
-    const T_Scale *scales,
-    T_Activation  *output
+void head_core (
+    int             enable,
+    int             head,
+    int             tokens_dim,
+    T_Scale         quant_scale,
+    T_Activation   *k_val,
+    T_MhaHeadIndex *k_col,
+    int            *k_ptr,
+    T_Activation   *q_val,
+    T_MhaHeadIndex *q_col,
+    int            *q_ptr,
+    T_Activation   *v_head,
+    T_MhaBankWord  *out_packed
 );
 
 #endif // MHA_H

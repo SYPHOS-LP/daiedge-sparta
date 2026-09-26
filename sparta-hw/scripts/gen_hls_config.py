@@ -103,9 +103,10 @@ def generate_hls_config(config, output_path):
         p(helpers_inc_dir / "mha_recip.h"),
         p(config_inc_dir / "mha_cfg.h"),
     ]
-    mlp_files = [
-        p(layers_src_dir / "mlp.cpp"),
-        p(layers_inc_dir / "mlp.h"),
+    # The layer's stage loop: the single call site for the engine and for every tail.
+    stages_files = [
+        p(layers_src_dir / "encoder_stages.cpp"),
+        p(layers_inc_dir / "encoder_stages.h"),
         p(config_inc_dir / "mlp_cfg.h"),
     ]
     residual_files = [
@@ -124,16 +125,10 @@ def generate_hls_config(config, output_path):
             p(top_src_dir / "encoder_layer.cpp"),
             p(top_inc_dir / "encoder_layer.h"),
             p(config_inc_dir / "encoder_layer_cfg.h"),
-            p(top_src_dir / "encoder_mha_block.cpp"),
-            p(top_inc_dir / "encoder_mha_block.h"),
-            p(config_inc_dir / "encoder_mha_block_cfg.h"),
-            p(top_src_dir / "encoder_mlp_block.cpp"),
-            p(top_inc_dir / "encoder_mlp_block.h"),
-            p(config_inc_dir / "encoder_mlp_block_cfg.h"),
             *residual_files,
             *spmm_files,
+            *stages_files,
             *mha_files,
-            *mlp_files,
             *rmsnorm_files,
         ]
     else:

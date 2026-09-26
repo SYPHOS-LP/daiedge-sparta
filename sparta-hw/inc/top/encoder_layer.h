@@ -73,9 +73,9 @@
 #ifndef ENCODER_LAYER_H
 #define ENCODER_LAYER_H
 
-#include "encoder_mha_block.h"
-#include "encoder_mlp_block.h"
 #include "encoder_layer_cfg.h"
+#include "encoder_stages.h"
+#include "csr_bounds.h"   // MAX_NNZ / MAX_ROWS, the m_axi port depths
 #include "encoder_scales.h"    // EncoderScaleLUTIndex (the scales[] array layout)
 
 /**
