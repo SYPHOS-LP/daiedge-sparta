@@ -47,7 +47,7 @@ HLS_CONFIG  := $(PROJECT_DIR)/hls_config.cfg
 # (encoder_types.yaml -> encoder_types.h is the one naming exception).
 CFG_YML_DIR    := config/yml
 CFG_INC_DIR    := config/inc
-CFG_COMPONENTS := rmsnorm mlp mha encoder_mha_block encoder_mlp_block encoder_layer
+CFG_COMPONENTS := rmsnorm mlp mha encoder_layer
 CFG_HEADERS    := $(addprefix $(CFG_INC_DIR)/,$(addsuffix _cfg.h,$(CFG_COMPONENTS))) \
                    $(CFG_INC_DIR)/encoder_types.h
 
