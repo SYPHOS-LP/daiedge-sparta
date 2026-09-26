@@ -32,18 +32,27 @@ import numpy as np
 # so the dtype only has to give the right element width.
 _DT = {"int8": np.dtype("<i1"), "uint8": np.dtype("<u1"),
        "uint16": np.dtype("<u2"),
-       "int16": np.dtype("<i2"), "int32": np.dtype("<i4")}
+       "int16": np.dtype("<i2"), "int32": np.dtype("<i4"),
+       "uint64": np.dtype("<u8")}
 
 
 @dataclass
 class Weight:
-    """One CSR weight (views into model.bin)."""
+    """One weight (views into model.bin).
+
+    layout "csr" / "csc": values + col + rowptr.
+    layout "tiled_bank": bank + counts, where bank holds the packed {column, value} entries the
+    kernel copies into its banks and counts the nonzeros per (column block, row).
+    """
     shape: tuple
     nnz: int
     max_row_nnz: int
-    values: np.ndarray      # int8   [nnz]
-    col: np.ndarray         # uint16 [nnz]
-    rowptr: np.ndarray      # int32  [rows+1]
+    layout: str = "csr"
+    values: np.ndarray = None   # int8   [nnz]
+    col: np.ndarray = None      # uint16 [nnz]
+    rowptr: np.ndarray = None   # int32  [rows+1]
+    bank: np.ndarray = None     # uint64 [nnz // entries-per-word]
+    counts: np.ndarray = None   # int32  [n_tiles * rows]
 
 
 @dataclass
@@ -85,10 +94,16 @@ class Loader:
         m = self.manifest["layers"][str(i)]
         L = Layer(index=i)
         for tag, w in m["weights"].items():
-            L.weights[tag] = Weight(
-                shape=tuple(w["shape"]), nnz=w["nnz"], max_row_nnz=w["max_row_nnz"],
-                values=self.view(w["values"]), col=self.view(w["col"]),
-                rowptr=self.view(w["rowptr"]))
+            layout = w.get("layout", "csr")
+            if layout == "tiled_bank":
+                L.weights[tag] = Weight(
+                    shape=tuple(w["shape"]), nnz=w["nnz"], max_row_nnz=w["max_row_nnz"],
+                    layout=layout, bank=self.view(w["bank"]), counts=self.view(w["counts"]))
+            else:
+                L.weights[tag] = Weight(
+                    shape=tuple(w["shape"]), nnz=w["nnz"], max_row_nnz=w["max_row_nnz"],
+                    layout=layout, values=self.view(w["values"]), col=self.view(w["col"]),
+                    rowptr=self.view(w["rowptr"]))
         for name, d in m["scale_rows"].items():
             L.scale_rows[name] = self.view(d)
         L.scales = self.view(m["scales"])

@@ -346,11 +346,13 @@ GAMMA_BITS = 8    # T_RmsGamma = ap_int<8> (int8 code; gamma_scale folded into i
 
 # The six weights: tag -> module suffix.  Per-row fold s_in/s_out resolved per layer.
 WEIGHTS = ["w_q", "w_k", "w_v", "out_proj", "linear_1", "linear_2"]
-# The MHA projections share one tiled SpMM engine, so they are the weights emitted per column
-# block (see dense_to_tiled_csr).  The MLP weights keep their row-/column-major CSR for now.
-TILED_WEIGHTS = ["w_q", "w_k", "w_v", "out_proj"]
+# Weights that can be emitted per column block for the tiled SpMM engine (see
+# dense_to_tiled_csr): the four MHA projections, selected by --mha-tiles, and the two MLP
+# weights, selected by --mlp-tiles.
+MHA_TILED_WEIGHTS = ["w_q", "w_k", "w_v", "out_proj"]
+MLP_TILED_WEIGHTS = ["linear_1", "linear_2"]
 # Weight entries per kernel memory word (MHA_TILE_PACK in mha_cfg.h): 4 entries of
-# {6-bit block-local column, 4-bit value} in a 16-bit lane fill a 64-bit word, so one bank is
+# {8-bit block-local column, 4-bit value} in a 16-bit lane fill a 64-bit word, so one bank is
 # one URAM (72-bit words) and each load reads whole words.
 TILE_PACK = 4
 WMODULE = {
@@ -470,6 +472,58 @@ def dense_to_csc(wint):
     vals = np.concatenate(vals) if vals else np.zeros(0, np.int64)
     rowidx = np.concatenate(rowidx) if rowidx else np.zeros(0, np.uint16)
     return vals, rowidx.astype("<u2"), colptr.astype("<i4")
+
+
+def pack_tiled_bank(vals, indices, pot, pack=TILE_PACK, entry_bits=16):
+    """Pack tiled weight entries into the words the kernel copies into its banks.
+
+    The kernel reads an entry as a value in bits 0..3 and a block-local column in bits 4..9 of an
+    `entry_bits`-wide slot, with `pack` slots per word.  Producing that layout here makes the
+    on-chip load a plain copy instead of two passes that unpack, re-encode and merge.
+
+    Parameters
+    ----------
+    vals : ndarray of int
+        Nonzero weight values in bank order (output of dense_to_tiled_csr), zeros for padding.
+    indices : ndarray of int
+        Block-local column of each value, same order and length as `vals`.
+    pot : bool
+        True for a power-of-two model: the value is encoded as {sign in bit 3, exponent in bits
+        0..2}, matching the shift-MAC.  False encodes the plain int4 weight in two's complement.
+    pack : int, optional
+        Entries per word.
+    entry_bits : int, optional
+        Bits per entry slot.
+
+    Returns
+    -------
+    ndarray of uint64, shape (len(vals) // pack,)
+        One word per `pack` entries, in the same order as `vals`.
+
+    Raises
+    ------
+    ValueError
+        If `len(vals)` is not a multiple of `pack`, or a column does not fit 6 bits.
+    """
+    v = np.asarray(vals, dtype=np.int64)
+    c = np.asarray(indices, dtype=np.int64)
+    if v.size % pack:
+        raise ValueError(f"{v.size} entries is not a multiple of pack={pack}")
+    if c.size and (c.min() < 0 or c.max() > 0xFF):
+        raise ValueError(f"block-local column out of 0..255: {c.min()}..{c.max()}")
+
+    if pot:
+        nibble = pot_weight_signexp(v, allow_zero=True).astype(np.int64)
+        nibble = ((nibble >> 7) << 3) | (nibble & 0x7)   # {sign bit7, exp bits0..6} -> {sign bit3, exp bits0..2}
+    else:
+        nibble = v & 0xF                                  # int4 two's complement
+
+    entry = (nibble | (c << 4)).astype(np.uint64)
+    entry = entry.reshape(-1, pack)
+    word = np.zeros(entry.shape[0], dtype="<u8")
+    for lane in range(pack):
+        word |= entry[:, lane] << np.uint64(lane * entry_bits)
+    return word
 
 
 def dense_to_tiled_csr(wint, n_tiles, pad_to=1):
@@ -641,7 +695,7 @@ def emit_gamma(model, layer, ln, bw, verify):
     return entry
 
 
-def emit_layer(model, layer, bw, verify, pot=False, fused=None, pot_scales=None, n_tiles=0):
+def emit_layer(model, layer, bw, verify, pot=False, fused=None, pot_scales=None, tiles=None):
     """Append one layer's blobs to the single-file writer `bw`; return its manifest.
 
     pot=True (POT4 model): WEIGHTS are emitted as one sign+exponent byte per nonzero
@@ -669,8 +723,9 @@ def emit_layer(model, layer, bw, verify, pot=False, fused=None, pot_scales=None,
         # The manifest keeps the same (values/col/rowptr) key names, but for CSC they carry
         # (values, ROW index per nonzero, COLUMN pointer) -- the HW reads the triple as a
         # column-major CSR.  All other weights stay row-major CSR.
-        csc = (tag == "linear_2")
-        tiled = (n_tiles > 0 and tag in TILED_WEIGHTS)
+        n_tiles = (tiles or {}).get(tag, 0)
+        tiled = n_tiles > 0
+        csc = (tag == "linear_2" and not tiled)
         if tiled:
             # One CSR per column block.  The "rowptr" slot carries each block's per-row nonzero
             # counts (block-major), which is what the kernel needs to advance one cursor per block.
@@ -680,14 +735,19 @@ def emit_layer(model, layer, bw, verify, pot=False, fused=None, pot_scales=None,
             vals, idx, ptr = dense_to_csc(wi)   # idx = row index, ptr = column pointer
         else:
             vals, idx, ptr = dense_to_csr(wi)   # idx = col index, ptr = row pointer
-        val_blob = (bw.put(pot_weight_signexp(vals, allow_zero=tiled)) if pot
-                    else bw.put(vals.astype(np.int8)))
         ent = {"shape": list(wi.shape), "nnz": int(vals.size),
                "max_row_nnz": int(ptr.max() if tiled else np.diff(ptr.astype(np.int64)).max()),
-               "layout": "tiled_csr" if tiled else ("csc" if csc else "csr"),
-               "values": val_blob,
-               "col": bw.put(idx),
-               "rowptr": bw.put(ptr)}
+               "layout": "tiled_bank" if tiled else ("csc" if csc else "csr")}
+        if tiled:
+            # Values and columns in one pre-packed array; "counts" holds the per-(block, row)
+            # nonzero counts the kernel walks the rows with.
+            ent["bank"]   = bw.put(pack_tiled_bank(vals, idx, pot))
+            ent["counts"] = bw.put(ptr)
+        else:
+            ent["values"] = (bw.put(pot_weight_signexp(vals)) if pot
+                             else bw.put(vals.astype(np.int8)))
+            ent["col"]    = bw.put(idx)
+            ent["rowptr"] = bw.put(ptr)
         if tiled:
             ent["n_tiles"] = n_tiles
             ent["tile_nnz"] = [int(n) for n in indptr[:, -1]]   # nonzeros per block
@@ -741,7 +801,7 @@ def _is_pot_model(model):
 
 
 def emit_model(model, layers, out_dir, verify=False, pot=None, fused=None, pot_scales=None,
-               perms=None, n_tiles=0):
+               perms=None, tiles=None):
     """Emit ONE concatenated model.bin (all layers, all blobs) + manifest.json.
 
     perms: the permutations already applied to `model` (apply_permutations), if any. They are
@@ -782,7 +842,7 @@ def emit_model(model, layers, out_dir, verify=False, pot=None, fused=None, pot_s
         bw = BlobWriter(fh)
         for layer in layers:
             ld = emit_layer(model, layer, bw, verify, pot=pot, fused=fused, pot_scales=pot_scales,
-                            n_tiles=n_tiles)
+                            tiles=tiles)
             manifest["layers"][str(layer)] = ld
             w = ld["weights"]
             vtxt = ""
@@ -816,7 +876,7 @@ def emit_model_index(manifest, out_dir, n_heads=12):
 
     Layout: magic + (n_layers, D, d_h, n_heads) + per layer, per weight in WEIGHTS order,
     (nnz, n_ptr) where n_ptr = pointer-array length - 1: rows for CSR, columns for CSC, and
-    n_tiles * rows for tiled_csr, whose pointer blob holds per-row counts for every block."""
+    n_tiles * rows for tiled_bank, whose count array holds one entry per (block, row)."""
     ids = sorted(int(k) for k in manifest["layers"])
     w0 = manifest["layers"][str(ids[0])]["weights"]
     d_model, d_hidden = int(w0["w_q"]["shape"][1]), int(w0["linear_1"]["shape"][0])
@@ -828,7 +888,7 @@ def emit_model_index(manifest, out_dir, n_heads=12):
             for tag in WEIGHTS:
                 w = manifest["layers"][str(L)]["weights"][tag]
                 layout = w.get("layout")
-                if layout == "tiled_csr":
+                if layout == "tiled_bank":
                     n_ptr = int(w["n_tiles"]) * int(w["shape"][0]) - 1
                 elif layout == "csc":
                     n_ptr = int(w["shape"][1])
@@ -1088,6 +1148,10 @@ def main():
     ap.add_argument("--mha-tiles", type=int, default=0,
                     help="emit the MHA projection weights as this many per-column-block CSRs "
                          "(0 = one row-major CSR, the original layout)")
+    ap.add_argument("--mlp-tiles", type=int, default=0,
+                    help="emit the MLP weights as this many per-column-block CSRs; linear_1 splits "
+                         "its D input features, linear_2 its d_h hidden features "
+                         "(0 = row-major CSR for linear_1 and column-major CSC for linear_2)")
     ap.add_argument("--w1-group-cap", type=int, default=572,
                     help="--permute: max nonzeros per group of 4 W1 rows; mirrors "
                          "MLP_W1_GROUP_NNZ_MAX in src/layers/mlp.cpp (0 = no limit)")
@@ -1122,8 +1186,10 @@ def main():
     if perms is not None:
         apply_permutations(model, perms)
     pot_scales = {"auto": None, "fixed": False, "shift": True}[args.scales]
+    tiles = {t: args.mha_tiles for t in MHA_TILED_WEIGHTS if args.mha_tiles > 0}
+    tiles.update({t: args.mlp_tiles for t in MLP_TILED_WEIGHTS if args.mlp_tiles > 0})
     manifest = emit_model(model, layers, args.out, args.verify, pot_scales=pot_scales, perms=perms,
-                          n_tiles=args.mha_tiles)
+                          tiles=tiles)
     if args.model_index:
         emit_model_index(manifest, args.out)
     print(f"\nWrote {len(layers)} layer(s) to {args.out}/", file=sys.stderr)

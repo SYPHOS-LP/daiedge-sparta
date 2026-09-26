@@ -73,10 +73,10 @@ class SpartaLayerArgs(ctypes.Structure):
         ("feature_dim", ctypes.c_int32),
         ("tokens_dim", ctypes.c_int32),
         ("intermediate_dim", ctypes.c_int32),
-        ("wq_values", ctypes.c_uint64), ("wq_col_idx", ctypes.c_uint64), ("wq_row_ptr", ctypes.c_uint64),
-        ("wk_values", ctypes.c_uint64), ("wk_col_idx", ctypes.c_uint64), ("wk_row_ptr", ctypes.c_uint64),
-        ("wv_values", ctypes.c_uint64), ("wv_col_idx", ctypes.c_uint64), ("wv_row_ptr", ctypes.c_uint64),
-        ("wo_values", ctypes.c_uint64), ("wo_col_idx", ctypes.c_uint64), ("wo_row_ptr", ctypes.c_uint64),
+        ("wq_bank", ctypes.c_uint64), ("wq_counts", ctypes.c_uint64),
+        ("wk_bank", ctypes.c_uint64), ("wk_counts", ctypes.c_uint64),
+        ("wv_bank", ctypes.c_uint64), ("wv_counts", ctypes.c_uint64),
+        ("wo_bank", ctypes.c_uint64), ("wo_counts", ctypes.c_uint64),
         ("w1_values", ctypes.c_uint64), ("w1_col_idx", ctypes.c_uint64), ("w1_row_ptr", ctypes.c_uint64),
         ("w2_values", ctypes.c_uint64), ("w2_col_idx", ctypes.c_uint64), ("w2_row_ptr", ctypes.c_uint64),
         ("scales", ctypes.c_uint64),
@@ -110,14 +110,14 @@ REGMAP = {
     "feature_dim":      (0x01c, False),
     "tokens_dim":       (0x024, False),
     "intermediate_dim": (0x02c, False),
-    "wq_values": (0x034, True), "wq_col_idx": (0x040, True), "wq_row_ptr": (0x04c, True),
-    "wk_values": (0x058, True), "wk_col_idx": (0x064, True), "wk_row_ptr": (0x070, True),
-    "wv_values": (0x07c, True), "wv_col_idx": (0x088, True), "wv_row_ptr": (0x094, True),
-    "wo_values": (0x0a0, True), "wo_col_idx": (0x0ac, True), "wo_row_ptr": (0x0b8, True),
-    "w1_values": (0x0c4, True), "w1_col_idx": (0x0d0, True), "w1_row_ptr": (0x0dc, True),
-    "w2_values": (0x0e8, True), "w2_col_idx": (0x0f4, True), "w2_row_ptr": (0x100, True),
-    "scales":    (0x10c, True),
-    "output":    (0x118, True),
+    "wq_bank":   (0x034, True), "wq_counts": (0x040, True),
+    "wk_bank":   (0x04c, True), "wk_counts": (0x058, True),
+    "wv_bank":   (0x064, True), "wv_counts": (0x070, True),
+    "wo_bank":   (0x07c, True), "wo_counts": (0x088, True),
+    "w1_values": (0x094, True), "w1_col_idx": (0x0a0, True), "w1_row_ptr": (0x0ac, True),
+    "w2_values": (0x0b8, True), "w2_col_idx": (0x0c4, True), "w2_row_ptr": (0x0d0, True),
+    "scales":    (0x0dc, True),
+    "output":    (0x0e8, True),
 }
 
 
@@ -562,9 +562,13 @@ def _stage_layer(alloc, layer):
         bufs[name] = b
 
     for tag, w in layer.weights.items():
-        stage(f"{tag}.values", w.values)
-        stage(f"{tag}.col",    w.col)
-        stage(f"{tag}.rowptr", w.rowptr)
+        if w.layout == "tiled_bank":
+            stage(f"{tag}.bank",   w.bank)
+            stage(f"{tag}.counts", w.counts)
+        else:
+            stage(f"{tag}.values", w.values)
+            stage(f"{tag}.col",    w.col)
+            stage(f"{tag}.rowptr", w.rowptr)
     stage("scales", layer.scales)
     # NOT staged: scale_rows and gammas.  Neither is a kernel argument on this
     # baseline -- the per-row requant folded into `scales` and the gammas into
@@ -597,15 +601,15 @@ def _build_args(x_buf, y_buf, lb, n_tokens, d, d_h):
     """Fill a SpartaLayerArgs from PYNQ buffer device addresses.
 
     Field order matches encoder_layer_top()'s signature.  The weight tag names
-    (`w_q.values`, `out_proj.rowptr`, ...) come from compile_model.py's
+    (`w_q.bank`, `linear_1.rowptr`, ...) come from compile_model.py's
     manifest via SPARTALoader and are unaffected by the runtime flow."""
     return SpartaLayerArgs(
         input=_addr(x_buf),
         feature_dim=d, tokens_dim=n_tokens, intermediate_dim=d_h,
-        wq_values=_addr(lb["w_q.values"]), wq_col_idx=_addr(lb["w_q.col"]), wq_row_ptr=_addr(lb["w_q.rowptr"]),
-        wk_values=_addr(lb["w_k.values"]), wk_col_idx=_addr(lb["w_k.col"]), wk_row_ptr=_addr(lb["w_k.rowptr"]),
-        wv_values=_addr(lb["w_v.values"]), wv_col_idx=_addr(lb["w_v.col"]), wv_row_ptr=_addr(lb["w_v.rowptr"]),
-        wo_values=_addr(lb["out_proj.values"]), wo_col_idx=_addr(lb["out_proj.col"]), wo_row_ptr=_addr(lb["out_proj.rowptr"]),
+        wq_bank=_addr(lb["w_q.bank"]), wq_counts=_addr(lb["w_q.counts"]),
+        wk_bank=_addr(lb["w_k.bank"]), wk_counts=_addr(lb["w_k.counts"]),
+        wv_bank=_addr(lb["w_v.bank"]), wv_counts=_addr(lb["w_v.counts"]),
+        wo_bank=_addr(lb["out_proj.bank"]), wo_counts=_addr(lb["out_proj.counts"]),
         w1_values=_addr(lb["linear_1.values"]), w1_col_idx=_addr(lb["linear_1.col"]), w1_row_ptr=_addr(lb["linear_1.rowptr"]),
         w2_values=_addr(lb["linear_2.values"]), w2_col_idx=_addr(lb["linear_2.col"]), w2_row_ptr=_addr(lb["linear_2.rowptr"]),
         scales=_addr(lb["scales"]),

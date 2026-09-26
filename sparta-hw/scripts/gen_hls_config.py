@@ -92,6 +92,11 @@ def generate_hls_config(config, output_path):
         p(config_inc_dir / "rmsnorm_cfg.h"),
         p(helpers_inc_dir / "rmsnorm_rsqrt.h"),
     ]
+    # The tiled SpMM engine is shared by the layer's projections, so it is its own module.
+    spmm_files = [
+        p(layers_src_dir / "spmm_tiled.cpp"),
+        p(layers_inc_dir / "spmm_tiled.h"),
+    ]
     mha_files = [
         p(layers_src_dir / "mha.cpp"),
         p(layers_inc_dir / "mha.h"),
@@ -126,6 +131,7 @@ def generate_hls_config(config, output_path):
             p(top_inc_dir / "encoder_mlp_block.h"),
             p(config_inc_dir / "encoder_mlp_block_cfg.h"),
             *residual_files,
+            *spmm_files,
             *mha_files,
             *mlp_files,
             *rmsnorm_files,

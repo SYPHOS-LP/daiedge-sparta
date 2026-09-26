@@ -66,8 +66,20 @@ defines:
   # whole block.  The +MHA_TILE_PACK is because the burst starts at the word CONTAINING the cell's
   # first entry, so up to MHA_TILE_PACK-1 entries of the previous cell sit in front of it.
   - { name: MHA_ROW_BLOCKS,     value: "(MHA_FEATURE_W_MAX / MHA_FEATURE_HEAD)", comment: "row blocks per weight (12; a block = one head's rows)" }
-  - { name: MHA_TILE_NNZ_MAX,   value: 1024, comment: "per-bank capacity for one row block; measured worst cell = 977 + up to 3 lead-in entries" }
-  - { name: MHA_TILE_BANK_WORDS, value: "(MHA_TILE_NNZ_MAX / MHA_TILE_PACK)", comment: "bank depth in packed words (256)" }
+  # The engine is shared with the MLP, whose W2 has 256-wide column blocks and denser cells, so the
+  # bank is sized for the largest user: measured worst cell 2196 (W2) against 977 (MHA w_q).
+  - { name: MHA_TILE_NNZ_MAX,   value: 2560, comment: "per-bank capacity for one row block; worst cell 2196 (MLP W2) + up to 3 lead-in entries" }
+  - { name: MHA_TILE_BANK_WORDS, value: "(MHA_TILE_NNZ_MAX / MHA_TILE_PACK)", comment: "bank depth in packed words (640, one URAM)" }
+
+  # --- activation tile regions -----------------------------------------------------------
+  # One tile array serves both halves of the layer, in two regions: words [0, MHA_TILE_WORDS) hold
+  # the 64 features of an MHA / W1 column block, words [MHA_H_TILE_BASE, ...) hold the 256 hidden
+  # features of an MLP W2 column block.  Keeping H in the same memories lets the MLP's second stage
+  # read it in place, with no copy between the stages.
+  - { name: MHA_H_TILE_FEATURES, value: 256, comment: "hidden features per W2 column block (d_h / MHA_TILES)" }
+  - { name: MHA_H_TILE_WORDS,    value: "(MHA_H_TILE_FEATURES * MHA_BANK_ROW_WORDS)", comment: "packed words of one H tile (256*7=1792)" }
+  - { name: MHA_H_TILE_BASE,     value: "MHA_TILE_WORDS", comment: "first word of the H region inside a tile" }
+  - { name: MHA_TILE_WORDS_MAX,  value: "(MHA_TILE_WORDS + MHA_H_TILE_WORDS)", comment: "tile depth covering both regions (2240, one URAM)" }
 
   # --- per-head attention working state ------------------------------------------
   - { name: MHA_SCR_A_CNT,      value: "(MHA_FEATURE_HEAD * MHA_FEATURE_HEAD)", comment: "per-head A = K'V^T (int32)" }
@@ -87,7 +99,7 @@ types:
   - { name: T_MhaHeadIndex, kind: ap_uint, width: 8,         comment: "Q'/K' CSR col idx: K'=token(0..196), Q'=BAND-LOCAL feature(0..63) after head-major emit -> both fit 8 bits" }
   - { name: T_MhaBankWord, kind: ap_uint, width_expr: "MHA_BANK_WORD_BITS", comment: "packed bank URAM word: MHA_BANK_PACK int8 activations (64-bit)" }
   - { name: T_MhaTileWord, kind: ap_uint, width_expr: "(MHA_TILE_PACK * MHA_TILE_ENTRY_BITS)", comment: "packed weight-bank word: MHA_TILE_PACK entries of {col, val} (64-bit)" }
-  - { name: T_MhaTileCol,  kind: ap_uint, width: 6,  comment: "block-local column index (0..MHA_TILE_FEATURES-1)" }
+  - { name: T_MhaTileCol,  kind: ap_uint, width: 8,  comment: "block-local column: 0..63 for the MHA and W1, 0..255 for the MLP's W2 blocks" }
   - { name: T_MhaTileCount, kind: ap_uint, width: 8, comment: "nonzeros of one output row inside one block (measured max 62)" }
   - { name: T_MhaAcc,   kind: ap_int,   width: 32,           comment: "MAC / scatter accumulator (int8xint8 summed)" }
   - { name: T_MhaRecip, kind: ap_ufixed, total: 32, int: 1,  comment: "1/(d+eps) reciprocal LUT output; d is large so recip ~1e-6, needs many frac bits" }
