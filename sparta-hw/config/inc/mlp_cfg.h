@@ -40,6 +40,7 @@
 #define MLP_BANK_ROW_WORDS (MLP_BANK_PAD_TOK / MLP_BANK_PACK)   // packed words per feature row (56/8=7)
 #define MLP_BANK_WORDS (MLP_FEATURE_W_MAX * MLP_BANK_ROW_WORDS)   // total packed words in the bank (768*7)
 #define MLP_BANK_CYCLIC (MLP_MAC_UNROLL / MLP_BANK_PACK)   // word-array cyclic factor = words per MAC-wide read (16/8=2)
+#define MLP_BANK_WORDS_ALLOC (MLP_BANK_WORDS + MLP_BANK_CYCLIC - 1)   // bank array size read by the SpMM: + the spare word(s) the last token tile reads past the final row (value unused)
 #define MLP_TC_HIDDEN_FEATURE 3072   // hidden rows (H_ROW_LOOP)
 #define MLP_TC_FEATURE_OUT 768   // output rows (Y_ROW_LOOP) = d_out
 #define MLP_TC_BATCH 50   // samples / dense row width

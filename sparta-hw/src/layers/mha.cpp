@@ -27,18 +27,17 @@ static_assert(MHA_MAX_W_NNZ <= MHA_FEATURE_W_MAX, "MHA_MAX_W_NNZ should not exce
 static_assert(MHA_FEATURE_W_MAX == MHA_N_HEADS * MHA_FEATURE_HEAD, "MHA_FEATURE_W_MAX != N_HEADS * D_HEAD");
 static_assert(MHA_FEATURE_HEAD == 64,                  "code assumes d_head == 64");
 
-// Scratch buffer sizes must match the model dimensions.
-static_assert(MHA_SCR_QP_VAL_CNT == MHA_MAX_QK_NNZ,   "Qp val cnt != MHA_MAX_QK_NNZ");
-static_assert(MHA_SCR_KP_VAL_CNT == MHA_MAX_QK_NNZ,   "Kp val cnt != MHA_MAX_QK_NNZ");
-static_assert(MHA_SCR_V_CNT      == MHA_FEATURE_W_MAX * MHA_TOKEN_W_MAX,   "V cnt != D*N");
+// Per-head buffer sizes must match the head dimensions.
+static_assert(MHA_HEAD_NNZ_MAX   == MHA_FEATURE_HEAD * MHA_TOKEN_W_MAX, "head CSR capacity != 64*N");
+static_assert(MHA_SCR_V_HEAD_CNT == MHA_FEATURE_HEAD * MHA_TOKEN_W_MAX, "V head count != 64*N");
 static_assert(MHA_SCR_A_CNT      == MHA_FEATURE_HEAD * MHA_FEATURE_HEAD, "A cnt != d_head^2");
 
 // parallel_out_rows_compute manually unrolls the 8 packed lanes of a bank word.
 static_assert(MHA_BANK_PACK == 8, "code assumes MHA_BANK_PACK == 8");
 
-// Per-projection output-row parallelism.
-#define MHA_PROJ_P     4
-#define MHA_PROJ_P_QK  4
+// Output rows the tiled engine advances per step (parallelism now comes from the blocks).
+#define MHA_PROJ_P     MHA_ROWS_PER_STEP
+#define MHA_PROJ_P_QK  MHA_ROWS_PER_STEP
 
 // Wide DDR read words for better bursts on the AXI ports.
  #define MHA_WIDE_BITS   256
@@ -46,110 +45,248 @@ static_assert(MHA_BANK_PACK == 8, "code assumes MHA_BANK_PACK == 8");
 #define MHA_COL_LANES   (MHA_WIDE_BITS / 16)   /* 16 uint16 columns per beat */
 typedef ap_uint<MHA_WIDE_BITS> T_MhaWideWord;
 
-/* Global weight buffers shared between all projections, burst loaded from DDR. */
-static T_MhaWVal g_weight_val_buffer[MHA_MAX_W_TOTAL_NNZ];
-static T_MhaWCol g_weight_col_buffer[MHA_MAX_W_TOTAL_NNZ];
-static int       g_weight_rptr_buffer[MHA_FEATURE_W_MAX + 1];
+/* ---------------------------------------------------------------------------------------
+ * Tiled SpMM state.
+ *
+ * The feature axis is cut into MHA_TILES column blocks.  Block t owns ONE activation tile
+ * (its own memory, MHA_TILE_FEATURES rows of packed tokens) and ONE weight bank (its own
+ * memory, holding every nonzero whose column falls in that block, rows ascending).  The
+ * MHA_TILES lanes therefore each read one nonzero and one activation word per cycle without
+ * any copy of the activation: the four replicas this replaces cost 4x the whole D x N bank.
+ *
+ * compile_model.py --mha-tiles emits the weights to match: values and block-local columns in
+ * block order (each block padded to a whole MHA_TILE_PACK word) plus, in the row-pointer slot,
+ * the per-(block, row) nonzero counts that let each lane walk row by row.
+ * ------------------------------------------------------------------------------------ */
+static T_MhaBankWord  g_act_tile[MHA_TILES][MHA_TILE_WORDS];
+static T_MhaTileWord  g_bank[MHA_TILES][MHA_TILE_BANK_WORDS];
+static T_MhaTileCount g_bank_count[MHA_TILES][MHA_FEATURE_HEAD];
 
-/* Global buffer for input activation replicas used by the projections. */
-static T_MhaBankWord g_activation_replicas[MHA_PROJ_P_QK][MHA_BANK_WORDS];
+/* Engine state kept at file scope on purpose: with no caller-specific pointer arguments every
+ * call to tiled_rows_compute() has identical bindings, which is what lets HLS build ONE engine
+ * instead of specialising one per call site. */
+static int      g_bank_cursor[MHA_TILES];
+static T_MhaAcc g_proj_rows[MHA_ROWS_PER_STEP][MHA_TOKEN_W_MAX];
+
+/* DDR position of the next row block, per weight matrix (0 = W_K, 1 = W_Q, 2 = W_V, 3 = W_O) and
+ * column block.  g_block_word0 is the column block's first packed word in DDR, g_slice_entry the
+ * entry index within the block where the next row block starts, g_slice_cursor0 that entry's lane
+ * within its packed word.  Reads start at the word boundary below the first entry (up to
+ * MHA_TILE_PACK-1 unused entries precede the slice in the bank) so that no data realignment is
+ * needed.  The weight matrices are interleaved across stages, so each keeps its own position. */
+#define MHA_N_WEIGHTS 4
+static int g_block_word0[MHA_N_WEIGHTS][MHA_TILES];
+static int g_slice_entry[MHA_N_WEIGHTS][MHA_TILES];
+static int g_slice_cursor0[MHA_TILES];
+
+/* Wide DDR views used to fill one packed bank word per read. */
+typedef ap_uint<MHA_TILE_PACK * 8>  T_MhaBankValWord;   /* MHA_TILE_PACK POT bytes   */
+typedef ap_uint<MHA_TILE_PACK * 16> T_MhaBankColWord;   /* MHA_TILE_PACK uint16 cols */
 
 /**
- * @brief Burst load projection weights from DDR into the shared on-chip buffers.
- * 
- * This component also typecasts to the appropriate bitlength, for better 
- * resource efficiency.
+ * @brief Linear (softmax-free) attention for one head's feature band.
  *
- * @param[in] w_val       Weight values in DDR.
- * @param[in] w_col       Weight column indices in DDR.
- * @param[in] w_ptr       Weight row pointers in DDR.
- * @param[in] feature_dim Feature dimension.
+ * Computes O = Q'.(K'^T V) / (Q'. sum K'), reassociated so the intermediate is a small
+ * d_head x d_head matrix (no N x N score matrix, no softmax):
+ *   pass 1 builds key_value_matrix = K'^T V and key_sums = sum K' (walk K' features);
+ *   pass 2 builds numerator Q'.key_value_matrix and denominator Q'.key_sums per token,
+ *   then divides (one reciprocal per token);
+ *   pass 3 packs the head's output into the packed URAM the O projection reads.
+ * Heads run serially, so the working buffers are one reused set.
+ *
+ * @param[in]  head          Head index.
+ * @param[in]  tokens_dim    Number of tokens.
+ * @param[in]  quant_scale   Folded scale used for quantizing the output.
+ * @param[in]  k_val_buf     On-chip K' value slice buffer.
+ * @param[in]  k_col_buf     On-chip K' column slice buffer.
+ * @param[in]  k_ptr         K' row pointers (absolute; rebased by k_slice_base).
+ * @param[in]  k_slice_base  Absolute nnz offset of this head's K' slice.
+ * @param[in]  q_val_buf     On-chip Q' value slice buffer.
+ * @param[in]  q_col_buf     On-chip Q' column slice buffer.
+ * @param[in]  q_ptr         Q' head-major row pointers (absolute; rebased by q_slice_base).
+ * @param[in]  q_slice_base  Absolute nnz offset of this head's Q' slice.
+ * @param[in]  v_dense       Dense V.
+ * @param[out] out_packed    Packed output.
  */
-static void load_weight_from_ddr (T_Activation* w_val, T_MhaIndex* w_col, int* w_ptr, int feature_dim) {
-    LOAD_ROW_POINTER:
-    for (int i = 0; i <= feature_dim; i++) {
-        #pragma HLS LOOP_TRIPCOUNT min=(MHA_TC_FEATURE+1) max=(MHA_TC_FEATURE+1)
-        #pragma HLS PIPELINE II=1
-        g_weight_rptr_buffer[i] = w_ptr[i];
+
+/**
+ * @brief Unpack one weight entry from a bank word: {block-local column, POT value}.
+ */
+static inline void bank_entry(T_MhaTileWord word, int lane, T_MhaWVal &val, T_MhaTileCol &col) {
+#pragma HLS INLINE
+    const int lo = lane * MHA_TILE_ENTRY_BITS;
+    val = (T_MhaWVal)   word.range(lo + 3, lo);
+    col = (T_MhaTileCol) word.range(lo + 9, lo + 4);
+}
+
+/**
+ * @brief Compute the first DDR word of every column block of one weight matrix.
+ *
+ * Called once per weight matrix.  Each column block is padded to a whole packed word, so block t
+ * starts after the padded lengths of blocks 0..t-1, which requires the counts of all their rows.
+ *
+ * @param[in] w_counts    Nonzeros per (column block, row), block-major: w_counts[t * rows + r].
+ * @param[in] feature_dim Output rows of the projection.
+ * @param[in] which       Weight matrix index (0..MHA_N_WEIGHTS-1).
+ */
+static void load_weight_bases (int* w_counts, int feature_dim, int which) {
+#pragma HLS INLINE off
+    int next_word = 0;
+    BASE_TILE:
+    for (int t = 0; t < MHA_TILES; t++) {
+        #pragma HLS LOOP_TRIPCOUNT min=MHA_TILES max=MHA_TILES
+        int len = 0;
+        BASE_ROW:
+        for (int r = 0; r < feature_dim; r++) {
+            #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_FEATURE max=MHA_TC_FEATURE
+            #pragma HLS PIPELINE II=1
+            len += w_counts[t * feature_dim + r];
+        }
+        g_block_word0[which][t] = next_word;
+        g_slice_entry[which][t] = 0;
+        next_word              += (len + MHA_TILE_PACK - 1) / MHA_TILE_PACK;
     }
-    // total_nz == w_ptr[feature_dim], already loaded above as the loop's last
-    // iteration -- read the on-chip copy instead of a second, isolated DDR access.
-    // A bare one-off scalar m_axi read outside any pipelined loop is a documented
-    // "fine in C-sim, hangs on real hardware" HLS pattern (see the KR260 bring-up
-    // changelog); ported from sparta-hw-armagedon-kr260-v3 (9df179a).
-    int total_nz = g_weight_rptr_buffer[feature_dim];
+}
 
-    /* Wide views of the same contiguous DDR CSR streams. */
-    T_MhaWideWord* w_val_wide = reinterpret_cast<T_MhaWideWord*>(w_val);
-    T_MhaWideWord* w_col_wide = reinterpret_cast<T_MhaWideWord*>(w_col);
-    const int n_val_words = (total_nz + MHA_VAL_LANES - 1) / MHA_VAL_LANES;
-    const int n_col_words = (total_nz + MHA_COL_LANES - 1) / MHA_COL_LANES;
+/**
+ * @brief Read the entries of output rows [row_base, row_base + rows) into the per-column-block banks.
+ *
+ * Within a column block the entries are ordered by row, so the rows of one row block are
+ * contiguous and one burst per column block is sufficient: 977 entries worst case against 9704
+ * for a whole column block.  Two passes at one read per cycle: values, then column indices merged
+ * into the same packed word, so the second pass reads back the word it updates.
+ *
+ * @param[in] w_val       Weight values in DDR (POT bytes, block order).
+ * @param[in] w_col        Block-local column indices in DDR (block order).
+ * @param[in] w_counts     Nonzeros per (column block, row), block-major.
+ * @param[in] feature_dim  Output rows of the weight matrix (row stride of w_counts).
+ * @param[in] which        Weight matrix index (0..MHA_N_WEIGHTS-1).
+ * @param[in] row_base     First output row of this stage.
+ * @param[in] rows         Output rows in this stage.
+ */
+static void load_weight_slice (T_Activation* w_val, T_MhaIndex* w_col, int* w_counts,
+                               int feature_dim, int which, int row_base, int rows) {
+#pragma HLS INLINE off
+    /* A bank is 64-bit words, MHA_TILE_BANK_WORDS deep: one URAM each (72 b x 4096), where BRAM
+     * would need ~12 BRAM18 per bank for the same data (18 b per port, 1024 deep). */
+    #pragma HLS BIND_STORAGE variable=g_bank type=ram_t2p impl=uram
+    #pragma HLS ARRAY_PARTITION variable=g_bank_count complete dim=1
+    int slice_words[MHA_TILES], slice_word0[MHA_TILES];
+    #pragma HLS ARRAY_PARTITION variable=slice_words complete dim=1
+    #pragma HLS ARRAY_PARTITION variable=slice_word0 complete dim=1
 
-    /* Values: 64 int8 lanes per 512-bit beat. */
-    LOAD_VALUES_WIDE:
-    for (int wq = 0; wq < n_val_words; wq++) {
-        #pragma HLS LOOP_TRIPCOUNT min=(MHA_TC_FEATURE*MHA_TC_W_NNZ/MHA_VAL_LANES+1) max=(MHA_TC_FEATURE*MHA_TC_W_NNZ/MHA_VAL_LANES+1)
-        #pragma HLS PIPELINE II=1
-        T_MhaWideWord word = w_val_wide[wq];
-        UNPACK_VAL_LANES:
-        for (int lane = 0; lane < MHA_VAL_LANES; lane++) {
-            #pragma HLS UNROLL
-            int idx = wq * MHA_VAL_LANES + lane;
-            if (idx < total_nz) {
-                ap_uint<8> b = (ap_uint<8>) word.range(lane * 8 + 7, lane * 8);
+    /* Nonzero counts of this row block, which the MAC loop uses to index the banks, and their sum
+     * per column block, which is the length of the DDR read.  One column block at a time: the
+     * counts of one block are contiguous in DDR, and reading all MHA_TILES of a row in the same
+     * cycle would need 12 concurrent reads on one AXI port. */
+    int slice_len[MHA_TILES];
+    #pragma HLS ARRAY_PARTITION variable=slice_len complete dim=1
+    SLICE_COUNT_TILE:
+    for (int t = 0; t < MHA_TILES; t++) {
+        #pragma HLS LOOP_TRIPCOUNT min=MHA_TILES max=MHA_TILES
+        int len = 0;
+        SLICE_COUNT_ROW:
+        for (int r = 0; r < rows; r++) {
+            #pragma HLS LOOP_TRIPCOUNT min=MHA_FEATURE_HEAD max=MHA_FEATURE_HEAD
+            #pragma HLS PIPELINE II=1
+            const int n = w_counts[t * feature_dim + row_base + r];
+            g_bank_count[t][r] = (T_MhaTileCount) n;
+            len += n;
+        }
+        slice_len[t] = len;
+    }
+
+    SLICE_PLAN:
+    for (int t = 0; t < MHA_TILES; t++) {
+        #pragma HLS UNROLL
+        const int start = g_slice_entry[which][t];
+        const int lane  = start % MHA_TILE_PACK;   /* lane of the first entry in its word */
+#ifndef __SYNTHESIS__
+        assert(lane + slice_len[t] <= MHA_TILE_NNZ_MAX &&
+               "weight row block exceeds MHA_TILE_NNZ_MAX (raise the cap)");
+#endif
+        g_slice_cursor0[t]      = lane;
+        g_slice_entry[which][t] = start + slice_len[t];
+        slice_word0[t]          = g_block_word0[which][t] + start / MHA_TILE_PACK;
+        slice_words[t]     = (lane + slice_len[t] + MHA_TILE_PACK - 1) / MHA_TILE_PACK;
+    }
+
+    /* Values: one read holds exactly one bank word's worth of entries. */
+    T_MhaBankValWord* val_words = reinterpret_cast<T_MhaBankValWord*>(w_val);
+    BANK_VALUES_TILE:
+    for (int t = 0; t < MHA_TILES; t++) {
+        #pragma HLS LOOP_TRIPCOUNT min=MHA_TILES max=MHA_TILES
+        const int words = slice_words[t];
+        BANK_VALUES_WORD:
+        for (int w = 0; w < words; w++) {
+            #pragma HLS LOOP_TRIPCOUNT min=64 avg=104 max=MHA_TILE_BANK_WORDS
+            #pragma HLS PIPELINE II=1
+            T_MhaBankValWord raw = val_words[slice_word0[t] + w];
+            T_MhaTileWord    packed = 0;
+            BANK_VALUE_LANE:
+            for (int l = 0; l < MHA_TILE_PACK; l++) {
+                #pragma HLS UNROLL
+                const ap_uint<8> b  = (ap_uint<8>) raw.range(l * 8 + 7, l * 8);
+                const int        lo = l * MHA_TILE_ENTRY_BITS;
 #ifdef POT_SHIFT_MAC
-                /* POT weight: DDR byte is {sign(bit7), exponent(bits0..6)}; repack to
-                 * the on-chip {sign(bit3), exponent(bits0..2)} the shift-MAC reads. */
-                g_weight_val_buffer[idx] = (T_MhaWVal)((ap_uint<4>)((b[7] << 3) | (b & 0x7)));
+                /* POT weight: DDR byte is {sign(bit7), exponent(bits0..6)}; repack to the
+                 * on-chip {sign(bit3), exponent(bits0..2)} the shift-MAC reads. */
+                packed.range(lo + 3, lo) = (ap_uint<4>)((b[7] << 3) | (b & 0x7));
 #else
-                g_weight_val_buffer[idx] = (T_MhaWVal)(ap_int<8>) b;
+                packed.range(lo + 3, lo) = (ap_uint<4>) b;
 #endif
             }
+            g_bank[t][w] = packed;
         }
     }
 
-    /* Columns: 32 uint16 lanes per 512-bit beat. */
-    LOAD_COLUMNS_WIDE:
-    for (int wq = 0; wq < n_col_words; wq++) {
-        #pragma HLS LOOP_TRIPCOUNT min=(MHA_TC_FEATURE*MHA_TC_W_NNZ/MHA_COL_LANES+1) max=(MHA_TC_FEATURE*MHA_TC_W_NNZ/MHA_COL_LANES+1)
-        #pragma HLS PIPELINE II=1
-        T_MhaWideWord word = w_col_wide[wq];
-        UNPACK_COL_LANES:
-        for (int lane = 0; lane < MHA_COL_LANES; lane++) {
-            #pragma HLS UNROLL
-            int idx = wq * MHA_COL_LANES + lane;
-            if (idx < total_nz) {
-                ap_uint<16> c = (ap_uint<16>) word.range(lane * 16 + 15, lane * 16);
-                g_weight_col_buffer[idx] = (T_MhaWCol)(T_MhaIndex) c;
+    /* Columns: same word layout, merged into the values already stored. */
+    T_MhaBankColWord* col_words = reinterpret_cast<T_MhaBankColWord*>(w_col);
+    BANK_COLUMNS_TILE:
+    for (int t = 0; t < MHA_TILES; t++) {
+        #pragma HLS LOOP_TRIPCOUNT min=MHA_TILES max=MHA_TILES
+        const int words = slice_words[t];
+        BANK_COLUMNS_WORD:
+        for (int w = 0; w < words; w++) {
+            #pragma HLS LOOP_TRIPCOUNT min=64 avg=104 max=MHA_TILE_BANK_WORDS
+            #pragma HLS PIPELINE II=1
+            T_MhaBankColWord raw    = col_words[slice_word0[t] + w];
+            T_MhaTileWord    packed = g_bank[t][w];
+            BANK_COLUMN_LANE:
+            for (int l = 0; l < MHA_TILE_PACK; l++) {
+                #pragma HLS UNROLL
+                const int lo = l * MHA_TILE_ENTRY_BITS;
+                packed.range(lo + 9, lo + 4) = (ap_uint<6>) raw.range(l * 16 + 5, l * 16);
             }
+            g_bank[t][w] = packed;
         }
     }
 }
 
 /**
- * @brief Broadcast input activation into the first ACTIVE_P of the shared URAM replicas.
+ * @brief Split the packed activation into the per-block tiles the lanes read.
  *
- * @tparam P  Number of replicas created.
+ * Feature f lives in block f / MHA_TILE_FEATURES, and the bank is feature-major, so block t is
+ * simply the contiguous word range [t * MHA_TILE_WORDS, (t+1) * MHA_TILE_WORDS).  One copy is
+ * made, not one per lane.
  *
- * @param[in]  input           Input activations.
- * @param[out] input_replicas  The shared replica buffer.
+ * @param[in] packed_input  Packed activation bank (feature-major, MHA_BANK_PACK tokens/word).
  */
-template <int P>
-static void replicate_input_activations (T_MhaBankWord* input, T_MhaBankWord input_replicas[MHA_PROJ_P_QK][MHA_BANK_WORDS]) {
+static void load_activation_tiles (T_MhaBankWord* packed_input) {
 #pragma HLS INLINE off
-#pragma HLS ARRAY_PARTITION variable=input_replicas complete dim=1
-#pragma HLS ARRAY_PARTITION variable=input_replicas cyclic factor=MHA_BANK_CYCLIC dim=2
-#pragma HLS BIND_STORAGE    variable=input_replicas type=ram_t2p impl=uram
+#pragma HLS ARRAY_PARTITION variable=g_act_tile complete dim=1
+    /* One tile is 448 words x 64 b, which fits a single BRAM36; keep them out of URAM, which the
+     * weight banks need. */
+    #pragma HLS BIND_STORAGE variable=g_act_tile type=ram_t2p impl=bram
 
-    REPLICATE_INPUT:
-    for (int word_idx = 0; word_idx < MHA_BANK_WORDS; word_idx++) {
-        #pragma HLS LOOP_TRIPCOUNT min=MHA_BANK_WORDS max=MHA_BANK_WORDS
-        #pragma HLS PIPELINE II=1
-        T_MhaBankWord input_val = input[word_idx];
-
-        for (int rep_idx = 0; rep_idx < P; rep_idx++) {
-            #pragma HLS UNROLL
-            input_replicas[rep_idx][word_idx] = input_val;
+    ACTIVATION_TILE:
+    for (int t = 0; t < MHA_TILES; t++) {
+        #pragma HLS LOOP_TRIPCOUNT min=MHA_TILES max=MHA_TILES
+        ACTIVATION_TILE_WORD:
+        for (int w = 0; w < MHA_TILE_WORDS; w++) {
+            #pragma HLS LOOP_TRIPCOUNT min=MHA_TILE_WORDS max=MHA_TILE_WORDS
+            #pragma HLS PIPELINE II=1
+            g_act_tile[t][w] = packed_input[t * MHA_TILE_WORDS + w];
         }
     }
 }
@@ -196,441 +333,175 @@ static inline void mac_pe (
 }
 
 /**
- * @brief Processing engine for P output rows in parallel, performing the Gustavson
- * algorithm for Sparse-Dense Matrix Multiplication, between the sparse weights and
- * the dense activation. Output buffer is properly partitioned to allow for P parallel
- * writes, while the input activation is replicated P times to allow for P parallel reads.
- * 
- * The input buffer resides in URAM and the 8-bit values it consists of are packed, so
- * that each URAM element holds 8 values for better utilization of the URAM.
+ * @brief One step of the tiled SpMM: MHA_ROWS_PER_STEP output rows across MHA_TILES lanes.
  *
- * @tparam P            number of output-row lanes computed concurrently
- * 
- * @param[in]  input        Input activations, packed in URAM
- * @param[in]  out_row_base Base output row, output will contain rows [out_row_base, out_row_base+P]
- * @param[in]  tokens_dim   Number of tokens
- * @param[in]  weight_val   Weight values (CSR data format)
- * @param[in]  weight_col   Weight columns (CSR data format)
- * @param[in]  weight_ptr   Weight row pointers (CSR data format)
- * @param[out] out_rows     Output rows
+ * Lane t reads only block t's weight bank and only block t's activation tile, so the lanes
+ * never contend for a memory and no copy of the activation is needed.  Each lane accumulates
+ * into its own partial row; the partials are summed once at the end of the step.  The lanes
+ * advance together, so a step costs the busiest lane -- grouping several output rows lets a
+ * light row in one block offset a heavy one in another.
+ *
+ * @param[in]     row_base     First output row of this step.
+ * @param[in]     rows_in_step Output rows in this step (<= MHA_ROWS_PER_STEP).
+ * @param[in]     tokens_dim   Number of tokens.
+ *
+ * Reads g_bank / g_act_tile / g_bank_count, advances g_bank_cursor and writes g_proj_rows.
  */
-template <int P>
-static void parallel_out_rows_compute (
-    T_MhaBankWord input[MHA_PROJ_P_QK][MHA_BANK_WORDS],
-    int           out_row_base,
-    int           tokens_dim,
-    T_MhaWVal    *weight_val,
-    T_MhaWCol    *weight_col,
-    int          *weight_ptr,
-    T_MhaAcc      out_rows[P][MHA_TOKEN_W_MAX]
+static void tiled_rows_compute (
+    int row_local,
+    int rows_in_step,
+    int tokens_dim
 ) {
 #pragma HLS INLINE off
-#pragma HLS ARRAY_PARTITION variable=input    cyclic factor=MHA_BANK_CYCLIC dim=2
-#pragma HLS ARRAY_PARTITION variable=input    complete dim=1
-#pragma HLS ARRAY_PARTITION variable=out_rows cyclic factor=MHA_MAC_UNROLL dim=2
-#pragma HLS ARRAY_PARTITION variable=out_rows complete dim=1
-    
-    /* Clear all accumulators to be used. */
-    ACC_CLEAR:
-    for (int i = 0; i <  tokens_dim; i++) {
-        #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_TOKEN max=MHA_TC_TOKEN
+#pragma HLS ARRAY_PARTITION variable=g_act_tile   complete dim=1
+#pragma HLS ARRAY_PARTITION variable=g_bank       complete dim=1
+#pragma HLS ARRAY_PARTITION variable=g_bank_count complete dim=1
+#pragma HLS ARRAY_PARTITION variable=g_bank_cursor complete dim=1
+#pragma HLS ARRAY_PARTITION variable=g_proj_rows   complete dim=1
+#pragma HLS ARRAY_PARTITION variable=g_proj_rows   cyclic factor=MHA_BANK_PACK dim=2
+
+    /* One partial row per lane: lane t only ever touches partial[t], so the lanes' updates
+     * are independent. */
+    static T_MhaAcc partial[MHA_TILES][MHA_ROWS_PER_STEP][MHA_TOKEN_W_MAX];
+    #pragma HLS ARRAY_PARTITION variable=partial complete dim=1
+    #pragma HLS ARRAY_PARTITION variable=partial complete dim=2
+    #pragma HLS ARRAY_PARTITION variable=partial cyclic factor=MHA_BANK_PACK dim=3
+
+    const int row_words = (tokens_dim + MHA_BANK_PACK - 1) / MHA_BANK_PACK;
+
+    CLEAR_PARTIAL_WORD:
+    for (int w = 0; w < row_words; w++) {
+        #pragma HLS LOOP_TRIPCOUNT min=MHA_BANK_ROW_WORDS max=MHA_BANK_ROW_WORDS
         #pragma HLS PIPELINE II=1
-        #pragma HLS UNROLL factor=MHA_MAC_UNROLL
-        for (int lane = 0; lane < P; lane++) {
+        for (int t = 0; t < MHA_TILES; t++) {
             #pragma HLS UNROLL
-            out_rows[lane][i] = (T_MhaAcc) 0;
+            for (int r = 0; r < MHA_ROWS_PER_STEP; r++) {
+                #pragma HLS UNROLL
+                for (int p = 0; p < MHA_BANK_PACK; p++) {
+                    #pragma HLS UNROLL
+                    const int token = w * MHA_BANK_PACK + p;
+                    if (token < tokens_dim) {
+                        partial[t][r][token] = (T_MhaAcc) 0;
+                    }
+                }
+            }
         }
     }
 
-    /* Since the parallel lanes iterate simultaneously,
-     * we measure the largest non-zero span across all
-     * the parallel lanes.
-     */
-    int max_nz_span = 0;
-    int nz_begin[P];
-    int nz_end[P];
-    #pragma HLS ARRAY_PARTITION variable=nz_begin complete dim=1
-    #pragma HLS ARRAY_PARTITION variable=nz_end   complete dim=1
-    IDENTIFY_NZ_SPAN:
-    for (int lane = 0; lane < P; lane++) {
+    /* Per-lane walk: how many nonzeros this step holds, and where each row starts within them
+     * (prefix[r] is compared against the walk index instead of re-reading the counts). */
+    int lane_len[MHA_TILES];
+    int prefix[MHA_TILES][MHA_ROWS_PER_STEP];
+    #pragma HLS ARRAY_PARTITION variable=lane_len complete dim=1
+    #pragma HLS ARRAY_PARTITION variable=prefix   complete dim=0
+    int max_len = 0;
+    LANE_INIT:
+    for (int t = 0; t < MHA_TILES; t++) {
         #pragma HLS UNROLL
-        nz_begin[lane] = weight_ptr[out_row_base + lane];
-        nz_end[lane]   = weight_ptr[out_row_base + lane + 1];
-
-        int nz_count = nz_end[lane] - nz_begin[lane];
-
-        if (nz_count > max_nz_span) {
-            max_nz_span = nz_count;
+        int len = 0;
+        for (int r = 0; r < MHA_ROWS_PER_STEP; r++) {
+            #pragma HLS UNROLL
+            prefix[t][r] = len;
+            if (r < rows_in_step) {
+                len += (int) g_bank_count[t][row_local + r];
+            }
+        }
+        lane_len[t] = len;
+        if (len > max_len) {
+            max_len = len;
         }
     }
 
-    /* All parallel rows are traversed simultaneously through their non-zero elements. */
-    NONZERO_ELEMENTS:
-    for (int nz = 0; nz < max_nz_span; nz++) {
-        #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_W_NNZ max=MHA_TC_W_NNZ
-        
-        /* Each iteration processes a number of token tiles equal to the unroll factor. */
-        TOKEN_TILES:
-        for (int token_idx = 0; token_idx < tokens_dim; token_idx += MHA_MAC_UNROLL) {
-            #pragma HLS LOOP_TRIPCOUNT min=(MHA_TC_TOKEN/MHA_MAC_UNROLL+1) max=(MHA_TC_TOKEN/MHA_MAC_UNROLL+1)
+    /* Walk the step's nonzeros; every lane covers one nonzero's worth of tokens per pass. */
+    MAC_ENTRY:
+    for (int k = 0; k < max_len; k++) {
+        #pragma HLS LOOP_TRIPCOUNT min=(MHA_TC_W_NNZ*MHA_ROWS_PER_STEP/MHA_TILES) max=(MHA_TC_W_NNZ*MHA_ROWS_PER_STEP/MHA_TILES)
+        MAC_WORD:
+        for (int w = 0; w < row_words; w++) {
+            #pragma HLS LOOP_TRIPCOUNT min=MHA_BANK_ROW_WORDS max=MHA_BANK_ROW_WORDS
             #pragma HLS PIPELINE II=1
-            PARALLEL_OUTPUT_ROWS:
-            for (int lane = 0; lane < P; lane++) {
+            MAC_LANE:
+            for (int t = 0; t < MHA_TILES; t++) {
                 #pragma HLS UNROLL
-                int nz_idx = nz_begin[lane] + nz;
+                if (k < lane_len[t]) {
+                    const int    entry = g_bank_cursor[t] + k;
+                    T_MhaWVal    val;
+                    T_MhaTileCol col;
+                    bank_entry(g_bank[t][entry / MHA_TILE_PACK], entry % MHA_TILE_PACK, val, col);
 
-                /* If no more nonzeros in this lane, skip computations. */
-                if (nz_idx < nz_end[lane]) {
-                    /* Identify the feature row being processed and compute the base tile word index */
-                    int feature_row_base = (int) weight_col[nz_idx] * MHA_BANK_ROW_WORDS;
-                    int tile_word_base   = feature_row_base + (token_idx / 8);
-
-                    /* Handle as many parallel words as possible based on cyclic factor of the input bank */
-                    PARALLEL_WORDS:
-                    for (int offset = 0; offset < MHA_BANK_CYCLIC; offset++) {
+                    /* Which of the step's rows this nonzero belongs to. */
+                    int row_sel = 0;
+                    for (int r = 1; r < MHA_ROWS_PER_STEP; r++) {
                         #pragma HLS UNROLL
-                        /* Read from dedicated bank within input replica. */
-                        T_MhaBankWord input_packed = input[lane][tile_word_base + offset];
-                        int           token_idx_0  = token_idx + offset * 8;
-                        mac_pe(input_packed, weight_val[nz_idx], token_idx_0 + 0, 0, tokens_dim, out_rows[lane]);
-                        mac_pe(input_packed, weight_val[nz_idx], token_idx_0 + 1, 1, tokens_dim, out_rows[lane]);
-                        mac_pe(input_packed, weight_val[nz_idx], token_idx_0 + 2, 2, tokens_dim, out_rows[lane]);
-                        mac_pe(input_packed, weight_val[nz_idx], token_idx_0 + 3, 3, tokens_dim, out_rows[lane]);
-                        mac_pe(input_packed, weight_val[nz_idx], token_idx_0 + 4, 4, tokens_dim, out_rows[lane]);
-                        mac_pe(input_packed, weight_val[nz_idx], token_idx_0 + 5, 5, tokens_dim, out_rows[lane]);
-                        mac_pe(input_packed, weight_val[nz_idx], token_idx_0 + 6, 6, tokens_dim, out_rows[lane]);
-                        mac_pe(input_packed, weight_val[nz_idx], token_idx_0 + 7, 7, tokens_dim, out_rows[lane]);
+                        if (k >= prefix[t][r]) {
+                            row_sel = r;
+                        }
                     }
+
+                    const T_MhaBankWord act = g_act_tile[t][(int) col * MHA_BANK_ROW_WORDS + w];
+                    const int           tok = w * MHA_BANK_PACK;
+                    mac_pe(act, val, tok + 0, 0, tokens_dim, partial[t][row_sel]);
+                    mac_pe(act, val, tok + 1, 1, tokens_dim, partial[t][row_sel]);
+                    mac_pe(act, val, tok + 2, 2, tokens_dim, partial[t][row_sel]);
+                    mac_pe(act, val, tok + 3, 3, tokens_dim, partial[t][row_sel]);
+                    mac_pe(act, val, tok + 4, 4, tokens_dim, partial[t][row_sel]);
+                    mac_pe(act, val, tok + 5, 5, tokens_dim, partial[t][row_sel]);
+                    mac_pe(act, val, tok + 6, 6, tokens_dim, partial[t][row_sel]);
+                    mac_pe(act, val, tok + 7, 7, tokens_dim, partial[t][row_sel]);
                 }
             }
         }
     }
-}
 
-/**
- * @brief Dense projection
- *
- * @param[in]  w_val       Weight values in DDR.
- * @param[in]  w_col       Weight column indices in DDR.
- * @param[in]  w_ptr       Weight row pointers in DDR.
- * @param[in]  feature_dim Number of features.
- * @param[in]  tokens_dim  Number of tokens.
- * @param[in]  quant_scale Folded scale used for quantizing the output.
- * @param[out] out_dense   Dense output array.
- */
-static void proj_dense (
-    T_Activation *w_val,
-    T_MhaIndex   *w_col,
-    int          *w_ptr,
-    int           feature_dim,
-    int           tokens_dim,
-    T_Scale       quant_scale,
-    T_Activation *out_dense
-) {
-    load_weight_from_ddr(w_val, w_col, w_ptr, feature_dim);
-
-    T_MhaAcc rows[MHA_PROJ_P][MHA_TOKEN_W_MAX];
-    #pragma HLS ARRAY_PARTITION variable=rows cyclic factor=MHA_MAC_UNROLL dim=2
-    #pragma HLS ARRAY_PARTITION variable=rows complete dim=1
-
-    /* On-chip staging for the projection result.  Compute fills this,
-     * then a separate write-back loop streams it to out_dense as one contiguous
-     * burst.
-     */
-    static T_Activation out_stage[MHA_SCR_V_CNT];   // D*N int8 (== v_dense size)
-    #pragma HLS BIND_STORAGE variable=out_stage type=ram_t2p impl=bram
-
-    DENSE_PROJECTION_PER_ROW:
-    for (int i = 0; i < feature_dim; i += MHA_PROJ_P) {
-        #pragma HLS LOOP_TRIPCOUNT min=(MHA_TC_FEATURE/MHA_PROJ_P) max=(MHA_TC_FEATURE/MHA_PROJ_P)
-
-        parallel_out_rows_compute<MHA_PROJ_P>(g_activation_replicas,
-                                              i,
-                                              tokens_dim,
-                                              g_weight_val_buffer,
-                                              g_weight_col_buffer,
-                                              g_weight_rptr_buffer,
-                                              rows);
-        /* Quantize into on-chip staging. */
-        DENSE_PROJECTION_STAGE:
-        for (int j = 0; j <  tokens_dim; j++) {
-            #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_TOKEN max=MHA_TC_TOKEN
+    /* Sum the lanes into the output rows, MHA_BANK_PACK tokens per cycle. */
+    MERGE_ROW:
+    for (int r = 0; r < rows_in_step; r++) {
+        #pragma HLS LOOP_TRIPCOUNT min=MHA_ROWS_PER_STEP max=MHA_ROWS_PER_STEP
+        MERGE_WORD:
+        for (int w = 0; w < row_words; w++) {
+            #pragma HLS LOOP_TRIPCOUNT min=MHA_BANK_ROW_WORDS max=MHA_BANK_ROW_WORDS
             #pragma HLS PIPELINE II=1
-            for (int l = 0; l < MHA_PROJ_P; l++) {
+            for (int p = 0; p < MHA_BANK_PACK; p++) {
                 #pragma HLS UNROLL
-                out_stage[(i + l) * tokens_dim + j] = requant_to_int8(rows[l][j], quant_scale);
-            }
-        }
-    }
-
-    /* Standalone contiguous write-back. */
-    DENSE_PROJECTION_WRITEBACK:
-    for (int e = 0; e < feature_dim * tokens_dim; e++) {
-        #pragma HLS LOOP_TRIPCOUNT min=(MHA_TC_FEATURE*MHA_TC_TOKEN) max=(MHA_TC_FEATURE*MHA_TC_TOKEN)
-        #pragma HLS PIPELINE II=1
-        out_dense[e] = out_stage[e];
-    }
-}
-
-/**
- * @brief Sparse projection (projection followed by ReLU).
- * 
- * Output activations are produced in feature-major order.
- *
- * @param[in]  w_val       Weight values in DDR.
- * @param[in]  w_col       Weight column indices in DDR.
- * @param[in]  w_ptr       Weight row pointers in DDR.
- * @param[in]  feature_dim Number of features.
- * @param[in]  tokens_dim  Number of tokens.
- * @param[in]  quant_scale Folded scale used for quantizing the output.
- * @param[out] out_val     Output activation values.
- * @param[out] out_col     Output activation column indices.
- * @param[out] out_ptr     Output activation row pointers.
- */
-static void proj_relu_featmajor (
-    T_Activation   *w_val, 
-    T_MhaIndex     *w_col,
-    int            *w_ptr,
-    int             feature_dim,
-    int             tokens_dim, 
-    T_Scale         quant_scale,
-    T_Activation   *out_val, 
-    T_MhaHeadIndex *out_col, 
-    int            *out_ptr
-) {
-    load_weight_from_ddr(w_val, w_col, w_ptr, feature_dim);   
-    
-    T_MhaAcc rows[MHA_PROJ_P_QK][MHA_TOKEN_W_MAX];
-    #pragma HLS ARRAY_PARTITION variable=rows cyclic factor=MHA_MAC_UNROLL dim=2
-    #pragma HLS ARRAY_PARTITION variable=rows complete dim=1
-    int nnz    = 0;
-    out_ptr[0] = 0;
-
-    SPARSE_PROJECTION_ROW:
-    for (int i = 0; i < feature_dim; i += MHA_PROJ_P_QK) {
-        #pragma HLS LOOP_TRIPCOUNT min=(MHA_TC_FEATURE/MHA_PROJ_P_QK) max=(MHA_TC_FEATURE/MHA_PROJ_P_QK)
-
-        parallel_out_rows_compute<MHA_PROJ_P_QK>(g_activation_replicas, 
-                                                 i, 
-                                                 tokens_dim, 
-                                                 g_weight_val_buffer, 
-                                                 g_weight_col_buffer, 
-                                                 g_weight_rptr_buffer, 
-                                                 rows);
-        PARALLEL_LANES:
-        for (int p = 0; p < MHA_PROJ_P_QK; p++) {
-            
-            RELU_QUANTIZE_SPARSIFY:
-            for (int j = 0; j <  tokens_dim; j++) {
-                #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_TOKEN max=MHA_TC_TOKEN
-                #pragma HLS PIPELINE II=1
-
-                if (rows[p][j] > (T_MhaAcc) 0) {
-                    T_Activation quant_out = requant_to_int8(rows[p][j], quant_scale);
-
-                    if (quant_out > (T_Activation) 0) {
-#ifndef __SYNTHESIS__
-                        assert(nnz < MHA_MAX_QK_NNZ && "K CSR overflow (raise MHA_MAX_QK_NNZ)");
-#endif
-                        out_val[nnz] = quant_out;
-                        out_col[nnz] = (T_MhaHeadIndex) j;
-                        nnz++;
+                const int token = w * MHA_BANK_PACK + p;
+                if (token < tokens_dim) {
+                    T_MhaAcc sum = (T_MhaAcc) 0;
+                    for (int t = 0; t < MHA_TILES; t++) {
+                        #pragma HLS UNROLL
+                        sum += partial[t][r][token];
                     }
+                    g_proj_rows[r][token] = sum;
                 }
             }
-
-            out_ptr[i + p + 1] = nnz;
-        }
-    }
-}
-
-/**
- * @brief Sparse Q projection (projection followed by ReLU), emitted HEAD-MAJOR.
- *
- * Output activations are bucketed by head: 12 head blocks, each a token-major CSR
- * (row_ptr of n+1 at out_ptr[h*(n+1)+..], columns are band-local features 0..63).
- * This lets each attention head read a CONTIGUOUS slice with no band filter.
- * A scratch buffer keeps the intermediate dense result, as we transpose before ReLU.
- *
- * @param[in]  w_val          Weight values in DDR.
- * @param[in]  w_col          Weight column indices in DDR.
- * @param[in]  w_ptr          Weight row pointers in DDR.
- * @param[in]  feature_dim    Number of features.
- * @param[in]  tokens_dim     Number of tokens.
- * @param[in]  quant_scale    Folded scale used for quantizing the output.
- * @param[in]  scratch_buffer Scratch buffer for intermediate transpose.
- * @param[out] out_val        Output activation values.
- * @param[out] out_col        Output activation column indices.
- * @param[out] out_ptr        Output activation row pointers.
- */
-static void proj_relu_headmajor (
-    T_Activation   *w_val, 
-    T_MhaIndex     *w_col,
-    int            *w_ptr,
-    int             feature_dim,
-    int             tokens_dim, 
-    T_Scale         quant_scale,
-    T_Activation   *scratch_buffer,
-    T_Activation   *out_val, 
-    T_MhaHeadIndex *out_col, 
-    int            *out_ptr
-) {
-    load_weight_from_ddr(w_val, w_col, w_ptr, feature_dim);
-
-    T_MhaAcc rows[MHA_PROJ_P_QK][MHA_TOKEN_W_MAX];
-    #pragma HLS ARRAY_PARTITION variable=rows cyclic factor=MHA_MAC_UNROLL dim=2
-    #pragma HLS ARRAY_PARTITION variable=rows complete dim=1
-    
-    DENSE_PROJECTION_ROW:
-    for (int i = 0; i < feature_dim; i += MHA_PROJ_P_QK) {
-        #pragma HLS LOOP_TRIPCOUNT min=(MHA_TC_FEATURE/MHA_PROJ_P_QK) max=(MHA_TC_FEATURE/MHA_PROJ_P_QK)
-        
-        parallel_out_rows_compute<MHA_PROJ_P_QK>(g_activation_replicas, 
-                                                 i, 
-                                                 tokens_dim, 
-                                                 g_weight_val_buffer, 
-                                                 g_weight_col_buffer, 
-                                                 g_weight_rptr_buffer, 
-                                                 rows);
-
-        QUANTIZE_AND_TRANSPOSE:
-        for (int j = 0; j <  tokens_dim; j++) {
-            #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_TOKEN max=MHA_TC_TOKEN
-            #pragma HLS PIPELINE II=1
-            /* Each (i+p, j) is a distinct scratch address across iterations (j varies, p
-             * distinct) -> no real inter-iteration dependency; assert it to hold II=1. */
-            #pragma HLS DEPENDENCE variable=scratch_buffer type=inter false
-
-            for (int p = 0; p < MHA_PROJ_P_QK; p++) {
-                #pragma HLS UNROLL
-                T_Activation quant_out = (rows[p][j] > (T_MhaAcc) 0) ? requant_to_int8(rows[p][j], quant_scale) : (T_Activation) 0;
-                scratch_buffer[(i + p) *  tokens_dim + j] = quant_out;
-            }
         }
     }
 
-    /* HEAD-MAJOR CSR emit: bucket Q' by head so each head reads a CONTIGUOUS slice
-     * (like K'), eliminating the per-head full scan + band filter.  Layout: 12 head
-     * blocks, each a token-major row_ptr of (n+1) entries at out_ptr[h*(n+1) + ...].
-     * Within a head block the column is the BAND-LOCAL feature (0..63).  Features are
-     * emitted ascending within each (head,token), matching the old within-band order. */
-    int nnz = 0;
-    const int n_heads = feature_dim / MHA_FEATURE_HEAD;
-    RELU_ON_SCRATCH_HEAD:
-    for (int h = 0; h < n_heads; h++) {
-        #pragma HLS LOOP_TRIPCOUNT min=MHA_N_HEADS max=MHA_N_HEADS
-        const int feature_base = h * MHA_FEATURE_HEAD;
-        const int ptr_base     = h * (tokens_dim + 1);
-        out_ptr[ptr_base] = nnz;
-
-        RELU_ON_SCRATCH_TOKEN:
-        for (int j = 0; j < tokens_dim; j++) {
-            #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_TOKEN max=MHA_TC_TOKEN
-
-            PER_BAND_FEATURE_LOOP:
-            for (int bf = 0; bf < MHA_FEATURE_HEAD; bf++) {
-                #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_FEATURE_HEAD max=MHA_TC_FEATURE_HEAD
-                #pragma HLS PIPELINE II=1
-
-                T_Activation out_data = scratch_buffer[(feature_base + bf) * tokens_dim + j];
-
-                if (out_data > (T_Activation) 0) {
-#ifndef __SYNTHESIS__
-                    assert(nnz < MHA_MAX_QK_NNZ && "Q' CSR overflow (raise MHA_MAX_QK_NNZ)");
-#endif
-                    out_val[nnz] = out_data;
-                    out_col[nnz] = (T_MhaHeadIndex) bf;   // band-local feature (0..63)
-                    nnz++;
-                }
-            }
-
-            out_ptr[ptr_base + j + 1] = nnz;
-        }
-    }
-}
-
-/**
- * @brief Linear (softmax-free) attention for one head's feature band.
- *
- * Computes O = Q'.(K'^T V) / (Q'. sum K'), reassociated so the intermediate is a small
- * d_head x d_head matrix (no N x N score matrix, no softmax):
- *   pass 1 builds key_value_matrix = K'^T V and key_sums = sum K' (walk K' features);
- *   pass 2 builds numerator Q'.key_value_matrix and denominator Q'.key_sums per token,
- *   then divides (one reciprocal per token);
- *   pass 3 packs the head's output into the packed URAM the O projection reads.
- * Heads run serially, so the working buffers are one reused set.
- *
- * @param[in]  head          Head index.
- * @param[in]  tokens_dim    Number of tokens.
- * @param[in]  quant_scale   Folded scale used for quantizing the output.
- * @param[in]  k_val_buf     On-chip K' value slice buffer.
- * @param[in]  k_col_buf     On-chip K' column slice buffer.
- * @param[in]  k_ptr         K' row pointers (absolute; rebased by k_slice_base).
- * @param[in]  k_slice_base  Absolute nnz offset of this head's K' slice.
- * @param[in]  q_val_buf     On-chip Q' value slice buffer.
- * @param[in]  q_col_buf     On-chip Q' column slice buffer.
- * @param[in]  q_ptr         Q' head-major row pointers (absolute; rebased by q_slice_base).
- * @param[in]  q_slice_base  Absolute nnz offset of this head's Q' slice.
- * @param[in]  v_dense       Dense V.
- * @param[out] out_packed    Packed output.
- */
-
-/**
- * @brief Burst one head's contiguous K'/Q' slice from DDR into on-chip buffers.
- *
- * K'/Q' are the sparse FIRST operand and are read as a per-head contiguous slice
- * (K' feature-major band [h*64,(h+1)*64); Q' head-major block h).  Streaming the
- * slice on-chip removes the DDR reads from the head compute loops.  The slice fits
- * the fully-dense bound (MHA_*_STREAM_NNZ = 64*197), so it never overflows.
- * Buffers are indexed slice-locally: absolute nnz index s maps to s - slice_base.
- *
- * @param[in]  k_val_ddr/k_col_ddr  DDR K' values / columns.
- * @param[in]  k_slice_base/k_slice_len  This head's K' slice [base, base+len) in DDR.
- * @param[in]  q_val_ddr/q_col_ddr  DDR Q' values / columns.
- * @param[in]  q_slice_base/q_slice_len  This head's Q' slice [base, base+len) in DDR.
- * @param[out] k_val_buf/k_col_buf/q_val_buf/q_col_buf  On-chip slice buffers.
- */
-static void load_head_slice (
-    T_Activation   *k_val_ddr, T_MhaHeadIndex *k_col_ddr, int k_slice_base, int k_slice_len,
-    T_Activation   *q_val_ddr, T_MhaHeadIndex *q_col_ddr, int q_slice_base, int q_slice_len,
-    T_Activation   *k_val_buf, T_MhaHeadIndex *k_col_buf,
-    T_Activation   *q_val_buf, T_MhaHeadIndex *q_col_buf
-) {
-#pragma HLS INLINE off
-    LOAD_K_SLICE:
-    for (int i = 0; i < k_slice_len; i++) {
-        #pragma HLS LOOP_TRIPCOUNT min=0 max=MHA_KP_STREAM_NNZ
-        #pragma HLS PIPELINE II=1
-        k_val_buf[i] = k_val_ddr[k_slice_base + i];
-        k_col_buf[i] = k_col_ddr[k_slice_base + i];
-    }
-    LOAD_Q_SLICE:
-    for (int i = 0; i < q_slice_len; i++) {
-        #pragma HLS LOOP_TRIPCOUNT min=0 max=MHA_QP_STREAM_NNZ
-        #pragma HLS PIPELINE II=1
-        q_val_buf[i] = q_val_ddr[q_slice_base + i];
-        q_col_buf[i] = q_col_ddr[q_slice_base + i];
+    CURSOR_ADVANCE:
+    for (int t = 0; t < MHA_TILES; t++) {
+        #pragma HLS UNROLL
+        g_bank_cursor[t] += lane_len[t];
     }
 }
 
 static void head_core (
+    int             enable,
     int             head,
     int             tokens_dim,
     T_Scale         quant_scale,
-    /* On-chip K'/Q' slice buffers (this head's slice), + the DDR row_ptr (span bounds)
-     * and the slice base offset to rebase absolute nnz indices to buffer-local. */
-    T_Activation   *k_val_buf,
-    T_MhaHeadIndex *k_col_buf,
+    /* This head's K' and Q' CSR and its dense V, all on-chip and indexed from 0. */
+    T_Activation   *k_val,
+    T_MhaHeadIndex *k_col,
     int            *k_ptr,
-    int             k_slice_base,
-    T_Activation   *q_val_buf,
-    T_MhaHeadIndex *q_col_buf,
+    T_Activation   *q_val,
+    T_MhaHeadIndex *q_col,
     int            *q_ptr,
-    int             q_slice_base,
-    T_Activation   *v_dense,
+    T_Activation   *v_head,
     T_MhaBankWord  *out_packed
 ) {
-    const int feature_base = head * MHA_FEATURE_HEAD;
+    if (!enable) {
+        return;
+    }
+    const int feature_base = head * MHA_FEATURE_HEAD;   /* only for the packed output offset */
 
     /* Per-head output scratch */
     static T_Activation head_output[MHA_FEATURE_HEAD][MHA_BANK_PAD_TOK];
@@ -660,16 +531,14 @@ static void head_core (
     KEY_VALUE_FEATURE:
     for (int feature = 0; feature < MHA_FEATURE_HEAD; feature++) {
         #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_FEATURE_HEAD max=MHA_TC_FEATURE_HEAD
-        int feature_row = feature_base + feature;
-        int nz_begin    = k_ptr[feature_row];
-        int nz_end      = k_ptr[feature_row + 1];
+        int nz_begin = k_ptr[feature];
+        int nz_end   = k_ptr[feature + 1];
 
         KEY_VALUE_NONZERO:
         for (int s = nz_begin; s < nz_end; s++) {
             #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_KP_NNZ max=MHA_TC_KP_NNZ
-            int          bi      = s - k_slice_base;   // slice-local buffer index
-            int          token   = (int) k_col_buf[bi];
-            T_Activation key_val = k_val_buf[bi];
+            int          token   = (int) k_col[s];
+            T_Activation key_val = k_val[s];
             
             key_sums[feature] += key_val;
 
@@ -681,7 +550,7 @@ static void head_core (
 
                 /* Multiply-Accumulate K value with MHA_FEATURE_HEAD features of selected token. */
                 key_value_matrix[feature * MHA_FEATURE_HEAD + out_feature] +=
-                    key_val * v_dense[(feature_base + out_feature) *  tokens_dim + token];
+                    key_val * v_head[out_feature * tokens_dim + token];
             }
         }
     }
@@ -698,18 +567,15 @@ static void head_core (
             numerator_row[out_feature] = (T_MhaAcc) 0;
         }
 
-        /* Q' is HEAD-MAJOR: this head's token-major row_ptr block starts at head*(n+1),
-         * and q_col holds the BAND-LOCAL feature (0..63) directly -- no scan/filter. */
+        /* Q' is token-major for this head and q_col holds the head-local feature (0..63). */
         T_MhaAcc denominator = (T_MhaAcc) 0;
-        const int q_ptr_base = head * (tokens_dim + 1);
-        int      nz_begin    = q_ptr[q_ptr_base + token];
-        int      nz_end      = q_ptr[q_ptr_base + token + 1];
+        int      nz_begin    = q_ptr[token];
+        int      nz_end      = q_ptr[token + 1];
         NUMERATOR_NONZERO:
         for (int s = nz_begin; s < nz_end; s++) {
             #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_QP_NNZ max=MHA_TC_QP_NNZ
-            int          bi           = s - q_slice_base;   // slice-local buffer index
-            int          band_feature = (int) q_col_buf[bi]; // already band-local (0..63)
-            T_Activation query_val    = q_val_buf[bi];
+            int          band_feature = (int) q_col[s];   // head-local feature (0..63)
+            T_Activation query_val    = q_val[s];
 
             denominator += query_val * key_sums[band_feature];
 
@@ -767,6 +633,163 @@ static void head_core (
     }
 }
 
+/* Which tail the shared projection runs; see mha_projection(). */
+enum MhaProjMode {
+    MHA_PROJ_DENSE     = 0,  /* dense rows to the on-chip scratch (V) */
+    MHA_PROJ_FEATMAJOR = 1,  /* ReLU + sparsify, feature-major (K') */
+    MHA_PROJ_HEADMAJOR = 2,  /* ReLU into the scratch, then sparsify head-major (Q') */
+    MHA_PROJ_DENSE_DDR = 3   /* dense rows straight to the layer output in DDR (out_proj) */
+};
+
+/**
+ * @brief Compute output rows [row_base, row_base + rows) of one projection.
+ *
+ * Requires the banks to hold this row block's entries (load_weight_slice).  Per output row the
+ * MHA_TILES column blocks accumulate in parallel; the accumulated row is then requantized and,
+ * for Q' and K', ReLU'd and emitted as CSR.
+ *
+ * mha() calls this from a single site.  HLS specialises a function per call site and an
+ * ALLOCATION limit does not apply to the functions it outlines loop bodies into, so four call
+ * sites gave two copies of this logic at 35k LUT each.
+ *
+ * @param[in]  mode         MHA_PROJ_DENSE (V), FEATMAJOR (K'), HEADMAJOR (Q'), DENSE_DDR (out_proj).
+ * @param[in]  row_base     First output row of this block.
+ * @param[in]  rows         Output rows in this block.
+ * @param[in]  tokens_dim   Number of tokens.
+ * @param[in]  quant_scale  Folded requantization scale.
+ * @param[out] out_dense    On-chip dense output (DENSE) or transpose scratch (HEADMAJOR).
+ * @param[out] out_ddr      DDR dense output (DENSE_DDR).
+ * @param[out] q_val        Q' values / columns / row pointers (HEADMAJOR).
+ * @param[out] q_col
+ * @param[out] q_ptr
+ * @param[out] k_val        K' values / columns / row pointers (FEATMAJOR).
+ * @param[out] k_col
+ * @param[out] k_ptr
+ */
+static void project_rows (
+    int             mode,
+    int             row_base,
+    int             rows,
+    int             tokens_dim,
+    T_Scale         quant_scale,
+    T_Activation   *q_scratch,
+    T_Activation   *v_head,
+    T_Activation   *out_ddr,
+    T_Activation   *q_val,
+    T_MhaHeadIndex *q_col,
+    int            *q_ptr,
+    T_Activation   *k_val,
+    T_MhaHeadIndex *k_col,
+    int            *k_ptr
+) {
+#pragma HLS INLINE off
+    /* Reads start at a packed-word boundary, so the first entry of the row block is at lane
+     * g_slice_cursor0[t], not at 0. */
+    CURSOR_INIT:
+    for (int t = 0; t < MHA_TILES; t++) {
+        #pragma HLS UNROLL
+        g_bank_cursor[t] = g_slice_cursor0[t];
+    }
+
+    /* The sparse outputs are this head's CSR, so they are written from index 0 on every call. */
+    int nnz = 0;
+    if (mode == MHA_PROJ_FEATMAJOR) {
+        k_ptr[0] = 0;
+    } else if (mode == MHA_PROJ_HEADMAJOR) {
+        q_ptr[0] = 0;
+    }
+
+    PROJECTION_ROW:
+    for (int i = 0; i < rows; i += MHA_ROWS_PER_STEP) {
+        #pragma HLS LOOP_TRIPCOUNT min=(MHA_FEATURE_HEAD/MHA_ROWS_PER_STEP) max=(MHA_FEATURE_HEAD/MHA_ROWS_PER_STEP)
+        const int rows_in_step = (rows - i < MHA_ROWS_PER_STEP) ? (rows - i) : MHA_ROWS_PER_STEP;
+
+        tiled_rows_compute(i, rows_in_step, tokens_dim);
+
+        PROJECTION_TAIL_ROW:
+        for (int p = 0; p < MHA_ROWS_PER_STEP; p++) {
+            #pragma HLS LOOP_TRIPCOUNT min=MHA_ROWS_PER_STEP max=MHA_ROWS_PER_STEP
+            if (p >= rows_in_step) {
+                continue;
+            }
+            /* One loop per mode, each with a branch-free body so that all of them hold II=1. */
+            if (mode == MHA_PROJ_DENSE_DDR) {
+                TAIL_DENSE_DDR:
+                for (int j = 0; j < tokens_dim; j++) {
+                    #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_TOKEN max=MHA_TC_TOKEN
+                    #pragma HLS PIPELINE II=1
+                    out_ddr[(row_base + i + p) * tokens_dim + j] =
+                        requant_to_int8(g_proj_rows[p][j], quant_scale);
+                }
+            } else if (mode == MHA_PROJ_DENSE) {
+                TAIL_DENSE:
+                for (int j = 0; j < tokens_dim; j++) {
+                    #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_TOKEN max=MHA_TC_TOKEN
+                    #pragma HLS PIPELINE II=1
+                    v_head[(i + p) * tokens_dim + j] = requant_to_int8(g_proj_rows[p][j], quant_scale);
+                }
+            } else if (mode == MHA_PROJ_HEADMAJOR) {
+                TAIL_HEADMAJOR:
+                for (int j = 0; j < tokens_dim; j++) {
+                    #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_TOKEN max=MHA_TC_TOKEN
+                    #pragma HLS PIPELINE II=1
+                    const T_MhaAcc acc = g_proj_rows[p][j];
+                    q_scratch[(i + p) * tokens_dim + j] =
+                        (acc > (T_MhaAcc) 0) ? requant_to_int8(acc, quant_scale) : (T_Activation) 0;
+                }
+            } else {
+                TAIL_FEATMAJOR:
+                for (int j = 0; j < tokens_dim; j++) {
+                    #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_TOKEN max=MHA_TC_TOKEN
+                    #pragma HLS PIPELINE II=1
+                    const T_MhaAcc acc = g_proj_rows[p][j];
+                    if (acc > (T_MhaAcc) 0) {
+                        const T_Activation quant_out = requant_to_int8(acc, quant_scale);
+                        if (quant_out > (T_Activation) 0) {
+#ifndef __SYNTHESIS__
+                            assert(nnz < MHA_HEAD_NNZ_MAX && "K' CSR overflow");
+#endif
+                            k_val[nnz] = quant_out;
+                            k_col[nnz] = (T_MhaHeadIndex) j;
+                            nnz++;
+                        }
+                    }
+                }
+                k_ptr[i + p + 1] = nnz;
+            }
+        }
+    }
+
+    if (mode == MHA_PROJ_HEADMAJOR) {
+    /* Q' is emitted token-major: row j of the CSR holds the nonzero features of token j, with the
+     * head-local feature index (0..63) as the column.  Q' . A reads it by token, which is why the
+     * dense rows go to a scratch first and are transposed here. */
+    RELU_ON_SCRATCH_TOKEN:
+    for (int j = 0; j < tokens_dim; j++) {
+        #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_TOKEN max=MHA_TC_TOKEN
+
+        PER_BAND_FEATURE_LOOP:
+        for (int bf = 0; bf < MHA_FEATURE_HEAD; bf++) {
+            #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_FEATURE_HEAD max=MHA_TC_FEATURE_HEAD
+            #pragma HLS PIPELINE II=1
+
+            T_Activation out_data = q_scratch[bf * tokens_dim + j];
+
+            if (out_data > (T_Activation) 0) {
+#ifndef __SYNTHESIS__
+                assert(nnz < MHA_HEAD_NNZ_MAX && "Q' CSR overflow");
+#endif
+                q_val[nnz] = out_data;
+                q_col[nnz] = (T_MhaHeadIndex) bf;
+                nnz++;
+            }
+        }
+
+        q_ptr[j + 1] = nnz;
+    }
+    }
+}
+
 void mha(
     T_MhaBankWord* input_packed,
     int            tokens_dim,
@@ -775,11 +798,6 @@ void mha(
     T_Activation* wv_values, T_MhaIndex* wv_col_idx, int* wv_row_ptr,
     T_Activation* wo_values, T_MhaIndex* wo_col_idx, int* wo_row_ptr,
     const T_Scale* scales,
-    /* Q'/K' val/col CSR are DDR-resident scratch (full grid D*N); each head streams its
-     * slice on-chip.  Row pointers are produced+consumed within mha() so they stay on-chip
-     * (k_ptr_local/q_ptr_local) and are NOT interface args. */
-    T_Activation* q_val, T_MhaHeadIndex* q_col,
-    T_Activation* k_val, T_MhaHeadIndex* k_col,
     T_Activation*  output
 ) {
 /* Keep mha() a standalone function (do NOT dissolve into the caller).  As one function HLS overlaps
@@ -787,110 +805,100 @@ void mha(
  * siblings that schedule sequentially.  Which way HLS goes flips on body size (e.g. the POT shift-MAC
  * enlarges the bodies and triggers the dissolve), inflating latency -- so pin it. */
 #pragma HLS INLINE off
+
     const int feature_dim = MHA_FEATURE_W_MAX;          // all projection weights are D x D
 #ifndef __SYNTHESIS__
     assert(tokens_dim <= MHA_TOKEN_W_MAX && "tokens_dim exceeds MHA_TOKEN_W_MAX");
 #endif
 
-    /* Dense V array. */
-    static T_Activation v_dense[MHA_SCR_V_CNT];
-    #pragma HLS BIND_STORAGE variable=v_dense type=ram_t2p impl=bram
+    /* One head's Q', K' and V, sized for 100 % ReLU survival (MHA_FEATURE_HEAD x N), so overflow is
+     * impossible without relying on measured densities.  Full-grid Q'/K' would be 12x this and was
+     * the reason they used to be kept in DDR. */
+    static T_Activation   v_head[MHA_SCR_V_HEAD_CNT];
+    static T_Activation   q_scratch[MHA_SCR_V_HEAD_CNT];
+    #pragma HLS BIND_STORAGE variable=v_head    type=ram_t2p impl=bram
+    #pragma HLS BIND_STORAGE variable=q_scratch type=ram_t2p impl=bram
 
-    /* Packed attention output. */
-    static T_MhaBankWord attn_output[MHA_BANK_WORDS];
-    #pragma HLS BIND_STORAGE   variable=attn_output type=ram_t2p impl=uram
-    #pragma HLS ARRAY_PARTITION variable=attn_output cyclic factor=MHA_BANK_CYCLIC dim=1
-
-    /* On-chip per-head K'/Q' slice buffers (streamed from DDR before each head).
-     * Sized to the fully-dense per-head slice -> never overflows.  head_core reads
-     * these instead of DDR, removing DDR from the head compute loops. */
-    static T_Activation   k_val_buf[MHA_KP_STREAM_NNZ];
-    static T_MhaHeadIndex k_col_buf[MHA_KP_STREAM_NNZ];
-    static T_Activation   q_val_buf[MHA_QP_STREAM_NNZ];
-    static T_MhaHeadIndex q_col_buf[MHA_QP_STREAM_NNZ];
+    static T_Activation   k_val_buf[MHA_HEAD_NNZ_MAX];
+    static T_MhaHeadIndex k_col_buf[MHA_HEAD_NNZ_MAX];
+    static int            k_ptr_buf[MHA_FEATURE_HEAD + 1];
+    static T_Activation   q_val_buf[MHA_HEAD_NNZ_MAX];
+    static T_MhaHeadIndex q_col_buf[MHA_HEAD_NNZ_MAX];
+    static int            q_ptr_buf[MHA_TOKEN_W_MAX + 1];
     #pragma HLS BIND_STORAGE variable=k_val_buf type=ram_t2p impl=bram
     #pragma HLS BIND_STORAGE variable=k_col_buf type=ram_t2p impl=bram
     #pragma HLS BIND_STORAGE variable=q_val_buf type=ram_t2p impl=bram
     #pragma HLS BIND_STORAGE variable=q_col_buf type=ram_t2p impl=bram
 
-    /* K'/Q' row pointers are PRODUCED and CONSUMED entirely within this mha() call, so
-     * they live on-chip -- never round-tripped through DDR.  (val/col are still DDR: the
-     * full grid doesn't fit on-chip, so each head streams its slice.) */
-    static int k_ptr_local[MHA_SCR_KP_PTR_CNT];
-    static int q_ptr_local[MHA_SCR_QP_PTR_CNT];
-    #pragma HLS BIND_STORAGE variable=k_ptr_local type=ram_t2p impl=bram
-    #pragma HLS BIND_STORAGE variable=q_ptr_local type=ram_t2p impl=bram
+    /* Packed attention output, all heads: the output projection needs every feature. */
+    static T_MhaBankWord attn_output[MHA_BANK_WORDS];
+    #pragma HLS BIND_STORAGE   variable=attn_output type=ram_t2p impl=uram
+    #pragma HLS ARRAY_PARTITION variable=attn_output cyclic factor=MHA_BANK_CYCLIC dim=1
 
-    /* Replicate input activation. Reused for all Q, K and V computations. */
-    replicate_input_activations<MHA_PROJ_P_QK>(input_packed, g_activation_replicas);
+    /* Activation tiles for Q, K and V: one copy of the layer input, split per column block. */
+    load_activation_tiles(input_packed);
 
-    /* Compute Q in token-major order. V dense array temporarily used as scratch. */
-    proj_relu_headmajor(wq_values,
-                         wq_col_idx,
-                         wq_row_ptr,
-                         feature_dim,
-                         tokens_dim,
-                         scales[SCALE_Q_IDX],
-                         v_dense,
-                         q_val,
-                         q_col,
-                         q_ptr_local);
+    /* Phase 1, stages 0..3*MHA_N_HEADS-1: K, Q and V of one head, then that head's attention, so
+     * only one head's projections are live at any time.  Phase 2: the output projection, in
+     * MHA_ROW_BLOCKS row blocks.  One call site for project_rows and the weight loaders, so HLS
+     * instantiates one of each; the weight pointers are selected in this scope, where the
+     * ALLOCATION pragmas apply and HLS multiplexes the AXI ports itself. */
+    #pragma HLS ALLOCATION instances=project_rows       limit=1 function
+    #pragma HLS ALLOCATION instances=load_weight_slice  limit=1 function
+    #pragma HLS ALLOCATION instances=load_weight_bases  limit=1 function
 
-    /* Compute K in feature-major order. */
-    proj_relu_featmajor(wk_values,
-                        wk_col_idx,
-                        wk_row_ptr,
-                        feature_dim,
-                        tokens_dim,
-                        scales[SCALE_K_IDX],
-                        k_val,
-                        k_col,
-                        k_ptr_local);
-    
-    /* Compute the dense V. */
-    proj_dense(wv_values, 
-               wv_col_idx, 
-               wv_row_ptr, 
-               feature_dim, 
-               tokens_dim,
-               scales[SCALE_V_IDX], 
-               v_dense);
+    PROJECTION_STAGE:
+    for (int stage = 0; stage < 3 * MHA_N_HEADS + MHA_ROW_BLOCKS; stage++) {
+        #pragma HLS LOOP_TRIPCOUNT min=(3*MHA_N_HEADS+MHA_ROW_BLOCKS) max=(3*MHA_N_HEADS+MHA_ROW_BLOCKS)
+        #pragma HLS LOOP_FLATTEN off
 
-    /* Per-head attention: stream this head's K'/Q' slice on-chip, then compute. */
-    HEAD_LOOP:
-    for (int head = 0; head < MHA_N_HEADS; head++) {
-        #pragma HLS LOOP_TRIPCOUNT min=MHA_N_HEADS max=MHA_N_HEADS
+        const int in_phase1 = (stage < 3 * MHA_N_HEADS);
+        const int head      = in_phase1 ? (stage / 3) : 0;
+        const int which     = in_phase1 ? (stage % 3) : 3;   // 0 = K, 1 = Q, 2 = V, 3 = out_proj
+        const int block     = in_phase1 ? head : (stage - 3 * MHA_N_HEADS);
+        const int row_base  = block * MHA_FEATURE_HEAD;
+        const int first     = (block == 0);
 
-        /* K' feature-major: head owns feature rows [head*64, (head+1)*64). */
-        const int k_slice_base = k_ptr_local[head * MHA_FEATURE_HEAD];
-        const int k_slice_len  = k_ptr_local[(head + 1) * MHA_FEATURE_HEAD] - k_slice_base;
-        /* Q' head-major: head's token-major block starts at head*(n+1). */
-        const int q_ptr_base   = head * (tokens_dim + 1);
-        const int q_slice_base = q_ptr_local[q_ptr_base];
-        const int q_slice_len  = q_ptr_local[q_ptr_base + tokens_dim] - q_slice_base;
+        /* The output projection multiplies the attention result, not the layer input. */
+        if (which == 3 && first) {
+            load_activation_tiles(attn_output);
+        }
 
-        load_head_slice(k_val, k_col, k_slice_base, k_slice_len,
-                        q_val, q_col, q_slice_base, q_slice_len,
-                        k_val_buf, k_col_buf, q_val_buf, q_col_buf);
+        /* Weight matrix of this stage; one branch each, all in this scope. */
+        if (which == 0) {
+            if (first) { load_weight_bases(wk_row_ptr, feature_dim, 0); }
+            load_weight_slice(wk_values, wk_col_idx, wk_row_ptr, feature_dim, 0, row_base, MHA_FEATURE_HEAD);
+        } else if (which == 1) {
+            if (first) { load_weight_bases(wq_row_ptr, feature_dim, 1); }
+            load_weight_slice(wq_values, wq_col_idx, wq_row_ptr, feature_dim, 1, row_base, MHA_FEATURE_HEAD);
+        } else if (which == 2) {
+            if (first) { load_weight_bases(wv_row_ptr, feature_dim, 2); }
+            load_weight_slice(wv_values, wv_col_idx, wv_row_ptr, feature_dim, 2, row_base, MHA_FEATURE_HEAD);
+        } else {
+            if (first) { load_weight_bases(wo_row_ptr, feature_dim, 3); }
+            load_weight_slice(wo_values, wo_col_idx, wo_row_ptr, feature_dim, 3, row_base, MHA_FEATURE_HEAD);
+        }
 
-        head_core(head,
-                  tokens_dim,
-                  scales[SCALE_DIV_OUT_IDX],
-                  k_val_buf, k_col_buf, k_ptr_local, k_slice_base,
-                  q_val_buf, q_col_buf, q_ptr_local, q_slice_base,
-                  v_dense,
-                  attn_output);
+        /* K' is emitted feature-major, Q' dense to a scratch and then token-major, V stays dense,
+         * the output projection writes the layer output in DDR. */
+        const int     mode  = (which == 0) ? MHA_PROJ_FEATMAJOR
+                            : (which == 1) ? MHA_PROJ_HEADMAJOR
+                            : (which == 2) ? MHA_PROJ_DENSE
+                                           : MHA_PROJ_DENSE_DDR;
+        const T_Scale scale = (which == 0) ? scales[SCALE_K_IDX]
+                            : (which == 1) ? scales[SCALE_Q_IDX]
+                            : (which == 2) ? scales[SCALE_V_IDX]
+                                           : scales[SCALE_LINEAR_OUT_IDX];
+
+        project_rows(mode, row_base, MHA_FEATURE_HEAD, tokens_dim, scale,
+                     q_scratch, v_head, output,
+                     q_val_buf, q_col_buf, q_ptr_buf,
+                     k_val_buf, k_col_buf, k_ptr_buf);
+
+        /* V is computed last of the three, so this head's attention runs on the V stage. */
+        head_core(which == 2, head, tokens_dim, scales[SCALE_DIV_OUT_IDX],
+                  k_val_buf, k_col_buf, k_ptr_buf,
+                  q_val_buf, q_col_buf, q_ptr_buf,
+                  v_head, attn_output);
     }
-
-    /* Replicate attention output. */
-    replicate_input_activations<MHA_PROJ_P>(attn_output, g_activation_replicas);
-
-    /* Dense output projection. */
-    proj_dense(wo_values, 
-               wo_col_idx, 
-               wo_row_ptr, 
-               feature_dim, 
-               tokens_dim,
-               scales[SCALE_LINEAR_OUT_IDX],
-               output);
 }

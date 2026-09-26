@@ -75,6 +75,7 @@ defines:
   - { name: MLP_BANK_ROW_WORDS, value: "(MLP_BANK_PAD_TOK / MLP_BANK_PACK)", comment: "packed words per feature row (56/8=7)" }
   - { name: MLP_BANK_WORDS,     value: "(MLP_FEATURE_W_MAX * MLP_BANK_ROW_WORDS)", comment: "total packed words in the bank (768*7)" }
   - { name: MLP_BANK_CYCLIC,    value: "(MLP_MAC_UNROLL / MLP_BANK_PACK)", comment: "word-array cyclic factor = words per MAC-wide read (16/8=2)" }
+  - { name: MLP_BANK_WORDS_ALLOC, value: "(MLP_BANK_WORDS + MLP_BANK_CYCLIC - 1)", comment: "bank array size read by the SpMM: + the spare word(s) the last token tile reads past the final row (value unused)" }
 
   # --- loop tripcounts: latency ESTIMATION only (ViT MLP @ ~90% weight sparsity) ---
   - { name: MLP_TC_HIDDEN_FEATURE, value: 3072, comment: "hidden rows (H_ROW_LOOP)" }

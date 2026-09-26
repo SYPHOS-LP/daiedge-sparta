@@ -61,8 +61,6 @@ void mha(
     T_Activation *wv_values, T_MhaIndex *wv_col_idx, int *wv_row_ptr,
     T_Activation *wo_values, T_MhaIndex *wo_col_idx, int *wo_row_ptr,
     const T_Scale *scales,
-    T_Activation *q_val, T_MhaHeadIndex *q_col,
-    T_Activation *k_val, T_MhaHeadIndex *k_col,
     T_Activation  *output
 );
 

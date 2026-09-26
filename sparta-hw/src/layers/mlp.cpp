@@ -459,6 +459,12 @@ static void fused_sdmm_relu_streaming (
 static T_MlpW2Word g_w2_csc[MLP_OUT_ROW_PARALLEL][MLP_W2_WORDS_PE];
 static int         g_w2_csc_ptr[MLP_OUT_ROW_PARALLEL][MLP_HIDDEN_FEATURE_W_MAX + 1];
 
+/* Staging scratch (mlp_stage_w2 only): on-chip copy of the DDR column pointers, and the list of
+ * non-empty columns with their end offsets (+1 sentinel entry for the look-ahead read). */
+static int g_w2_col_ptr[MLP_HIDDEN_FEATURE_W_MAX + 1];
+static int g_w2_nonempty_col[MLP_HIDDEN_FEATURE_W_MAX + 1];
+static int g_w2_nonempty_end[MLP_HIDDEN_FEATURE_W_MAX + 1];
+
 /* Unpack a W2 nonzero from an ALREADY-FETCHED packed word (word = g_w2_csc[s/PACK]).
  * The caller fetches the word once per PACK consecutive nonzeros (cuts URAM reads +
  * the per-nonzero shift LUT). */
@@ -486,6 +492,12 @@ static inline void acc_set(T_MlpAccWord &word, int lane_idx, T_MlpAccLane v) {
 /**
  * @brief Burst-stage the whole W2 (column-major CSC) from DDR into on-chip PACKED URAM once.
  *
+ * DDR is touched by exactly two sequential, unconditional loops (the burstable pattern): one over
+ * the column pointers and one over all nonzeros.  Column boundaries are tracked on-chip, instead of
+ * re-reading w2_col_ptr from DDR per column inside a nested loop (which cannot burst, and is the
+ * isolated-scalar m_axi read pattern known to misbehave on the board).  w2_values and w2_row_idx
+ * must sit on different m_axi bundles so the nonzero loop can burst both.
+ *
  * @param[in]  w2_values   W2 CSC values in DDR
  * @param[in]  w2_row_idx  W2 CSC row indices
  * @param[in]  w2_col_ptr  W2 CSC column pointers
@@ -501,6 +513,39 @@ void mlp_stage_w2(
     #pragma HLS BIND_STORAGE variable=g_w2_csc type=ram_t2p impl=uram
     #pragma HLS ARRAY_PARTITION variable=g_w2_csc     complete dim=1
     #pragma HLS ARRAY_PARTITION variable=g_w2_csc_ptr complete dim=1
+    #pragma HLS BIND_STORAGE variable=g_w2_col_ptr      type=ram_t2p impl=bram
+    #pragma HLS BIND_STORAGE variable=g_w2_nonempty_col type=ram_t2p impl=bram
+    #pragma HLS BIND_STORAGE variable=g_w2_nonempty_end type=ram_t2p impl=bram
+
+    /* 1. Column pointers: one sequential burst into on-chip memory. */
+    W2_COL_PTR_LOAD:
+    for (int h = 0; h <= hidden_dim; h++) {
+        #pragma HLS LOOP_TRIPCOUNT min=(MLP_HIDDEN_FEATURE_W_MAX+1) max=(MLP_HIDDEN_FEATURE_W_MAX+1)
+        #pragma HLS PIPELINE II=1
+        g_w2_col_ptr[h] = w2_col_ptr[h];
+    }
+
+    /* 2. Non-empty columns and where each one ends (on-chip only). */
+    int n_nonempty = 0;
+    int prev_end   = g_w2_col_ptr[0];
+    W2_NONEMPTY_COLS:
+    for (int h = 0; h < hidden_dim; h++) {
+        #pragma HLS LOOP_TRIPCOUNT min=MLP_HIDDEN_FEATURE_W_MAX max=MLP_HIDDEN_FEATURE_W_MAX
+        #pragma HLS PIPELINE II=1
+        const int end = g_w2_col_ptr[h + 1];
+        if (end > prev_end) {
+            g_w2_nonempty_col[n_nonempty] = h;
+            g_w2_nonempty_end[n_nonempty] = end;
+            n_nonempty++;
+        }
+        prev_end = end;
+    }
+    const int total_nnz = prev_end;
+    g_w2_nonempty_col[n_nonempty] = 0;    /* sentinel for the look-ahead read, never matched */
+    g_w2_nonempty_end[n_nonempty] = -1;
+#ifndef __SYNTHESIS__
+    assert(total_nnz <= MLP_MAX_W2_TOTAL_NNZ && "W2 nnz exceeds MLP_MAX_W2_TOTAL_NNZ");
+#endif
 
     /* Per-slice packing cursors: partial word, lane-in-word, and word index for each PE. */
     T_MlpW2Word word[MLP_OUT_ROW_PARALLEL];
@@ -516,39 +561,68 @@ void mlp_stage_w2(
         g_w2_csc_ptr[p][0] = 0;
     }
 
-    /* Walk W2 column-by-column; route each nonzero to its out_row slice, appending to that
-     * slice's packed array and advancing that slice's per-column pointer. */
-    W2_CSC_COL:
+    /* 3. One pass over all nonzeros (column-major): route each to its out_row slice, appending to that
+     * slice's packed array.  At the end of each non-empty column, record every slice's per-column
+     * pointer.  The next boundary is read one entry ahead so the crossing costs no extra state. */
+    int cur_end = g_w2_nonempty_end[0];
+    int cur_col = g_w2_nonempty_col[0];
+    int k       = 0;
+    W2_CSC_NZ:
+    for (int i = 0; i < total_nnz; i++) {
+        #pragma HLS LOOP_TRIPCOUNT min=MLP_MAX_W2_TOTAL_NNZ max=MLP_MAX_W2_TOTAL_NNZ
+        #pragma HLS PIPELINE II=1
+        const int next_end = g_w2_nonempty_end[k + 1];
+        const int next_col = g_w2_nonempty_col[k + 1];
+#ifdef POT_SHIFT_MAC
+        ap_uint<8> b  = (ap_uint<8>) w2_values[i];
+        T_MlpWVal  v  = (T_MlpWVal)((ap_uint<4>)((b[7] << 3) | (b & 0x7)));
+#else
+        T_MlpWVal  v  = (T_MlpWVal) w2_values[i];
+#endif
+        const int  r  = (int) w2_row_idx[i];
+        const int  p  = r / MLP_OUT_ROW_SLICE;   /* which contiguous out_row slice owns it */
+        const int  lo = lane[p] * MLP_W2_LANE_BITS;
+        word[p].range(lo + 3,  lo)     = (ap_uint<4>)  v;
+        word[p].range(lo + 13, lo + 4) = (ap_uint<10>) (T_MlpW2Row) r;
+        lane[p]++;
+        if (lane[p] == MLP_W2_PACK) { g_w2_csc[p][w[p]++] = word[p]; word[p] = 0; lane[p] = 0; }
+
+        if (i + 1 == cur_end) {
+            /* Per-column span in NONZERO units, per slice (contiguous packing across columns). */
+            W2_COL_PTR:
+            for (int q = 0; q < MLP_OUT_ROW_PARALLEL; q++) {
+                #pragma HLS UNROLL
+                g_w2_csc_ptr[q][cur_col + 1] = w[q] * MLP_W2_PACK + lane[q];
+            }
+            k++;
+            cur_end = next_end;
+            cur_col = next_col;
+        }
+    }
+
+    /* 4. Empty columns span nothing: they inherit the previous column's pointer. */
+    int prev_ptr[MLP_OUT_ROW_PARALLEL];
+    #pragma HLS ARRAY_PARTITION variable=prev_ptr complete dim=1
+    for (int p = 0; p < MLP_OUT_ROW_PARALLEL; p++) {
+        #pragma HLS UNROLL
+        prev_ptr[p] = 0;
+    }
+    prev_end = g_w2_col_ptr[0];
+    W2_EMPTY_COLS:
     for (int h = 0; h < hidden_dim; h++) {
         #pragma HLS LOOP_TRIPCOUNT min=MLP_HIDDEN_FEATURE_W_MAX max=MLP_HIDDEN_FEATURE_W_MAX
-        const int c_begin = w2_col_ptr[h];
-        const int c_end   = w2_col_ptr[h + 1];
-
-        W2_CSC_NZ:
-        for (int i = c_begin; i < c_end; i++) {
-            #pragma HLS LOOP_TRIPCOUNT min=0 max=MLP_TC_W2COL_NNZ
-            #pragma HLS PIPELINE II=1
-#ifdef POT_SHIFT_MAC
-            ap_uint<8> b  = (ap_uint<8>) w2_values[i];
-            T_MlpWVal  v  = (T_MlpWVal)((ap_uint<4>)((b[7] << 3) | (b & 0x7)));
-#else
-            T_MlpWVal  v  = (T_MlpWVal) w2_values[i];
-#endif
-            const int  r  = (int) w2_row_idx[i];
-            const int  p  = r / MLP_OUT_ROW_SLICE;   /* which contiguous out_row slice owns it */
-            const int  lo = lane[p] * MLP_W2_LANE_BITS;
-            word[p].range(lo + 3,  lo)     = (ap_uint<4>)  v;
-            word[p].range(lo + 13, lo + 4) = (ap_uint<10>) (T_MlpW2Row) r;
-            lane[p]++;
-            if (lane[p] == MLP_W2_PACK) { g_w2_csc[p][w[p]++] = word[p]; word[p] = 0; lane[p] = 0; }
-        }
-
-        /* Per-column span in NONZERO units, per slice (contiguous packing across columns). */
-        W2_COL_PTR:
+        #pragma HLS PIPELINE II=1
+        const int  end   = g_w2_col_ptr[h + 1];
+        const bool empty = (end == prev_end);
         for (int p = 0; p < MLP_OUT_ROW_PARALLEL; p++) {
             #pragma HLS UNROLL
-            g_w2_csc_ptr[p][h + 1] = w[p] * MLP_W2_PACK + lane[p];
+            const int ptr = empty ? prev_ptr[p] : g_w2_csc_ptr[p][h + 1];
+            if (empty) {
+                g_w2_csc_ptr[p][h + 1] = ptr;
+            }
+            prev_ptr[p] = ptr;
         }
+        prev_end = end;
     }
 
     /* Flush each slice's final partial word. */

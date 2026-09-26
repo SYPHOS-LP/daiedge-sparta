@@ -34,8 +34,9 @@ void encoder_mlp_block(
     assert(tokens_dim  <= ENC_MLP_TOKEN_W_MAX && "tokens_dim exceeds ENC_MLP_TOKEN_W_MAX");
 #endif
 
-    /* RMSNorm output written in URAM in packed format. */
-    static T_MlpBankWord norm_input[MLP_BANK_WORDS];
+    /* RMSNorm output written in URAM in packed format (+ the spare word the SpMM's last token tile
+     * reads past the final row; its value is never used). */
+    static T_MlpBankWord norm_input[MLP_BANK_WORDS_ALLOC];
     #pragma HLS BIND_STORAGE    variable=norm_input type=ram_t2p impl=uram
     #pragma HLS ARRAY_PARTITION variable=norm_input cyclic factor=MLP_BANK_CYCLIC dim=1
     rmsnorm(input,
@@ -45,11 +46,11 @@ void encoder_mlp_block(
             reinterpret_cast<T_RmsBankWord*> (norm_input));
 
     mlp(norm_input,
-        feature_dim, 
-        intermediate_dim, 
+        feature_dim,
+        intermediate_dim,
         tokens_dim,
-        w1_values, 
-        w1_col_idx, 
+        w1_values,
+        w1_col_idx,
         w1_row_ptr,
         w2_values,
         w2_col_idx,
@@ -86,7 +87,7 @@ void encoder_mlp_block_top(
     #pragma HLS INTERFACE m_axi port=w1_col_idx bundle=w1_mem   depth=MAX_NNZ
     #pragma HLS INTERFACE m_axi port=w1_row_ptr bundle=w1_mem   depth=MAX_ROWS+1
     #pragma HLS INTERFACE m_axi port=w2_values  bundle=w2_mem   depth=MAX_NNZ
-    #pragma HLS INTERFACE m_axi port=w2_col_idx bundle=w2_mem   depth=MAX_NNZ
+    #pragma HLS INTERFACE m_axi port=w2_col_idx bundle=w2i_mem  depth=MAX_NNZ
     #pragma HLS INTERFACE m_axi port=w2_row_ptr bundle=w2_mem   depth=MAX_ROWS+1
     #pragma HLS INTERFACE m_axi port=output     bundle=y_mem    depth=(ENC_MLP_FEATURE_W_MAX*ENC_MLP_TOKEN_W_MAX)
 

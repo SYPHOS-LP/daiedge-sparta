@@ -196,8 +196,6 @@ static TestResult run_case(
         w1v.data(),w1c.data(),w1p.data(),
         w2v.data(),w2c.data(),w2p.data(),
         scales.data(),
-        qpv.data(), qpc.data(),
-        kpv.data(), kpc.data(),
         y.data());
 
     double maxerr=0; int off=0,worse=0;

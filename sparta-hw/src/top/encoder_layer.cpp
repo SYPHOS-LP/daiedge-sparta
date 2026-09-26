@@ -20,8 +20,6 @@ static void mha_block_and_w2_prestage(
     T_Activation* wv_values, T_MhaIndex* wv_col_idx, int* wv_row_ptr,
     T_Activation* wo_values, T_MhaIndex* wo_col_idx, int* wo_row_ptr,
     const T_Scale* layer_scales,
-    T_Activation* q_val, T_MhaHeadIndex* q_col,
-    T_Activation* k_val, T_MhaHeadIndex* k_col,
     T_Activation* hidden,
     T_Activation* w2_values, T_MlpIndex* w2_col_idx, int* w2_row_ptr,
     int intermediate_dim
@@ -34,7 +32,6 @@ static void mha_block_and_w2_prestage(
                       wv_values, wv_col_idx, wv_row_ptr,
                       wo_values, wo_col_idx, wo_row_ptr,
                       layer_scales,
-                      q_val, q_col, k_val, k_col,
                       hidden);
     mlp_stage_w2(w2_values, w2_col_idx, w2_row_ptr, intermediate_dim);
 }
@@ -60,8 +57,6 @@ void encoder_layer_top(
     const T_Scale* scales,
     /* DDR-resident activation scratch: Q'/K' val/col (full grid D*N).  Q'/K' row pointers
      * are on-chip in mha() (produced+consumed there).  */
-    T_Activation* q_val, T_MhaHeadIndex* q_col,
-    T_Activation* k_val, T_MhaHeadIndex* k_col,
     T_Activation* output
 ) {
     #pragma HLS INTERFACE s_axilite port=return     bundle=control
@@ -86,17 +81,14 @@ void encoder_layer_top(
     #pragma HLS INTERFACE m_axi port=w1_col_idx bundle=w1_mem depth=MAX_NNZ num_read_outstanding=16 num_write_outstanding=2 max_read_burst_length=256
     #pragma HLS INTERFACE m_axi port=w1_row_ptr bundle=w1_mem depth=MAX_ROWS+1 num_read_outstanding=16 num_write_outstanding=2 max_read_burst_length=256
     #pragma HLS INTERFACE m_axi port=w2_values  bundle=w2_mem depth=MAX_NNZ num_read_outstanding=16 num_write_outstanding=2 max_read_burst_length=256
-    #pragma HLS INTERFACE m_axi port=w2_col_idx bundle=w2_mem depth=MAX_NNZ num_read_outstanding=16 num_write_outstanding=2 max_read_burst_length=256
+    /* W2 row indices on their own bundle: mlp_stage_w2 reads them in the same loop as w2_values. */
+    #pragma HLS INTERFACE m_axi port=w2_col_idx bundle=w2i_mem depth=MAX_NNZ num_read_outstanding=16 num_write_outstanding=2 max_read_burst_length=256
     #pragma HLS INTERFACE m_axi port=w2_row_ptr bundle=w2_mem depth=MAX_ROWS+1 num_read_outstanding=16 num_write_outstanding=2 max_read_burst_length=256
     #pragma HLS INTERFACE m_axi port=output bundle=y_mem depth=(ENC_FEATURE_W_MAX*ENC_TOKEN_W_MAX) num_read_outstanding=16 num_write_outstanding=16 max_read_burst_length=256 max_write_burst_length=256
     /* DDR-resident activation scratch: Q'/K' + H (single region each). */
     /* Each CSR array on its OWN bundle: sharing a bundle across val/col/ptr blocks HLS bursting
      * ("multiple potential writes to the same bundle in the same region"). One array per bundle
      * lets each be bursted independently. */
-    #pragma HLS INTERFACE m_axi port=q_val bundle=qv_mem depth=MHA_MAX_QK_NNZ num_read_outstanding=2 num_write_outstanding=2
-    #pragma HLS INTERFACE m_axi port=q_col bundle=qc_mem depth=MHA_MAX_QK_NNZ num_read_outstanding=2 num_write_outstanding=2
-    #pragma HLS INTERFACE m_axi port=k_val bundle=kv_mem depth=MHA_MAX_QK_NNZ num_read_outstanding=2 num_write_outstanding=2
-    #pragma HLS INTERFACE m_axi port=k_col bundle=kc_mem depth=MHA_MAX_QK_NNZ num_read_outstanding=2 num_write_outstanding=2
 
 #ifndef __SYNTHESIS__
     assert(tokens_dim <= ENC_TOKEN_W_MAX && "tokens_dim exceeds ENC_TOKEN_W_MAX");
@@ -123,7 +115,6 @@ void encoder_layer_top(
                               wv_values, wv_col_idx, wv_row_ptr,
                               wo_values, wo_col_idx, wo_row_ptr,
                               layer_scales,
-                              q_val, q_col, k_val, k_col,
                               hidden_oc,
                               w2_values, w2_col_idx, w2_row_ptr,
                               intermediate_dim);

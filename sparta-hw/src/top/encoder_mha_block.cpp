@@ -27,8 +27,6 @@ void encoder_mha_block(
     T_Activation* wv_values, T_MhaIndex* wv_col_idx, int* wv_row_ptr,
     T_Activation* wo_values, T_MhaIndex* wo_col_idx, int* wo_row_ptr,
     const T_Scale*      scales,
-    T_Activation* q_val, T_MhaHeadIndex* q_col,
-    T_Activation* k_val, T_MhaHeadIndex* k_col,
     T_Activation*       hidden
 ) {
 #ifndef __SYNTHESIS__
@@ -53,8 +51,6 @@ void encoder_mha_block(
         wv_values, wv_col_idx, wv_row_ptr,
         wo_values, wo_col_idx, wo_row_ptr,
         scales,
-        q_val, q_col,
-        k_val, k_col,
         hidden);
 
     residual_add(input,
@@ -74,8 +70,6 @@ void encoder_mha_block_top(
     T_Activation* wv_values, T_MhaIndex* wv_col_idx, int* wv_row_ptr,
     T_Activation* wo_values, T_MhaIndex* wo_col_idx, int* wo_row_ptr,
     const T_Scale*      scales,
-    T_Activation* q_val, T_MhaHeadIndex* q_col,
-    T_Activation* k_val, T_MhaHeadIndex* k_col,
     T_Activation*       hidden
 ) {
     #pragma HLS INTERFACE s_axilite port=return      bundle=control
@@ -96,11 +90,6 @@ void encoder_mha_block_top(
     #pragma HLS INTERFACE m_axi port=wo_col_idx bundle=wo_mem depth=MAX_NNZ
     #pragma HLS INTERFACE m_axi port=wo_row_ptr bundle=wo_mem depth=MAX_ROWS+1
     #pragma HLS INTERFACE m_axi port=hidden bundle=hidden_mem depth=(ENC_MHA_FEATURE_W_MAX*ENC_MHA_TOKEN_W_MAX)
-    /* DDR-resident Q'/K' val/col CSR scratch (full grid D*N); row pointers are on-chip in mha(). */
-    #pragma HLS INTERFACE m_axi port=q_val bundle=qp_mem depth=MHA_MAX_QK_NNZ
-    #pragma HLS INTERFACE m_axi port=q_col bundle=qp_mem depth=MHA_MAX_QK_NNZ
-    #pragma HLS INTERFACE m_axi port=k_val bundle=kp_mem depth=MHA_MAX_QK_NNZ
-    #pragma HLS INTERFACE m_axi port=k_col bundle=kp_mem depth=MHA_MAX_QK_NNZ
 
     encoder_mha_block(input, tokens_dim, feature_dim,
                       wq_values, wq_col_idx, wq_row_ptr,
@@ -108,7 +97,5 @@ void encoder_mha_block_top(
                       wv_values, wv_col_idx, wv_row_ptr,
                       wo_values, wo_col_idx, wo_row_ptr,
                       scales,
-                      q_val, q_col,
-                      k_val, k_col,
                       hidden);
 }

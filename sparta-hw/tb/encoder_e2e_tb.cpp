@@ -5,15 +5,15 @@
 // on real per-layer POT4 weights + a real SW-embedded image, in ONE csim process.
 // POT4 model = fused gammas (none read) + int8 weights + ap_fixed<32,16> scales.
 //
-//   model.bin       : per-layer CSR weights (int8 val, u16 col, i32 rowptr, i32 s_row)
-//                     + 15 ap_fixed scales.  NO gammas.  (scripts/compile_model.emit_model
-//                     pot=False fused=True)
+//   model.bin       : per-layer CSR weights (POT byte val, u16 col, i32 rowptr, i32 s_row)
+//                     + 15 ap_fixed scales.  NO gammas.  (scripts/compile_model.py
+//                     --scales fixed: pot=True, pot_scales=False, fused=True)
 //   model_index.bin : per-layer (nnz, n_rows) so we stream model.bin without JSON.
 //   inputs.bin      : per-image layer-0 input (D x N int8, feature-major) from SW embed.
 //   -> hw_out.bin   : per-image encoder output (D x N int8) after all 12 HW layers.
-//   -> hw_layers.bin: image-0 per-layer {hidden, output} boundaries for divergence localization.
+//   -> hw_layers.bin: image-0 per-layer outputs (12 x D x N) for divergence localization.
 //
-// File formats mirror the emit script scratchpad/emit_e2e_pot4.py.
+// E2E_IMAGES=<k> runs only the first k images (quick regression).
 // ============================================================================
 #include <cstdio>
 #include <cstdlib>
@@ -33,6 +33,10 @@ template <typename T> static void read_raw(FILE* f, T* d, size_t c, const char* 
     if (std::fread(d, sizeof(T), c, f) != c) { std::fprintf(stderr, "short read: %s\n", w); die("fread"); }
 }
 static int32_t read_i32(FILE* f) { int32_t v; read_raw(f, &v, 1, "i32"); return v; }
+
+// The kernel reads weight values/columns in wide words and reads the last word whole, so
+// the buffers must be readable (zero-padded) up to a multiple of this many elements.
+static const int WIDE_READ_PAD = 32;
 
 struct WMeta { int nnz; int n_rows; };
 struct LayerMeta { WMeta w[6]; };   // w_q,w_k,w_v,out_proj,linear_1,linear_2
@@ -65,7 +69,12 @@ int main(int argc, char** argv) {
     FILE* fin = std::fopen((g_dir + "inputs.bin").c_str(), "rb");
     if (!fin) die("cannot open inputs.bin");
     if ((uint32_t)read_i32(fin) != 0x45324E49u) die("bad inputs magic");
-    const int n_images = read_i32(fin);
+    const int n_in_file = read_i32(fin);
+    int n_images = n_in_file;
+    if (const char* e = std::getenv("E2E_IMAGES")) {
+        const int k = std::atoi(e);
+        if (k > 0 && k < n_images) n_images = k;
+    }
     const int in_D = read_i32(fin);
     const int N    = read_i32(fin);
     if (in_D != D) die("inputs D != model D");
@@ -80,7 +89,8 @@ int main(int argc, char** argv) {
     for (int L = 0; L < n_layers; L++) {
         for (int w = 0; w < 6; w++) {
             const int nnz = lm[L].w[w].nnz, nr = lm[L].w[w].n_rows;
-            LW[L].val[w].resize(nnz); LW[L].col[w].resize(nnz); LW[L].ptr[w].resize(nr + 1);
+            const int padded = (nnz + WIDE_READ_PAD - 1) / WIDE_READ_PAD * WIDE_READ_PAD;
+            LW[L].val[w].resize(padded); LW[L].col[w].resize(padded); LW[L].ptr[w].resize(nr + 1);
             { std::vector<int8_t> t(nnz); read_raw(fm, t.data(), nnz, "w.val");
               for (int i = 0; i < nnz; i++) LW[L].val[w][i] = (T_Activation)t[i]; }
             read_raw(fm, LW[L].col[w].data(), nnz, "w.col");
@@ -113,13 +123,8 @@ int main(int argc, char** argv) {
 
     std::vector<T_Activation> cur(XY), hidden(XY), nxt(XY);
 
-    // DDR-resident activation scratch, reused across all layers/images.
-    // Q'/K': full grid D*N.  H: ONE region (d_h*N) exposed via two pointer pairs (h0/h1) so the
-    // two stage-3 W2 PEs read it on independent AXI bundles -> both alias the SAME buffer here.
-    std::vector<T_Activation>   qpv(MHA_MAX_QK_NNZ), kpv(MHA_MAX_QK_NNZ);
-    std::vector<T_MhaHeadIndex> qpc(MHA_MAX_QK_NNZ), kpc(MHA_MAX_QK_NNZ);
-    std::vector<int>            qpp(MHA_SCR_QP_PTR_CNT), kpp(MHA_SCR_KP_PTR_CNT);
-    std::printf("E2E TB: %d images, %d layers, D=%d N=%d d_h=%d\n", n_images, n_layers, D, N, d_h);
+    std::printf("E2E TB: %d of %d images, %d layers, D=%d N=%d d_h=%d\n",
+                n_images, n_in_file, n_layers, D, N, d_h);
 
     for (int img = 0; img < n_images; img++) {
         { std::vector<int8_t> t(XY); read_raw(fin, t.data(), XY, "img input");
@@ -138,8 +143,6 @@ int main(int argc, char** argv) {
                 w.val[4].data(), mlp_col[L*2+0].data(), w.ptr[4].data(),   // linear_1
                 w.val[5].data(), mlp_col[L*2+1].data(), w.ptr[5].data(),   // linear_2
                 w.scales.data(),
-                qpv.data(), qpc.data(),
-                kpv.data(), kpc.data(),
                 nxt.data());
             if (fdbg) {
                 std::vector<int8_t> ty(XY);

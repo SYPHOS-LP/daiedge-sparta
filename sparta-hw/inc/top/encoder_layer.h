@@ -117,6 +117,10 @@
 
  * @param[in] scales           Per-layer folded scales.
  * @param[out] output          Layer output, D x N feature-major int8 (DDR).
+ *
+ * Buffer contract: the weight value and column-index buffers are burst-read in wide words
+ * (up to 256 bits) and the final word is read whole, so each buffer must be readable
+ * (zero-padded) up to the next multiple of 32 elements.
  */
 void encoder_layer_top(
     const T_Activation *input,
@@ -130,8 +134,6 @@ void encoder_layer_top(
     T_Activation *w1_values, T_MlpIndex *w1_col_idx, int *w1_row_ptr,
     T_Activation *w2_values, T_MlpIndex *w2_col_idx, int *w2_row_ptr,
     const T_Scale *scales,
-    T_Activation *q_val, T_MhaHeadIndex *q_col,
-    T_Activation *k_val, T_MhaHeadIndex *k_col,
     T_Activation  *output
 );
 

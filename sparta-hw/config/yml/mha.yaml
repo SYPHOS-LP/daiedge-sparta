@@ -20,14 +20,12 @@ defines:
   - { name: MHA_N_HEADS,       value: 12,  comment: "attention heads" }
   - { name: MHA_FEATURE_HEAD,  value: 64,  comment: "per-head feature width (MHA_FEATURE_W_MAX / MHA_N_HEADS)" }
 
-  # --- on-chip CSR capacity for Q'/K' ---
-  - { name: MHA_MAX_QK_NNZ, value: 38400, comment: "Q'/K' CSR cache capacity" }
-
-  # --- Q'/K' per-head stream buffer depth (streaming/double-buffer design) ---
-  # Sized to the fully-dense per-head slice (MHA_FEATURE_HEAD * MHA_TOKEN_W_MAX),
-  # so even 100% ReLU survival fits and the slice can never overflow.
-  - { name: MHA_KP_STREAM_NNZ, value: "(MHA_FEATURE_HEAD * MHA_TOKEN_W_MAX)", comment: "per-head K' slice buffer = fully-dense slice (64*197); never overflows" }
-  - { name: MHA_QP_STREAM_NNZ, value: "(MHA_FEATURE_HEAD * MHA_TOKEN_W_MAX)", comment: "per-head Q' slice buffer = fully-dense slice (64*197); never overflows" }
+  # --- on-chip capacity for one head's Q'/K' CSR and dense V ---
+  # Q', K' and V are computed and consumed one head at a time, so these hold MHA_FEATURE_HEAD x N.
+  # Sized for 100% ReLU survival, which makes overflow impossible without relying on measured
+  # densities (measured peak: Q' 0.45, K' 0.39 in layer 0).
+  - { name: MHA_HEAD_NNZ_MAX,  value: "(MHA_FEATURE_HEAD * MHA_TOKEN_W_MAX)", comment: "per-head Q'/K' CSR capacity = fully dense head slice (64*50)" }
+  - { name: MHA_SCR_V_HEAD_CNT, value: "(MHA_FEATURE_HEAD * MHA_TOKEN_W_MAX)", comment: "one head's dense V, and the Q' transpose scratch (int8)" }
 
   # --- MHA weight-row decode buffer bound -----
   - { name: MHA_MAX_W_NNZ, value: 256, comment: "per-row weight-decode buffer depth (measured max 195)" }
@@ -51,15 +49,27 @@ defines:
   - { name: MHA_BANK_WORDS,     value: "(MHA_FEATURE_W_MAX * MHA_BANK_ROW_WORDS)", comment: "total packed words in the bank (768*25)" }
   - { name: MHA_MAC_UNROLL,     value: 16, comment: "on-chip MAC lanes over tokens + accumulator partition" }
   - { name: MHA_BANK_CYCLIC,    value: "(MHA_MAC_UNROLL / MHA_BANK_PACK)", comment: "word-array cyclic factor = words per MAC-wide read (16/8=2)" }
+  - { name: MHA_BANK_WORDS_ALLOC, value: "(MHA_BANK_WORDS + MHA_BANK_CYCLIC - 1)", comment: "bank array size read by the SpMM: + the spare word(s) the last token tile reads past the final row (value unused)" }
 
-  # --- on-chip scratch array sizes (Q'/K' CSR + per-head working state) ----------
-  - { name: MHA_SCR_QP_VAL_CNT, value: MHA_MAX_QK_NNZ, comment: "Q' values (int8); mirrors MHA_MAX_QK_NNZ" }
-  - { name: MHA_SCR_QP_COL_CNT, value: MHA_MAX_QK_NNZ, comment: "Q' col indices (head features 0..63)" }
-  - { name: MHA_SCR_QP_PTR_CNT, value: "(MHA_N_HEADS * (MHA_TOKEN_W_MAX + 1))", comment: "Q' HEAD-MAJOR row_ptr: 12 blocks of (n+1); head h token-major spans in block h" }
-  - { name: MHA_SCR_KP_VAL_CNT, value: MHA_MAX_QK_NNZ, comment: "K' values (int8); mirrors MHA_MAX_QK_NNZ" }
-  - { name: MHA_SCR_KP_COL_CNT, value: MHA_MAX_QK_NNZ, comment: "K' col indices (tokens 0..196)" }
-  - { name: MHA_SCR_KP_PTR_CNT, value: "(MHA_FEATURE_W_MAX + 1)", comment: "K' feature-major row_ptr (D+1)" }
-  - { name: MHA_SCR_V_CNT,      value: "(MHA_FEATURE_W_MAX * MHA_TOKEN_W_MAX)", comment: "V dense D x N (int8)" }
+  # --- tiled SpMM: the feature axis is split into MHA_TILES column blocks -------------
+  # Each block has its own activation tile (one BRAM36: MHA_TILE_WORDS x 64 b) and its own
+  # weight bank (one URAM), so MHA_TILES lanes each read one nonzero per cycle without any
+  # copy of the activation.  compile_model.py --mha-tiles emits the weights to match.
+  - { name: MHA_TILES,          value: 12, comment: "column blocks of the feature axis (= heads at D=768)" }
+  - { name: MHA_TILE_FEATURES,  value: "(MHA_FEATURE_W_MAX / MHA_TILES)", comment: "features per block (64)" }
+  - { name: MHA_TILE_WORDS,     value: "(MHA_TILE_FEATURES * MHA_BANK_ROW_WORDS)", comment: "packed activation words per tile (64*7=448, one BRAM36)" }
+  - { name: MHA_ROWS_PER_STEP,  value: 1,  comment: "output rows the lanes advance together (amortises per-row block imbalance)" }
+  - { name: MHA_TILE_ENTRY_BITS, value: 16, comment: "packed weight entry: {block-local column (6 b), value (4 b)}" }
+  - { name: MHA_TILE_PACK,      value: 4,  comment: "weight entries per 64-bit bank word" }
+  # A stage computes MHA_FEATURE_HEAD output rows, so a bank holds one (row block x column block)
+  # cell, not a whole column block: measured worst cell = 977 entries (w_q) against 9704 for a
+  # whole block.  The +MHA_TILE_PACK is because the burst starts at the word CONTAINING the cell's
+  # first entry, so up to MHA_TILE_PACK-1 entries of the previous cell sit in front of it.
+  - { name: MHA_ROW_BLOCKS,     value: "(MHA_FEATURE_W_MAX / MHA_FEATURE_HEAD)", comment: "row blocks per weight (12; a block = one head's rows)" }
+  - { name: MHA_TILE_NNZ_MAX,   value: 1024, comment: "per-bank capacity for one row block; measured worst cell = 977 + up to 3 lead-in entries" }
+  - { name: MHA_TILE_BANK_WORDS, value: "(MHA_TILE_NNZ_MAX / MHA_TILE_PACK)", comment: "bank depth in packed words (256)" }
+
+  # --- per-head attention working state ------------------------------------------
   - { name: MHA_SCR_A_CNT,      value: "(MHA_FEATURE_HEAD * MHA_FEATURE_HEAD)", comment: "per-head A = K'V^T (int32)" }
 
   # --- loop tripcounts: latency ESTIMATION only (90% weight + activation sparsity)
@@ -76,6 +86,9 @@ types:
   - { name: T_MhaWCol,  kind: ap_uint,  width: 10,           comment: "on-chip decoded W col buffer (feature < MHA_FEATURE_W_MAX=768)" }
   - { name: T_MhaHeadIndex, kind: ap_uint, width: 8,         comment: "Q'/K' CSR col idx: K'=token(0..196), Q'=BAND-LOCAL feature(0..63) after head-major emit -> both fit 8 bits" }
   - { name: T_MhaBankWord, kind: ap_uint, width_expr: "MHA_BANK_WORD_BITS", comment: "packed bank URAM word: MHA_BANK_PACK int8 activations (64-bit)" }
+  - { name: T_MhaTileWord, kind: ap_uint, width_expr: "(MHA_TILE_PACK * MHA_TILE_ENTRY_BITS)", comment: "packed weight-bank word: MHA_TILE_PACK entries of {col, val} (64-bit)" }
+  - { name: T_MhaTileCol,  kind: ap_uint, width: 6,  comment: "block-local column index (0..MHA_TILE_FEATURES-1)" }
+  - { name: T_MhaTileCount, kind: ap_uint, width: 8, comment: "nonzeros of one output row inside one block (measured max 62)" }
   - { name: T_MhaAcc,   kind: ap_int,   width: 32,           comment: "MAC / scatter accumulator (int8xint8 summed)" }
   - { name: T_MhaRecip, kind: ap_ufixed, total: 32, int: 1,  comment: "1/(d+eps) reciprocal LUT output; d is large so recip ~1e-6, needs many frac bits" }
   - { name: T_MhaDiv,   kind: ap_fixed, total: 32, int: 16,  comment: "N*recip ~= N/d ratio (O(1)) before requant" }

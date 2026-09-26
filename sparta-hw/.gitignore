@@ -8,6 +8,8 @@ sim/data/
 sim/models/
 # compiled model payloads + golden dumps (regenerate via compile_model.py — see sim/README.md)
 sim/e2e/
+sim/e2e_tiled12/
+sim/e2e_tiled12_bal/
 sim/e2e_fixed/
 sim/e2e_backup*/
 
