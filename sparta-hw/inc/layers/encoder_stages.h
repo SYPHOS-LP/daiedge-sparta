@@ -45,7 +45,6 @@
  * @param[in]  w2_bank     MLP fc2 weight entries.
  * @param[in]  w2_counts   MLP fc2 weight counts.
  * @param[in]  scales      Per-layer folded scales.
- * @param[out] hidden      On-chip buffer for the attention half's output (D x N).
  * @param[out] output      Layer output, feature-major int8.
  */
 void encoder_layer_stages(
@@ -60,7 +59,6 @@ void encoder_layer_stages(
     T_MhaTileWord *w1_bank, int *w1_counts,
     T_MhaTileWord *w2_bank, int *w2_counts,
     const T_Scale      *scales,
-    T_Activation       *hidden,
     T_Activation       *output
 );
 

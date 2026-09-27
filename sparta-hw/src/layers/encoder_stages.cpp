@@ -53,6 +53,77 @@ static T_MhaBankWord g_attn_output[MHA_BANK_WORDS];
 /* RMSNorm output, packed.  One buffer for both halves of the layer: they run in sequence. */
 static T_MhaBankWord g_norm_input[MHA_BANK_WORDS_ALLOC];
 
+/* The layer's own activations, in the same packed form as everything else on chip: g_act holds the
+ * layer input and later the feed-forward branch's output, g_hidden the attention half's output.
+ * Keeping them packed is what lets RMSNorm, the residual adds and the tails move MHA_BANK_PACK
+ * tokens per cycle; external memory is read once at the start and written once at the end. */
+static T_MhaBankWord g_act[MHA_BANK_WORDS];
+static T_MhaBankWord g_hidden[MHA_BANK_WORDS];
+
+
+/**
+ * @brief Read the layer input from external memory into the packed on-chip form.
+ *
+ * The external buffer is feature-major with tokens_dim bytes per feature and no padding, while a
+ * packed row is MHA_BANK_ROW_WORDS words (MHA_BANK_PACK tokens each), so the trailing slots of the
+ * last word of each feature are zeroed.  One byte per transfer, because the port carries bytes.
+ */
+static void pack_activation (const T_Activation *src, T_MhaBankWord *dst,
+                             int tokens_dim, int feature_dim) {
+#pragma HLS INLINE off
+    const int row_words = (tokens_dim + MHA_BANK_PACK - 1) / MHA_BANK_PACK;
+    PACK_FEATURE:
+    for (int f = 0; f < feature_dim; f++) {
+        #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_FEATURE max=MHA_TC_FEATURE
+        PACK_WORD:
+        for (int w = 0; w < row_words; w++) {
+            #pragma HLS LOOP_TRIPCOUNT min=MHA_BANK_ROW_WORDS max=MHA_BANK_ROW_WORDS
+            T_MhaBankWord word = 0;
+            PACK_LANE:
+            for (int p = 0; p < MHA_BANK_PACK; p++) {
+                #pragma HLS PIPELINE II=1
+                const int    j = w * MHA_BANK_PACK + p;
+                T_Activation v = (T_Activation) 0;
+                if (j < tokens_dim) {
+                    v = src[f * tokens_dim + j];
+                }
+                word.range(p * MHA_ACT_ELEM_BITS + MHA_ACT_ELEM_BITS - 1,
+                           p * MHA_ACT_ELEM_BITS) = (ap_uint<MHA_ACT_ELEM_BITS>) v;
+            }
+            dst[f * MHA_BANK_ROW_WORDS + w] = word;
+        }
+    }
+}
+
+
+/**
+ * @brief Write the packed on-chip activation out to external memory, unpadded.
+ */
+static void unpack_activation (const T_MhaBankWord *src, T_Activation *dst,
+                               int tokens_dim, int feature_dim) {
+#pragma HLS INLINE off
+    const int row_words = (tokens_dim + MHA_BANK_PACK - 1) / MHA_BANK_PACK;
+    UNPACK_FEATURE:
+    for (int f = 0; f < feature_dim; f++) {
+        #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_FEATURE max=MHA_TC_FEATURE
+        UNPACK_WORD:
+        for (int w = 0; w < row_words; w++) {
+            #pragma HLS LOOP_TRIPCOUNT min=MHA_BANK_ROW_WORDS max=MHA_BANK_ROW_WORDS
+            const T_MhaBankWord word = src[f * MHA_BANK_ROW_WORDS + w];
+            UNPACK_LANE:
+            for (int p = 0; p < MHA_BANK_PACK; p++) {
+                #pragma HLS PIPELINE II=1
+                const int j = w * MHA_BANK_PACK + p;
+                if (j < tokens_dim) {
+                    dst[f * tokens_dim + j] =
+                        (T_Activation) word.range(p * MHA_ACT_ELEM_BITS + MHA_ACT_ELEM_BITS - 1,
+                                                  p * MHA_ACT_ELEM_BITS);
+                }
+            }
+        }
+    }
+}
+
 
 /**
  * @brief Compute output rows [row_base, row_base + rows) of one weight matrix.
@@ -68,17 +139,13 @@ static T_MhaBankWord g_norm_input[MHA_BANK_WORDS_ALLOC];
  * @param[in]  rows        Output rows in this block.
  * @param[in]  tokens_dim  Number of tokens.
  * @param[in]  scale       Folded requantization scale of this weight.
- * @param[out] hidden      Attention half's output (ROWS_MHA_O).
- * @param[out] output      Layer output (ROWS_MLP_Y).
  */
 static void layer_rows (
     int           mode,
     int           row_base,
     int           rows,
     int           tokens_dim,
-    T_Scale       scale,
-    T_Activation *hidden,
-    T_Activation *output
+    T_Scale       scale
 ) {
 #pragma HLS INLINE off
     const int row_words = (tokens_dim + MHA_BANK_PACK - 1) / MHA_BANK_PACK;
@@ -102,87 +169,89 @@ static void layer_rows (
 
         tiled_rows_compute(i, 1, tokens_dim, act_base);
 
-        /* One loop per mode, each with a branch-free body so that all of them hold II=1. */
+        /* Requantize the accumulated row once, MHA_BANK_PACK values per cycle, into row_q; the
+         * tails then only move bytes.  The six tails are mutually exclusive, so giving each its own
+         * requantize units built 27 multipliers where 8 suffice.  The MLP's hidden output is packed
+         * here as well, since its destination takes MHA_BANK_PACK values per word anyway.
+         *
+         * requant_to_int8 preserves sign (the scale is positive), so testing the requantized value
+         * against zero is the same ReLU as testing the accumulator. */
+        T_Activation row_q[MHA_TOKEN_W_MAX];
+        #pragma HLS ARRAY_PARTITION variable=row_q cyclic factor=MHA_BANK_PACK dim=1
+
+        REQUANT_ROW:
+        for (int w = 0; w < row_words; w++) {
+            #pragma HLS LOOP_TRIPCOUNT min=MHA_BANK_ROW_WORDS max=MHA_BANK_ROW_WORDS
+            #pragma HLS PIPELINE II=1
+            T_MhaBankWord packed = 0;   /* ReLU'd, for the MLP's hidden output */
+            T_MhaBankWord plain  = 0;   /* as requantized, for the two dense outputs */
+            REQUANT_LANE:
+            for (int p = 0; p < MHA_BANK_PACK; p++) {
+                #pragma HLS UNROLL
+                const int    j = w * MHA_BANK_PACK + p;
+                T_Activation q = (T_Activation) 0;
+                if (j < tokens_dim) {
+                    q = requant_to_int8(g_proj_rows[0][j], scale);
+                    row_q[j] = q;
+                }
+                const T_Activation relu = (q > (T_Activation) 0) ? q : (T_Activation) 0;
+                packed.range(p * MHA_ACT_ELEM_BITS + MHA_ACT_ELEM_BITS - 1,
+                             p * MHA_ACT_ELEM_BITS) = (ap_uint<MHA_ACT_ELEM_BITS>) relu;
+                plain.range(p * MHA_ACT_ELEM_BITS + MHA_ACT_ELEM_BITS - 1,
+                            p * MHA_ACT_ELEM_BITS) = (ap_uint<MHA_ACT_ELEM_BITS>) q;
+            }
+            /* The three packed destinations are written here, so those tails cost nothing more. */
+            if (mode == ROWS_MLP_H) {
+                g_act_tile[h_tile][MHA_H_TILE_BASE + (h_local + i) * MHA_BANK_ROW_WORDS + w] = packed;
+            } else if (mode == ROWS_MHA_O) {
+                g_hidden[(row_base + i) * MHA_BANK_ROW_WORDS + w] = plain;
+            } else if (mode == ROWS_MLP_Y) {
+                g_act[(row_base + i) * MHA_BANK_ROW_WORDS + w] = plain;
+            }
+        }
+
         if (mode == ROWS_MHA_K) {
+            /* Sparse emission appends, so it stays one token per cycle. */
             TAIL_K:
             for (int j = 0; j < tokens_dim; j++) {
                 #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_TOKEN max=MHA_TC_TOKEN
                 #pragma HLS PIPELINE II=1
-                const T_MhaAcc acc = g_proj_rows[0][j];
-                if (acc > (T_MhaAcc) 0) {
-                    const T_Activation quant_out = requant_to_int8(acc, scale);
-                    if (quant_out > (T_Activation) 0) {
+                const T_Activation quant_out = row_q[j];
+                if (quant_out > (T_Activation) 0) {
 #ifndef __SYNTHESIS__
-                        assert(nnz < MHA_HEAD_NNZ_MAX && "K' CSR overflow");
+                    assert(nnz < MHA_HEAD_NNZ_MAX && "K' CSR overflow");
 #endif
-                        g_k_val[nnz] = quant_out;
-                        g_k_col[nnz] = (T_MhaHeadIndex) j;
-                        nnz++;
-                    }
+                    g_k_val[nnz] = quant_out;
+                    g_k_col[nnz] = (T_MhaHeadIndex) j;
+                    nnz++;
                 }
             }
             g_k_ptr[i + 1] = nnz;
-        } else if (mode == ROWS_MHA_Q) {
-            TAIL_Q:
-            for (int j = 0; j < tokens_dim; j++) {
-                #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_TOKEN max=MHA_TC_TOKEN
-                #pragma HLS PIPELINE II=1
-                const T_MhaAcc acc = g_proj_rows[0][j];
-                g_q_scratch[i * tokens_dim + j] =
-                    (acc > (T_MhaAcc) 0) ? requant_to_int8(acc, scale) : (T_Activation) 0;
-            }
-        } else if (mode == ROWS_MHA_V) {
-            TAIL_V:
-            for (int j = 0; j < tokens_dim; j++) {
-                #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_TOKEN max=MHA_TC_TOKEN
-                #pragma HLS PIPELINE II=1
-                g_v_head[i * tokens_dim + j] = requant_to_int8(g_proj_rows[0][j], scale);
-            }
-        } else if (mode == ROWS_MHA_O) {
-            TAIL_O:
-            for (int j = 0; j < tokens_dim; j++) {
-                #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_TOKEN max=MHA_TC_TOKEN
-                #pragma HLS PIPELINE II=1
-                hidden[(row_base + i) * tokens_dim + j] = requant_to_int8(g_proj_rows[0][j], scale);
-            }
-        } else if (mode == ROWS_MLP_H) {
-            /* ReLU and requantize into int8, packed MHA_BANK_PACK tokens per word, straight into
-             * the hidden region of this block's tile: the second linear reads it there, so H is
-             * never copied and never leaves the chip. */
-            TAIL_H_WORD:
+        } else if (mode == ROWS_MHA_Q || mode == ROWS_MHA_V) {
+            /* Q' goes to the transpose scratch (ReLU'd) and V to this head's dense rows.  Both are
+             * read at arbitrary token positions later, so they stay byte-addressed and are split
+             * across MHA_BANK_PACK memories instead of packed. */
+            TAIL_BYTES:
             for (int w = 0; w < row_words; w++) {
                 #pragma HLS LOOP_TRIPCOUNT min=MHA_BANK_ROW_WORDS max=MHA_BANK_ROW_WORDS
                 #pragma HLS PIPELINE II=1
-                T_MhaBankWord word = 0;
-                TAIL_H_LANE:
+                TAIL_BYTES_LANE:
                 for (int p = 0; p < MHA_BANK_PACK; p++) {
                     #pragma HLS UNROLL
-                    const int    j = w * MHA_BANK_PACK + p;
-                    T_Activation v = (T_Activation) 0;
+                    const int j = w * MHA_BANK_PACK + p;
                     if (j < tokens_dim) {
-                        const T_MhaAcc acc = g_proj_rows[0][j];
-                        if (acc > (T_MhaAcc) 0) {
-                            const T_Activation q = requant_to_int8(acc, scale);
-                            if (q > (T_Activation) 0) {
-                                v = q;
-                            }
+                        const T_Activation q = row_q[j];
+                        if (mode == ROWS_MHA_Q) {
+                            g_q_scratch[i * tokens_dim + j] =
+                                (q > (T_Activation) 0) ? q : (T_Activation) 0;
+                        } else {
+                            g_v_head[i * tokens_dim + j] = q;
                         }
                     }
-                    word.range(p * MHA_ACT_ELEM_BITS + MHA_ACT_ELEM_BITS - 1,
-                               p * MHA_ACT_ELEM_BITS) = (ap_uint<MHA_ACT_ELEM_BITS>) v;
                 }
-                g_act_tile[h_tile][MHA_H_TILE_BASE + (h_local + i) * MHA_BANK_ROW_WORDS + w] = word;
-            }
-        } else {
-            TAIL_Y:
-            for (int j = 0; j < tokens_dim; j++) {
-                #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_TOKEN max=MHA_TC_TOKEN
-                #pragma HLS PIPELINE II=1
-                output[(row_base + i) * tokens_dim + j] = requant_to_int8(g_proj_rows[0][j], scale);
             }
         }
     }
-
     if (mode == ROWS_MHA_Q) {
         /* Q' is emitted token-major: CSR row j holds the nonzero features of token j, with the
          * head-local feature index (0..63) as the column.  Q' . A reads it by token, which is why
@@ -223,7 +292,6 @@ void encoder_layer_stages(
     T_MhaTileWord *w1_bank, int *w1_counts,
     T_MhaTileWord *w2_bank, int *w2_counts,
     const T_Scale      *scales,
-    T_Activation       *hidden,
     T_Activation       *output
 ) {
 #pragma HLS INLINE off
@@ -232,13 +300,17 @@ void encoder_layer_stages(
     assert(hidden_dim <= MLP_HIDDEN_FEATURE_W_MAX && "hidden_dim exceeds MLP_HIDDEN_FEATURE_W_MAX");
 #endif
     #pragma HLS BIND_STORAGE variable=g_v_head     type=ram_t2p impl=bram
+    #pragma HLS ARRAY_PARTITION variable=g_v_head cyclic factor=MHA_BANK_PACK dim=1
     #pragma HLS BIND_STORAGE variable=g_q_scratch  type=ram_t2p impl=bram
+    #pragma HLS ARRAY_PARTITION variable=g_q_scratch cyclic factor=MHA_BANK_PACK dim=1
     #pragma HLS BIND_STORAGE variable=g_k_val      type=ram_t2p impl=bram
     #pragma HLS BIND_STORAGE variable=g_k_col      type=ram_t2p impl=bram
     #pragma HLS BIND_STORAGE variable=g_q_val      type=ram_t2p impl=bram
     #pragma HLS BIND_STORAGE variable=g_q_col      type=ram_t2p impl=bram
     #pragma HLS BIND_STORAGE   variable=g_attn_output type=ram_t2p impl=uram
     #pragma HLS ARRAY_PARTITION variable=g_attn_output cyclic factor=MHA_BANK_CYCLIC dim=1
+    #pragma HLS BIND_STORAGE   variable=g_act    type=ram_t2p impl=uram
+    #pragma HLS BIND_STORAGE   variable=g_hidden type=ram_t2p impl=uram
     #pragma HLS BIND_STORAGE   variable=g_norm_input type=ram_t2p impl=uram
     #pragma HLS ARRAY_PARTITION variable=g_norm_input cyclic factor=MHA_BANK_CYCLIC dim=1
 
@@ -260,7 +332,11 @@ void encoder_layer_stages(
     #pragma HLS ALLOCATION instances=rmsnorm            limit=1 function
     #pragma HLS ALLOCATION instances=residual_add       limit=1 function
 
-    rmsnorm(input, tokens_dim, feature_dim, scales[SCALE_ATT_RMSNORM_OUT_INV_IDX],
+    /* External memory is read once here and written once at the end; everything between works on
+     * the packed on-chip form. */
+    pack_activation(input, g_act, tokens_dim, feature_dim);
+    rmsnorm(reinterpret_cast<const T_RmsBankWord*>(g_act), tokens_dim, feature_dim,
+            scales[SCALE_ATT_RMSNORM_OUT_INV_IDX],
             reinterpret_cast<T_RmsBankWord*>(g_norm_input));
     load_activation_tiles(g_norm_input, 0, MHA_TILE_WORDS);
 
@@ -289,10 +365,11 @@ void encoder_layer_stages(
         }
         /* Between the halves: close the attention residual, then normalize for the MLP. */
         if (mode == ROWS_MLP_H && first) {
-            residual_add(input, hidden, feature_dim * tokens_dim,
+            residual_add(g_act, g_hidden, feature_dim * MHA_BANK_ROW_WORDS,
                          scales[SCALE_ATT_RESIDUAL_IDX], scales[SCALE_ATT_BRANCH_RATIO_IDX],
-                         hidden);
-            rmsnorm(hidden, tokens_dim, feature_dim, scales[SCALE_FF_RMSNORM_OUT_INV_IDX],
+                         g_hidden);
+            rmsnorm(reinterpret_cast<const T_RmsBankWord*>(g_hidden), tokens_dim, feature_dim,
+                    scales[SCALE_FF_RMSNORM_OUT_INV_IDX],
                     reinterpret_cast<T_RmsBankWord*>(g_norm_input));
             load_activation_tiles(g_norm_input, 0, MHA_TILE_WORDS);
         }
@@ -326,7 +403,7 @@ void encoder_layer_stages(
                             : (mode == ROWS_MLP_H) ? scales[SCALE_FC1_IDX]
                                                    : scales[SCALE_FC2_IDX];
 
-        layer_rows(mode, row_base, MHA_FEATURE_HEAD, tokens_dim, scale, hidden, output);
+        layer_rows(mode, row_base, MHA_FEATURE_HEAD, tokens_dim, scale);
 
         /* V is the last of a head's three projections, so the head's attention runs here.  Called
          * unconditionally with an enable: a call inside an `if` makes HLS specialise the loop body
@@ -337,7 +414,8 @@ void encoder_layer_stages(
                   g_v_head, g_attn_output);
     }
 
-    residual_add(hidden, output, feature_dim * tokens_dim,
+    residual_add(g_hidden, g_act, feature_dim * MHA_BANK_ROW_WORDS,
                  scales[SCALE_FF_RESIDUAL_IDX], scales[SCALE_FF_BRANCH_RATIO_IDX],
-                 output);
+                 g_act);
+    unpack_activation(g_act, output, tokens_dim, feature_dim);
 }

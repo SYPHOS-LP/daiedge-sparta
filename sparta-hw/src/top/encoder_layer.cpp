@@ -71,10 +71,6 @@ void encoder_layer_top(
         layer_scales[i] = scales[i];
     }
 
-    /* On-chip intermediate ("hidden") activation. */
-    static T_Activation hidden_oc[ENC_FEATURE_W_MAX * ENC_TOKEN_W_MAX];
-    #pragma HLS BIND_STORAGE variable=hidden_oc type=ram_t2p impl=bram
-
     /* The whole layer: RMSNorm, the attention half's stages, its residual, RMSNorm again, the
      * feed-forward stages and its residual -- one stage loop, so one SpMM engine. */
     encoder_layer_stages(input, tokens_dim, feature_dim, intermediate_dim,
@@ -85,6 +81,5 @@ void encoder_layer_top(
                          w1_bank, w1_counts,
                          w2_bank, w2_counts,
                          layer_scales,
-                         hidden_oc,
                          output);
 }
