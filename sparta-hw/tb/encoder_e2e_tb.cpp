@@ -138,6 +138,10 @@ int main(int argc, char** argv) {
         { std::vector<int8_t> t(XY); read_raw(fin, t.data(), XY, "img input");
           for (int i = 0; i < XY; i++) cur[i] = (T_Activation)t[i]; }
 
+        /* The kernel keeps the activation on-chip between layers, so only the first layer reads it
+         * from memory and only the last writes it back.  Image 0 forces the write on every layer so
+         * that hw_layers.bin still holds each layer's output for the reference comparison; the other
+         * images run the production flags, which is what the board will do. */
         FILE* fdbg = (img == 0) ? std::fopen((g_dir + "hw_layers.bin").c_str(), "wb") : nullptr;
 
         for (int L = 0; L < n_layers; L++) {
@@ -151,7 +155,9 @@ int main(int argc, char** argv) {
                 w.bank[4].data(), w.ptr[4].data(),   // linear_1
                 w.bank[5].data(), w.ptr[5].data(),   // linear_2
                 w.scales.data(),
-                nxt.data());
+                nxt.data(),
+                (L == 0),                            /* first_layer: read the input from memory */
+                (fdbg != nullptr) || (L == n_layers - 1));   /* last_layer: write the result out */
             if (fdbg) {
                 std::vector<int8_t> ty(XY);
                 for (int i = 0; i < XY; i++) { ty[i] = (int8_t)nxt[i]; }

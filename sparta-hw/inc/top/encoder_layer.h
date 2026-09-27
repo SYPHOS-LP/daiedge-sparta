@@ -114,7 +114,11 @@
  * 
 
  * @param[in] scales           Per-layer folded scales.
- * @param[out] output          Layer output, D x N feature-major int8 (DDR).
+ * @param[out] output          Layer output, D x N feature-major int8 (DDR), written only when
+ *                             last_layer is set.
+ * @param[in] first_layer      Non-zero to read the input from DDR; otherwise the activation the
+ *                             previous layer left on-chip is used.
+ * @param[in] last_layer       Non-zero to write the result to DDR; otherwise it stays on-chip.
  *
  * Buffer contract: the weight value and column-index buffers are burst-read in wide words
  * (up to 256 bits) and the final word is read whole, so each buffer must be readable
@@ -132,7 +136,9 @@ void encoder_layer_top(
     T_MhaTileWord *w1_bank, int *w1_counts,
     T_MhaTileWord *w2_bank, int *w2_counts,
     const T_Scale *scales,
-    T_Activation  *output
+    T_Activation  *output,
+    int            first_layer,
+    int            last_layer
 );
 
 #endif // ENCODER_LAYER_H

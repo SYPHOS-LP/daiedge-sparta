@@ -81,6 +81,10 @@ class SpartaLayerArgs(ctypes.Structure):
         ("w2_values", ctypes.c_uint64), ("w2_col_idx", ctypes.c_uint64), ("w2_row_ptr", ctypes.c_uint64),
         ("scales", ctypes.c_uint64),
         ("output", ctypes.c_uint64),
+        # The kernel keeps the activation on-chip between layers: only the first layer reads it
+        # from DDR and only the last writes it back.
+        ("first_layer", ctypes.c_uint32),
+        ("last_layer", ctypes.c_uint32),
     ]
 
 
@@ -118,6 +122,7 @@ REGMAP = {
     "w2_values": (0x0b8, True), "w2_col_idx": (0x0c4, True), "w2_row_ptr": (0x0d0, True),
     "scales":    (0x0dc, True),
     "output":    (0x0e8, True),
+    "first_layer": (0x0f4, False), "last_layer": (0x0fc, False),
 }
 
 
@@ -597,7 +602,7 @@ def _addr(buf):
     return int(buf.device_address)
 
 
-def _build_args(x_buf, y_buf, lb, n_tokens, d, d_h):
+def _build_args(x_buf, y_buf, lb, n_tokens, d, d_h, first_layer=1, last_layer=1):
     """Fill a SpartaLayerArgs from PYNQ buffer device addresses.
 
     Field order matches encoder_layer_top()'s signature.  The weight tag names
@@ -613,6 +618,7 @@ def _build_args(x_buf, y_buf, lb, n_tokens, d, d_h):
         w1_values=_addr(lb["linear_1.values"]), w1_col_idx=_addr(lb["linear_1.col"]), w1_row_ptr=_addr(lb["linear_1.rowptr"]),
         w2_values=_addr(lb["linear_2.values"]), w2_col_idx=_addr(lb["linear_2.col"]), w2_row_ptr=_addr(lb["linear_2.rowptr"]),
         scales=_addr(lb["scales"]),
+        first_layer=int(first_layer), last_layer=int(last_layer),
         output=_addr(y_buf),
     )
 

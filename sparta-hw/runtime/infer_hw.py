@@ -249,9 +249,14 @@ class HwEncoder:
         self.a.sync_to_device()
         x_buf, y_buf = self.a, self.b
 
+        # The activation stays on-chip between layers, so only the first layer reads it from DDR
+        # and only the last writes it back -- unless a debug dump needs every layer's output.
+        dump_every = debug_tag is not None and self.debug_dir is not None
         for L in layers:
             args = SPARTA._build_args(x_buf, y_buf, self.staged[L],
-                                      SPARTA.ENC_N, SPARTA.ENC_D, self.d_h[L])
+                                      SPARTA.ENC_N, SPARTA.ENC_D, self.d_h[L],
+                                      first_layer=(L == layers[0]),
+                                      last_layer=(L == layers[-1]) or dump_every)
             if self.verbose:
                 print(f"  L{L:02d}: invoking kernel...", end="", flush=True)
 

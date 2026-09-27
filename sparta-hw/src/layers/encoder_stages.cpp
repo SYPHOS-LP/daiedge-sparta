@@ -292,7 +292,9 @@ void encoder_layer_stages(
     T_MhaTileWord *w1_bank, int *w1_counts,
     T_MhaTileWord *w2_bank, int *w2_counts,
     const T_Scale      *scales,
-    T_Activation       *output
+    T_Activation       *output,
+    int                 first_layer,
+    int                 last_layer
 ) {
 #pragma HLS INLINE off
 #ifndef __SYNTHESIS__
@@ -332,9 +334,12 @@ void encoder_layer_stages(
     #pragma HLS ALLOCATION instances=rmsnorm            limit=1 function
     #pragma HLS ALLOCATION instances=residual_add       limit=1 function
 
-    /* External memory is read once here and written once at the end; everything between works on
-     * the packed on-chip form. */
-    pack_activation(input, g_act, tokens_dim, feature_dim);
+    /* g_act keeps its contents between calls, and the previous layer left its output there, so only
+     * the first layer reads the activation from external memory and only the last writes it back.
+     * Both conversions cost one transfer per byte, the ports carrying bytes. */
+    if (first_layer) {
+        pack_activation(input, g_act, tokens_dim, feature_dim);
+    }
     rmsnorm(reinterpret_cast<const T_RmsBankWord*>(g_act), tokens_dim, feature_dim,
             scales[SCALE_ATT_RMSNORM_OUT_INV_IDX],
             reinterpret_cast<T_RmsBankWord*>(g_norm_input));
@@ -417,5 +422,7 @@ void encoder_layer_stages(
     residual_add(g_hidden, g_act, feature_dim * MHA_BANK_ROW_WORDS,
                  scales[SCALE_FF_RESIDUAL_IDX], scales[SCALE_FF_BRANCH_RATIO_IDX],
                  g_act);
-    unpack_activation(g_act, output, tokens_dim, feature_dim);
+    if (last_layer) {
+        unpack_activation(g_act, output, tokens_dim, feature_dim);
+    }
 }

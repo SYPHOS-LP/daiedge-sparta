@@ -45,7 +45,11 @@
  * @param[in]  w2_bank     MLP fc2 weight entries.
  * @param[in]  w2_counts   MLP fc2 weight counts.
  * @param[in]  scales      Per-layer folded scales.
- * @param[out] output      Layer output, feature-major int8.
+ * @param[out] output      Layer output, feature-major int8.  Written only when last_layer is set.
+ * @param[in]  first_layer Non-zero to read the layer input from `input`; otherwise the activation
+ *                         left on-chip by the previous layer is used.
+ * @param[in]  last_layer  Non-zero to write the result to `output`; otherwise it stays on-chip for
+ *                         the next layer.
  */
 void encoder_layer_stages(
     const T_Activation *input,
@@ -59,7 +63,9 @@ void encoder_layer_stages(
     T_MhaTileWord *w1_bank, int *w1_counts,
     T_MhaTileWord *w2_bank, int *w2_counts,
     const T_Scale      *scales,
-    T_Activation       *output
+    T_Activation       *output,
+    int                 first_layer,
+    int                 last_layer
 );
 
 #endif // ENCODER_STAGES_H

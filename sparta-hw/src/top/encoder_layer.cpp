@@ -29,14 +29,16 @@ void encoder_layer_top(
     T_MhaTileWord* w1_bank, int* w1_counts,
     T_MhaTileWord* w2_bank, int* w2_counts,
     const T_Scale* scales,
-    /* DDR-resident activation scratch: Q'/K' val/col (full grid D*N).  Q'/K' row pointers
-     * are on-chip in mha() (produced+consumed there).  */
-    T_Activation* output
+    T_Activation* output,
+    int           first_layer,
+    int           last_layer
 ) {
     #pragma HLS INTERFACE s_axilite port=return     bundle=control
     #pragma HLS INTERFACE s_axilite port=tokens_dim bundle=control
     #pragma HLS INTERFACE m_axi port=scales bundle=sc_mem depth=SCALE_IDX_MAX num_read_outstanding=16 num_write_outstanding=2 max_read_burst_length=256
     #pragma HLS INTERFACE s_axilite port=intermediate_dim bundle=control
+    #pragma HLS INTERFACE s_axilite port=first_layer      bundle=control
+    #pragma HLS INTERFACE s_axilite port=last_layer       bundle=control
     #pragma HLS INTERFACE s_axilite port=feature_dim      bundle=control
     #pragma HLS INTERFACE m_axi port=input     bundle=in_mem depth=(ENC_FEATURE_W_MAX*ENC_TOKEN_W_MAX) num_read_outstanding=16 num_write_outstanding=2 max_read_burst_length=256
     #pragma HLS INTERFACE m_axi port=wq_bank  bundle=w_mha_mem depth=MAX_NNZ num_read_outstanding=4 num_write_outstanding=2 max_read_burst_length=256
@@ -81,5 +83,7 @@ void encoder_layer_top(
                          w1_bank, w1_counts,
                          w2_bank, w2_counts,
                          layer_scales,
-                         output);
+                         output,
+                         first_layer,
+                         last_layer);
 }
