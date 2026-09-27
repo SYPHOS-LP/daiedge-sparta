@@ -300,22 +300,22 @@ void encoder_layer_stages(
         /* This stage's weight; one branch each, all in this scope, so HLS multiplexes the AXI
          * ports itself rather than needing a pointer selection in source. */
         if (mode == ROWS_MHA_K) {
-            if (first) { load_weight_bases(wk_counts, feature_dim, SPMM_W_K); }
+            if (first) { load_weight_bases(wk_counts, SPMM_W_K); }
             load_weight_slice(wk_bank, wk_counts, feature_dim, SPMM_W_K, row_base, MHA_FEATURE_HEAD);
         } else if (mode == ROWS_MHA_Q) {
-            if (first) { load_weight_bases(wq_counts, feature_dim, SPMM_W_Q); }
+            if (first) { load_weight_bases(wq_counts, SPMM_W_Q); }
             load_weight_slice(wq_bank, wq_counts, feature_dim, SPMM_W_Q, row_base, MHA_FEATURE_HEAD);
         } else if (mode == ROWS_MHA_V) {
-            if (first) { load_weight_bases(wv_counts, feature_dim, SPMM_W_V); }
+            if (first) { load_weight_bases(wv_counts, SPMM_W_V); }
             load_weight_slice(wv_bank, wv_counts, feature_dim, SPMM_W_V, row_base, MHA_FEATURE_HEAD);
         } else if (mode == ROWS_MHA_O) {
-            if (first) { load_weight_bases(wo_counts, feature_dim, SPMM_W_O); }
+            if (first) { load_weight_bases(wo_counts, SPMM_W_O); }
             load_weight_slice(wo_bank, wo_counts, feature_dim, SPMM_W_O, row_base, MHA_FEATURE_HEAD);
         } else if (mode == ROWS_MLP_H) {
-            if (first) { load_weight_bases(w1_counts, hidden_dim, SPMM_W_MLP1); }
+            if (first) { load_weight_bases(w1_counts, SPMM_W_MLP1); }
             load_weight_slice(w1_bank, w1_counts, hidden_dim, SPMM_W_MLP1, row_base, MHA_FEATURE_HEAD);
         } else {
-            if (first) { load_weight_bases(w2_counts, feature_dim, SPMM_W_MLP2); }
+            if (first) { load_weight_bases(w2_counts, SPMM_W_MLP2); }
             load_weight_slice(w2_bank, w2_counts, feature_dim, SPMM_W_MLP2, row_base, MHA_FEATURE_HEAD);
         }
 

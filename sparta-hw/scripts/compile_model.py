@@ -741,8 +741,14 @@ def emit_layer(model, layer, bw, verify, pot=False, fused=None, pot_scales=None,
         if tiled:
             # Values and columns in one pre-packed array; "counts" holds the per-(block, row)
             # nonzero counts the kernel walks the rows with.
+            # counts = [n_tiles first-word offsets][n_tiles * rows nonzero counts].  The offsets
+            # are prefix sums of each block's padded length, which the kernel would otherwise have
+            # to recompute by reading every count of the weight.
+            block_words = np.cumsum(
+                np.concatenate(([0], (indptr[:, -1] + TILE_PACK - 1) // TILE_PACK)))[:n_tiles]
             ent["bank"]   = bw.put(pack_tiled_bank(vals, idx, pot))
-            ent["counts"] = bw.put(ptr)
+            ent["counts"] = bw.put(np.concatenate([block_words, ptr]).astype("<i4"))
+            ent["block_words"] = [int(v) for v in block_words]
         else:
             ent["values"] = (bw.put(pot_weight_signexp(vals)) if pot
                              else bw.put(vals.astype(np.int8)))
@@ -876,7 +882,8 @@ def emit_model_index(manifest, out_dir, n_heads=12):
 
     Layout: magic + (n_layers, D, d_h, n_heads) + per layer, per weight in WEIGHTS order,
     (nnz, n_ptr) where n_ptr = pointer-array length - 1: rows for CSR, columns for CSC, and
-    n_tiles * rows for tiled_bank, whose count array holds one entry per (block, row)."""
+    n_tiles * (rows + 1) for tiled_bank, whose count array holds n_tiles block offsets followed by
+    one count per (block, row)."""
     ids = sorted(int(k) for k in manifest["layers"])
     w0 = manifest["layers"][str(ids[0])]["weights"]
     d_model, d_hidden = int(w0["w_q"]["shape"][1]), int(w0["linear_1"]["shape"][0])
@@ -889,7 +896,8 @@ def emit_model_index(manifest, out_dir, n_heads=12):
                 w = manifest["layers"][str(L)]["weights"][tag]
                 layout = w.get("layout")
                 if layout == "tiled_bank":
-                    n_ptr = int(w["n_tiles"]) * int(w["shape"][0]) - 1
+                    # the count array carries n_tiles offsets in front of n_tiles * rows counts
+                    n_ptr = int(w["n_tiles"]) * (int(w["shape"][0]) + 1) - 1
                 elif layout == "csc":
                     n_ptr = int(w["shape"][1])
                 else:

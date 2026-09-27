@@ -41,7 +41,7 @@ extern T_MhaAcc g_proj_rows[MHA_ROWS_PER_STEP][MHA_TOKEN_W_MAX];
  * into the hidden region, which is what lets its second stage read it without a copy. */
 extern T_MhaBankWord g_act_tile[MHA_TILES][MHA_TILE_WORDS_MAX];
 
-void load_weight_bases (int* w_counts, int feature_dim, int which);
+void load_weight_bases (int* w_counts, int which);
 
 void load_weight_slice (T_MhaTileWord* w_bank, int* w_counts,
                         int feature_dim, int which, int row_base, int rows);

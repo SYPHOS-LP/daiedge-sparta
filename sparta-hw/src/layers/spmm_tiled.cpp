@@ -61,31 +61,23 @@ static inline void bank_entry(T_MhaTileWord word, int lane, T_MhaWVal &val, T_Mh
 }
 
 /**
- * @brief Compute the first DDR word of every column block of one weight matrix.
+ * @brief Read the first DDR word of every column block of one weight matrix.
  *
- * Called once per weight matrix.  Each column block is padded to a whole packed word, so block t
- * starts after the padded lengths of blocks 0..t-1, which requires the counts of all their rows.
+ * Called once per weight matrix.  compile_model.py emits the MHA_TILES offsets in front of the
+ * counts, so this is MHA_TILES reads.  Recomputing them here meant first reading every count of
+ * the weight, which cost 83k cycles per layer across the six matrices.
  *
- * @param[in] w_counts    Nonzeros per (column block, row), block-major: w_counts[t * rows + r].
- * @param[in] feature_dim Output rows of the projection.
- * @param[in] which       Weight matrix slot (SpmmWeightSlot).
+ * @param[in] w_counts  MHA_TILES block offsets, then the nonzeros per (column block, row).
+ * @param[in] which     Weight matrix slot (SpmmWeightSlot).
  */
-void load_weight_bases (int* w_counts, int feature_dim, int which) {
+void load_weight_bases (int* w_counts, int which) {
 #pragma HLS INLINE off
-    int next_word = 0;
     BASE_TILE:
     for (int t = 0; t < MHA_TILES; t++) {
         #pragma HLS LOOP_TRIPCOUNT min=MHA_TILES max=MHA_TILES
-        int len = 0;
-        BASE_ROW:
-        for (int r = 0; r < feature_dim; r++) {
-            #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_FEATURE max=MHA_TC_FEATURE
-            #pragma HLS PIPELINE II=1
-            len += w_counts[t * feature_dim + r];
-        }
-        g_block_word0[which][t] = next_word;
+        #pragma HLS PIPELINE II=1
+        g_block_word0[which][t] = w_counts[t];
         g_slice_entry[which][t] = 0;
-        next_word              += (len + MHA_TILE_PACK - 1) / MHA_TILE_PACK;
     }
 }
 
@@ -98,7 +90,7 @@ void load_weight_bases (int* w_counts, int feature_dim, int which) {
  * hold them, so no unpacking, re-encoding or merging is needed here.
  *
  * @param[in] w_bank       Packed weight entries in DDR, {column, value} per slot, block order.
- * @param[in] w_counts     Nonzeros per (column block, row), block-major.
+ * @param[in] w_counts     MHA_TILES block offsets, then the nonzeros per (column block, row).
  * @param[in] feature_dim  Output rows of the weight matrix (row stride of w_counts).
  * @param[in] which        Weight matrix slot (SpmmWeightSlot).
  * @param[in] row_base     First output row of this stage.
@@ -129,7 +121,7 @@ void load_weight_slice (T_MhaTileWord* w_bank, int* w_counts,
         for (int r = 0; r < rows; r++) {
             #pragma HLS LOOP_TRIPCOUNT min=MHA_FEATURE_HEAD max=MHA_FEATURE_HEAD
             #pragma HLS PIPELINE II=1
-            const int n = w_counts[t * feature_dim + row_base + r];
+            const int n = w_counts[MHA_TILES + t * feature_dim + row_base + r];
             g_bank_count[t][r] = (T_MhaTileCount) n;
             len += n;
         }
@@ -218,16 +210,14 @@ static inline void mac_pe (
         /* Unpack */
         T_Activation input_word = (T_Activation) input.range(chunk * 8 + 7, chunk * 8);
 #ifdef POT_SHIFT_MAC
-        /* POT weight is {sign(bit3), exponent(bits0..2)}. LUTs are
-         * a scarce resource at this point, so we bind this operation
-         * to a DSP, as these are underutilized.
-         */
+        /* The weight is a power of two, {sign(bit3), exponent(bits0..2)}, so the product is the
+         * activation shifted left by the exponent: a barrel shifter instead of a multiplier, and
+         * a 16-bit addend instead of a 32-bit one.  int8 shifted by up to 7 spans
+         * -16384..16256, which fits 16 bits. */
         ap_uint<3> e   = weight.range(2, 0);
         bool       neg = weight[3];
-        T_MhaAcc   pot = neg ? (T_MhaAcc)(-(1 << e)) : (T_MhaAcc)(1 << e);
-        T_MhaAcc   prod = (T_MhaAcc) input_word * pot;
-        #pragma HLS BIND_OP variable=prod op=mul impl=dsp
-        out_row[token_idx] += prod;
+        ap_int<16> mag = ((ap_int<16>) input_word) << e;
+        out_row[token_idx] += neg ? (T_MhaAcc)(-mag) : (T_MhaAcc) mag;
 #else
         /* Multiply - Accumulate */
         out_row[token_idx] += weight * input_word;
