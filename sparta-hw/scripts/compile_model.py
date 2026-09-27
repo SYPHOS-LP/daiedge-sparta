@@ -477,9 +477,18 @@ def dense_to_csc(wint):
 def pack_tiled_bank(vals, indices, pot, pack=TILE_PACK, entry_bits=16):
     """Pack tiled weight entries into the words the kernel copies into its banks.
 
-    The kernel reads an entry as a value in bits 0..3 and a block-local column in bits 4..9 of an
-    `entry_bits`-wide slot, with `pack` slots per word.  Producing that layout here makes the
-    on-chip load a plain copy instead of two passes that unpack, re-encode and merge.
+    An entry is `entry_bits` wide: the value in the low bits, then the 8-bit block-local column.
+    The value field follows the kernel's datapath, and so does the column's position:
+
+    ==========  ===========  =============  ====================================================
+    `pot`       value field  column at bit  datapath
+    ==========  ===========  =============  ====================================================
+    True        4 bits       4              {sign, exponent}; the MAC shifts the activation
+    False       8 bits       8              plain integer; the MAC multiplies on a DSP
+    ==========  ===========  =============  ====================================================
+
+    Producing this layout here makes the on-chip load a plain copy instead of passes that unpack,
+    re-encode and merge.
 
     Parameters
     ----------
@@ -513,12 +522,17 @@ def pack_tiled_bank(vals, indices, pot, pack=TILE_PACK, entry_bits=16):
         raise ValueError(f"block-local column out of 0..255: {c.min()}..{c.max()}")
 
     if pot:
-        nibble = pot_weight_signexp(v, allow_zero=True).astype(np.int64)
-        nibble = ((nibble >> 7) << 3) | (nibble & 0x7)   # {sign bit7, exp bits0..6} -> {sign bit3, exp bits0..2}
+        code    = pot_weight_signexp(v, allow_zero=True).astype(np.int64)
+        code    = ((code >> 7) << 3) | (code & 0x7)   # {sign bit7, exp bits0..6} -> {sign bit3, exp bits0..2}
+        col_lsb = 4
     else:
-        nibble = v & 0xF                                  # int4 two's complement
+        # these weights reach +/-64, so the plain-integer field is 8 bits, not 4
+        if v.size and (v.min() < -128 or v.max() > 127):
+            raise ValueError(f"weight out of int8 range: {v.min()}..{v.max()}")
+        code    = v & 0xFF
+        col_lsb = 8
 
-    entry = (nibble | (c << 4)).astype(np.uint64)
+    entry = (code | (c << col_lsb)).astype(np.uint64)
     entry = entry.reshape(-1, pack)
     word = np.zeros(entry.shape[0], dtype="<u8")
     for lane in range(pack):
@@ -695,7 +709,8 @@ def emit_gamma(model, layer, ln, bw, verify):
     return entry
 
 
-def emit_layer(model, layer, bw, verify, pot=False, fused=None, pot_scales=None, tiles=None):
+def emit_layer(model, layer, bw, verify, pot=False, fused=None, pot_scales=None, tiles=None,
+               pot_weights=None):
     """Append one layer's blobs to the single-file writer `bw`; return its manifest.
 
     pot=True (POT4 model): WEIGHTS are emitted as one sign+exponent byte per nonzero
@@ -712,6 +727,8 @@ def emit_layer(model, layer, bw, verify, pot=False, fused=None, pot_scales=None,
         fused = pot
     if pot_scales is None:
         pot_scales = pot
+    if pot_weights is None:
+        pot_weights = pot
     P = f"encoder.encoder_layer_{layer}."
     ld = {"weights": {}, "scale_rows": {}, "gammas": {}}
     fold_names = {"w_q": "s_q_row", "w_k": "s_k_row", "w_v": "s_v_row",
@@ -746,11 +763,11 @@ def emit_layer(model, layer, bw, verify, pot=False, fused=None, pot_scales=None,
             # to recompute by reading every count of the weight.
             block_words = np.cumsum(
                 np.concatenate(([0], (indptr[:, -1] + TILE_PACK - 1) // TILE_PACK)))[:n_tiles]
-            ent["bank"]   = bw.put(pack_tiled_bank(vals, idx, pot))
+            ent["bank"]   = bw.put(pack_tiled_bank(vals, idx, pot_weights))
             ent["counts"] = bw.put(np.concatenate([block_words, ptr]).astype("<i4"))
             ent["block_words"] = [int(v) for v in block_words]
         else:
-            ent["values"] = (bw.put(pot_weight_signexp(vals)) if pot
+            ent["values"] = (bw.put(pot_weight_signexp(vals)) if pot_weights
                              else bw.put(vals.astype(np.int8)))
             ent["col"]    = bw.put(idx)
             ent["rowptr"] = bw.put(ptr)
@@ -807,15 +824,18 @@ def _is_pot_model(model):
 
 
 def emit_model(model, layers, out_dir, verify=False, pot=None, fused=None, pot_scales=None,
-               perms=None, tiles=None):
+               perms=None, tiles=None, pot_weights=None):
     """Emit ONE concatenated model.bin (all layers, all blobs) + manifest.json.
 
     perms: the permutations already applied to `model` (apply_permutations), if any. They are
     saved next to model.bin and recorded in the manifest so the host can permute the encoder
     input / un-permute its output.
 
-    pot: None -> auto-detect POT4 (fused gamma + po2 scales); True/False to force. POT
-    WEIGHTS are one sign+exp byte/nonzero (shift-MAC kernel).
+    pot: None -> auto-detect POT4 (fused gamma + po2 scales); True/False to force.  It selects
+    gamma fusion and the defaults of the two switches below.
+    pot_weights: None -> defaults to `pot`.  True encodes the weight values as {sign, exponent}
+    for the kernel's shift datapath, False as plain integers for its DSP-multiply datapath.  The
+    model's numbers are the same either way, only their encoding differs.
     pot_scales: None -> defaults to `pot`. SCALES as int8 shift amounts (True) or ap_fixed
     words (False). HYBRID (shift-MAC + shipping multiply requant) = pot=True, pot_scales=False.
     fused: None -> defaults to `pot`; gammas emitted only when NOT fused.
@@ -826,13 +846,15 @@ def emit_model(model, layers, out_dir, verify=False, pot=None, fused=None, pot_s
         pot_scales = pot
     if fused is None:
         fused = pot
+    if pot_weights is None:
+        pot_weights = pot
     os.makedirs(out_dir, exist_ok=True)
     bin_path = os.path.join(out_dir, "model.bin")
     manifest = {
         "source": model.meta.get("source", "quant_values.txt"),
         "bin": "model.bin",
         "endian": "little",
-        "format": "pot" if pot else "int",
+        "format": "pot" if pot_weights else "int",
         "w_bits": 4, "scale_frac": SCALE_FRAC, "gamma_bits": GAMMA_BITS,
         "note_format": ("POT: weight blob = uint8 (bit7=sign, bits0..6=log2|w|); scale "
                         "blobs = int8 shift s (real=2^s); NO gammas (fused into linears)."
@@ -848,7 +870,7 @@ def emit_model(model, layers, out_dir, verify=False, pot=None, fused=None, pot_s
         bw = BlobWriter(fh)
         for layer in layers:
             ld = emit_layer(model, layer, bw, verify, pot=pot, fused=fused, pot_scales=pot_scales,
-                            tiles=tiles)
+                            tiles=tiles, pot_weights=pot_weights)
             manifest["layers"][str(layer)] = ld
             w = ld["weights"]
             vtxt = ""
@@ -877,10 +899,13 @@ def emit_model(model, layers, out_dir, verify=False, pot=None, fused=None, pot_s
 MODEL_INDEX_MAGIC = 0x45324D49   # 'IM2E', checked by tb/encoder_e2e_tb.cpp
 
 
-def emit_model_index(manifest, out_dir, n_heads=12):
+def emit_model_index(manifest, out_dir, n_heads=12, entry_format=0):
     """Write model_index.bin for tb/encoder_e2e_tb.cpp from an emitted manifest.
 
-    Layout: magic + (n_layers, D, d_h, n_heads) + per layer, per weight in WEIGHTS order,
+    Layout: magic + (n_layers, D, d_h, n_heads, entry_format) + per layer, per weight in WEIGHTS
+    order, where entry_format is 0 for power-of-two values (the shift datapath) and 1 for plain
+    integers (the multiply datapath); the kernel's testbench checks it against its own build.
+    Then
     (nnz, n_ptr) where n_ptr = pointer-array length - 1: rows for CSR, columns for CSC, and
     n_tiles * (rows + 1) for tiled_bank, whose count array holds n_tiles block offsets followed by
     one count per (block, row)."""
@@ -890,7 +915,7 @@ def emit_model_index(manifest, out_dir, n_heads=12):
     path = os.path.join(out_dir, "model_index.bin")
     with open(path, "wb") as f:
         f.write(struct.pack("<I", MODEL_INDEX_MAGIC))
-        f.write(struct.pack("<4i", len(ids), d_model, d_hidden, n_heads))
+        f.write(struct.pack("<5i", len(ids), d_model, d_hidden, n_heads, entry_format))
         for L in ids:
             for tag in WEIGHTS:
                 w = manifest["layers"][str(L)]["weights"][tag]
@@ -1156,6 +1181,13 @@ def main():
     ap.add_argument("--mha-tiles", type=int, default=0,
                     help="emit the MHA projection weights as this many per-column-block CSRs "
                          "(0 = one row-major CSR, the original layout)")
+    ap.add_argument("--weights", choices=["auto", "pot", "int"], default="auto",
+                    help="weight values in the tiled payload: 'pot' = {sign, exponent} for the "
+                         "shift datapath, 'int' = plain integers for the DSP-multiply datapath, "
+                         "'auto' = follow POT_SHIFT_MAC in config/build_config.yaml (the same "
+                         "switch the kernel is built with)")
+    ap.add_argument("--build-config", default="config/build_config.yaml",
+                    help="--weights auto reads the kernel's defines from here")
     ap.add_argument("--mlp-tiles", type=int, default=0,
                     help="emit the MLP weights as this many per-column-block CSRs; linear_1 splits "
                          "its D input features, linear_2 its d_h hidden features "
@@ -1193,13 +1225,25 @@ def main():
                                                    4, args.w1_group_cap, rng)
     if perms is not None:
         apply_permutations(model, perms)
+    if args.weights == "auto":
+        try:
+            import yaml
+            defines = yaml.safe_load(open(args.build_config)).get("defines") or []
+        except Exception as exc:
+            raise SystemExit(f"--weights auto could not read {args.build_config}: {exc}")
+        pot_weights = "POT_SHIFT_MAC" in defines
+        print(f"--weights auto: {'pot' if pot_weights else 'int'} "
+              f"(POT_SHIFT_MAC {'set' if pot_weights else 'not set'} in {args.build_config})",
+              file=sys.stderr)
+    else:
+        pot_weights = (args.weights == "pot")
     pot_scales = {"auto": None, "fixed": False, "shift": True}[args.scales]
     tiles = {t: args.mha_tiles for t in MHA_TILED_WEIGHTS if args.mha_tiles > 0}
     tiles.update({t: args.mlp_tiles for t in MLP_TILED_WEIGHTS if args.mlp_tiles > 0})
-    manifest = emit_model(model, layers, args.out, args.verify, pot_scales=pot_scales, perms=perms,
-                          tiles=tiles)
+    manifest = emit_model(model, layers, args.out, args.verify, pot_weights=pot_weights,
+                          pot_scales=pot_scales, perms=perms, tiles=tiles)
     if args.model_index:
-        emit_model_index(manifest, args.out)
+        emit_model_index(manifest, args.out, entry_format=0 if pot_weights else 1)
     print(f"\nWrote {len(layers)} layer(s) to {args.out}/", file=sys.stderr)
 
 

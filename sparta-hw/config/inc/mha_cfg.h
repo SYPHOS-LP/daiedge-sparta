@@ -52,7 +52,7 @@
 #define MHA_TC_KP_NNZ 5   // K' nonzeros per feature-row (~10% of n=50)
 
 // ---- Types ----------------------------------------------------------------
-typedef ap_int<4> T_MhaWVal;   // on-chip decoded W value buffer (w4 weight, -7..+7)
+typedef ap_uint<8> T_MhaWVal;   // raw value field of a packed weight entry: 4-bit POT code, or an 8-bit plain integer weight
 typedef ap_uint<16> T_MhaIndex;   // DDR weight-CSR col index (dims < 65536; 16-bit keeps the AXI burst byte-aligned)
 typedef ap_uint<10> T_MhaWCol;   // on-chip decoded W col buffer (feature < MHA_FEATURE_W_MAX=768)
 typedef ap_uint<8> T_MhaHeadIndex;   // Q'/K' CSR col idx: K'=token(0..196), Q'=BAND-LOCAL feature(0..63) after head-major emit -> both fit 8 bits

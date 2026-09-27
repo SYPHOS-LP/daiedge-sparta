@@ -93,7 +93,7 @@ defines:
   - { name: MHA_TC_KP_NNZ,       value: 5,  comment: "K' nonzeros per feature-row (~10% of n=50)" }
 
 types:
-  - { name: T_MhaWVal,  kind: ap_int,   width: 4,            comment: "on-chip decoded W value buffer (w4 weight, -7..+7)" }
+  - { name: T_MhaWVal,  kind: ap_uint,  width: 8,            comment: "raw value field of a packed weight entry: 4-bit POT code, or an 8-bit plain integer weight" }
   - { name: T_MhaIndex, kind: ap_uint,  width: 16,           comment: "DDR weight-CSR col index (dims < 65536; 16-bit keeps the AXI burst byte-aligned)" }
   - { name: T_MhaWCol,  kind: ap_uint,  width: 10,           comment: "on-chip decoded W col buffer (feature < MHA_FEATURE_W_MAX=768)" }
   - { name: T_MhaHeadIndex, kind: ap_uint, width: 8,         comment: "Q'/K' CSR col idx: K'=token(0..196), Q'=BAND-LOCAL feature(0..63) after head-major emit -> both fit 8 bits" }

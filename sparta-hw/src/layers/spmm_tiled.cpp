@@ -13,6 +13,11 @@
 
 // The MAC loop unrolls the packed lanes of an activation word by hand.
 static_assert(MHA_BANK_PACK == 8, "code assumes MHA_BANK_PACK == 8");
+// A packed entry holds the value field and an 8-bit block-local column.
+static_assert(MHA_ENTRY_COL_LSB + 8 <= MHA_TILE_ENTRY_BITS,
+              "value + column do not fit MHA_TILE_ENTRY_BITS");
+static_assert((int)T_MhaWVal::width >= MHA_ENTRY_VAL_BITS,
+              "T_MhaWVal must hold the entry's value field");
 
 /* ---------------------------------------------------------------------------------------
  * Tiled SpMM state.
@@ -56,8 +61,8 @@ static int g_slice_cursor0[MHA_TILES];
 static inline void bank_entry(T_MhaTileWord word, int lane, T_MhaWVal &val, T_MhaTileCol &col) {
 #pragma HLS INLINE
     const int lo = lane * MHA_TILE_ENTRY_BITS;
-    val = (T_MhaWVal)   word.range(lo + 3, lo);
-    col = (T_MhaTileCol) word.range(lo + 11, lo + 4);
+    val = (T_MhaWVal)   word.range(lo + MHA_ENTRY_VAL_BITS - 1, lo);
+    col = (T_MhaTileCol) word.range(lo + MHA_ENTRY_COL_LSB + 7, lo + MHA_ENTRY_COL_LSB);
 }
 
 /**
@@ -219,8 +224,12 @@ static inline void mac_pe (
         ap_int<16> mag = ((ap_int<16>) input_word) << e;
         out_row[token_idx] += neg ? (T_MhaAcc)(-mag) : (T_MhaAcc) mag;
 #else
-        /* Multiply - Accumulate */
-        out_row[token_idx] += weight * input_word;
+        /* Plain integer weight: a real multiply, on a DSP.  These weights reach +/-64, so the
+         * value field is 8 bits wide (see MHA_ENTRY_VAL_BITS). */
+        ap_int<8> w    = (ap_int<8>) (ap_uint<8>) weight;
+        T_MhaAcc  prod = (T_MhaAcc) input_word * (T_MhaAcc) w;
+        #pragma HLS BIND_OP variable=prod op=mul impl=dsp
+        out_row[token_idx] += prod;
 #endif
     }
 }

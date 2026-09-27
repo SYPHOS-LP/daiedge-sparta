@@ -19,7 +19,6 @@
 
 // On-chip decoded-weight types must cover the values they narrow the DDR CSR to.
 static_assert(MHA_FEATURE_W_MAX <= (1 << T_MhaWCol::width), "MHA_FEATURE_W_MAX exceeds T_MhaWCol range (widen T_MhaWCol)");
-static_assert((int)T_MhaWVal::width >= 4,       "T_MhaWVal must hold w4 (-7..+7)");
 
 // Per-row weight-decode buffer must cover the densest emitted row (rows are sparse).
 static_assert(MHA_MAX_W_NNZ <= MHA_FEATURE_W_MAX, "MHA_MAX_W_NNZ should not exceed dense row width D");

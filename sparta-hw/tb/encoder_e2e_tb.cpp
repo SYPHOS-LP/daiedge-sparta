@@ -61,6 +61,22 @@ int main(int argc, char** argv) {
     const int D        = read_i32(fi);
     const int d_h      = read_i32(fi);
     (void)read_i32(fi);   // n_heads
+    {   /* Weight entry layout: 0 = power-of-two values (shift datapath), 1 = plain integers
+         * (DSP multiply).  compile_model.py --weights writes it; it must match this build. */
+        const int fmt = read_i32(fi);
+        if (fmt != MHA_ENTRY_FORMAT) {
+            std::fprintf(stderr, "model_index entry_format=%d but this kernel is built for %d "
+                                 "(POT_SHIFT_MAC %s); re-run compile_model.py --weights auto\n",
+                         fmt, MHA_ENTRY_FORMAT,
+#ifdef POT_SHIFT_MAC
+                         "set"
+#else
+                         "not set"
+#endif
+                         );
+            die("weight entry format mismatch");
+        }
+    }
     std::vector<LayerMeta> lm(n_layers);
     for (int L = 0; L < n_layers; L++)
         for (int w = 0; w < 6; w++) { lm[L].w[w].nnz = read_i32(fi); lm[L].w[w].n_rows = read_i32(fi); }

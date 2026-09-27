@@ -24,6 +24,26 @@
 
 #include "mha_cfg.h"
 
+/* Packed weight entry layout, which follows the datapath the kernel is built with.  An entry is
+ * MHA_TILE_ENTRY_BITS wide: the value in the low bits, then the 8-bit block-local column.
+ *
+ *   POT_SHIFT_MAC: the value is a power of two, {sign(bit3), exponent(bits0..2)} -> 4 bits, and
+ *                  the MAC shifts the activation by the exponent.
+ *   otherwise:     the value is the plain integer weight -> 8 bits (these weights reach +/-64, so
+ *                  int4 does not hold them), and the MAC multiplies on a DSP.
+ *
+ * compile_model.py --weights writes the matching layout and records it in model_index.bin, which
+ * the testbench checks against this build.
+ */
+#ifdef POT_SHIFT_MAC
+#define MHA_ENTRY_VAL_BITS 4
+#define MHA_ENTRY_FORMAT   0
+#else
+#define MHA_ENTRY_VAL_BITS 8
+#define MHA_ENTRY_FORMAT   1
+#endif
+#define MHA_ENTRY_COL_LSB  MHA_ENTRY_VAL_BITS
+
 /* Weight matrices whose DDR position is tracked independently, because the stages of the layer
  * interleave: each slot keeps its own per-column-block cursor into its DDR array. */
 enum SpmmWeightSlot {
