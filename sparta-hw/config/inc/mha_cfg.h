@@ -21,7 +21,7 @@
 #define MHA_SPARSE_FORMAT_CSR 1   // CSR format guard for the MHA decode paths
 #define MHA_RECIP_LUT_ADDR_BITS 8   // 256 entries
 #define MHA_RECIP_LUT_SIZE (1 << MHA_RECIP_LUT_ADDR_BITS)
-#define MHA_BANK_PACK 8   // int8 lanes packed per URAM word (64-bit)
+#define MHA_BANK_PACK 8   // tokens packed per activation word: one word is the vector a weight is applied to, so this sets how many multiply-accumulates a lane does per cycle
 #define MHA_ACT_ELEM_BITS 8   // activation bit width (int8)
 #define MHA_BANK_WORD_BITS (MHA_BANK_PACK * MHA_ACT_ELEM_BITS)   // 64-bit packed bank word
 #define MHA_BANK_PAD_TOK (((MHA_TOKEN_W_MAX + MHA_BANK_PACK - 1) / MHA_BANK_PACK) * MHA_BANK_PACK)   // tokens padded up to a multiple of MHA_BANK_PACK (197->200)

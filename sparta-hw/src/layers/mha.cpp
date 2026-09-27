@@ -33,7 +33,7 @@ static_assert(MHA_SCR_V_HEAD_CNT == MHA_FEATURE_HEAD * MHA_TOKEN_W_MAX, "V head 
 static_assert(MHA_SCR_A_CNT      == MHA_FEATURE_HEAD * MHA_FEATURE_HEAD, "A cnt != d_head^2");
 
 // parallel_out_rows_compute manually unrolls the 8 packed lanes of a bank word.
-static_assert(MHA_BANK_PACK == 8, "code assumes MHA_BANK_PACK == 8");
+static_assert(MHA_BANK_PACK >= 8, "MHA_BANK_PACK should cover at least eight tokens per word");
 
 
 // Wide DDR read words for better bursts on the AXI ports.

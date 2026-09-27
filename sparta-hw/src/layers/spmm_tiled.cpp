@@ -11,8 +11,8 @@
 #include <cassert>
 #endif
 
-// The MAC loop unrolls the packed lanes of an activation word by hand.
-static_assert(MHA_BANK_PACK == 8, "code assumes MHA_BANK_PACK == 8");
+// The MAC loop does one multiply-accumulate per token packed in an activation word.
+static_assert(MHA_BANK_PACK == 8, "the MAC loop writes out MHA_BANK_PACK token operations by hand");
 // A packed entry holds the value field and an 8-bit block-local column.
 static_assert(MHA_ENTRY_COL_LSB + 8 <= MHA_TILE_ENTRY_BITS,
               "value + column do not fit MHA_TILE_ENTRY_BITS");
@@ -270,6 +270,13 @@ void tiled_rows_compute (
     #pragma HLS ARRAY_PARTITION variable=partial complete dim=1
     #pragma HLS ARRAY_PARTITION variable=partial complete dim=2
     #pragma HLS ARRAY_PARTITION variable=partial cyclic factor=MHA_BANK_PACK dim=3
+    /* The walk below reads, adds and writes one accumulator per token lane every cycle.  Successive
+     * iterations move to the next activation word, so within a lane they touch a different address;
+     * the same address returns only MHA_BANK_ROW_WORDS iterations later.  Saying so lets the walk
+     * run one iteration per cycle -- without it HLS assumes consecutive iterations may collide and
+     * halves the rate, and the alternatives (all accumulators in registers, or two-port block
+     * memories) cost ~80k registers or 96 memory blocks respectively. */
+    #pragma HLS DEPENDENCE variable=partial type=inter direction=RAW distance=MHA_BANK_ROW_WORDS dependent=true
 
     const int row_words = (tokens_dim + MHA_BANK_PACK - 1) / MHA_BANK_PACK;
 
@@ -327,42 +334,52 @@ void tiled_rows_compute (
     }
 
     /* Walk the step's nonzeros; every lane covers one nonzero's worth of tokens per pass. */
-    MAC_ENTRY:
-    for (int k = 0; k < max_len; k++) {
-        #pragma HLS LOOP_TRIPCOUNT min=(MHA_TC_W_NNZ*MHA_ROWS_PER_STEP/MHA_TILES) max=(MHA_TC_W_NNZ*MHA_ROWS_PER_STEP/MHA_TILES)
-        MAC_WORD:
-        for (int w = 0; w < row_words; w++) {
-            #pragma HLS LOOP_TRIPCOUNT min=MHA_BANK_ROW_WORDS max=MHA_BANK_ROW_WORDS
-            #pragma HLS PIPELINE II=1
-            MAC_LANE:
-            for (int t = 0; t < MHA_TILES; t++) {
-                #pragma HLS UNROLL
-                if (k < lane_len[t]) {
-                    const int    entry = g_bank_cursor[t] + k;
-                    T_MhaWVal    val;
-                    T_MhaTileCol col;
-                    bank_entry(g_bank[t][entry / MHA_TILE_PACK], entry % MHA_TILE_PACK, val, col);
+    /* One pipelined loop over (weight, activation word) pairs.  As two nested loops the inner one's
+     * fill and drain were paid once per weight -- 15 cycles per weight where the work is
+     * MHA_BANK_ROW_WORDS -- and HLS refuses to flatten them because both bounds are runtime values.
+     * Flattening by hand over a compile-time word count lets successive weights flow through the
+     * same pipeline at no hardware cost.  A given token's accumulator recurs every
+     * MHA_BANK_ROW_WORDS iterations, which is distance enough for one iteration per cycle. */
+    const int mac_steps = max_len * MHA_BANK_ROW_WORDS;
 
-                    /* Which of the step's rows this nonzero belongs to. */
-                    int row_sel = 0;
-                    for (int r = 1; r < MHA_ROWS_PER_STEP; r++) {
-                        #pragma HLS UNROLL
-                        if (k >= prefix[t][r]) {
-                            row_sel = r;
-                        }
+    MAC_STEP:
+    for (int idx = 0; idx < mac_steps; idx++) {
+        #pragma HLS LOOP_TRIPCOUNT min=(MHA_TC_W_NNZ*MHA_ROWS_PER_STEP/MHA_TILES*MHA_BANK_ROW_WORDS) max=(MHA_TC_W_NNZ*MHA_ROWS_PER_STEP/MHA_TILES*MHA_BANK_ROW_WORDS)
+        #pragma HLS PIPELINE II=1
+        const int k = idx / MHA_BANK_ROW_WORDS;
+        const int w = idx - k * MHA_BANK_ROW_WORDS;
+
+        MAC_LANE:
+        for (int t = 0; t < MHA_TILES; t++) {
+            #pragma HLS UNROLL
+            if (k < lane_len[t]) {
+                const int    entry = g_bank_cursor[t] + k;
+                T_MhaWVal    val;
+                T_MhaTileCol col;
+                bank_entry(g_bank[t][entry / MHA_TILE_PACK], entry % MHA_TILE_PACK, val, col);
+
+                /* Which of the step's rows this nonzero belongs to. */
+                int row_sel = 0;
+                for (int r = 1; r < MHA_ROWS_PER_STEP; r++) {
+                    #pragma HLS UNROLL
+                    if (k >= prefix[t][r]) {
+                        row_sel = r;
                     }
-
-                    const T_MhaBankWord act = g_act_tile[t][act_base + (int) col * MHA_BANK_ROW_WORDS + w];
-                    const int           tok = w * MHA_BANK_PACK;
-                    mac_pe(act, val, tok + 0, 0, tokens_dim, partial[t][row_sel]);
-                    mac_pe(act, val, tok + 1, 1, tokens_dim, partial[t][row_sel]);
-                    mac_pe(act, val, tok + 2, 2, tokens_dim, partial[t][row_sel]);
-                    mac_pe(act, val, tok + 3, 3, tokens_dim, partial[t][row_sel]);
-                    mac_pe(act, val, tok + 4, 4, tokens_dim, partial[t][row_sel]);
-                    mac_pe(act, val, tok + 5, 5, tokens_dim, partial[t][row_sel]);
-                    mac_pe(act, val, tok + 6, 6, tokens_dim, partial[t][row_sel]);
-                    mac_pe(act, val, tok + 7, 7, tokens_dim, partial[t][row_sel]);
                 }
+
+                const T_MhaBankWord act = g_act_tile[t][act_base + (int) col * MHA_BANK_ROW_WORDS + w];
+                const int           tok = w * MHA_BANK_PACK;
+                /* One multiply-accumulate per token in the word: the activation word is the vector,
+                 * the weight the scalar applied to all of it.  Written out rather than looped: as a
+                 * loop with UNROLL the same eight operations cost ~4.8k LUT more. */
+                mac_pe(act, val, tok + 0, 0, tokens_dim, partial[t][row_sel]);
+                mac_pe(act, val, tok + 1, 1, tokens_dim, partial[t][row_sel]);
+                mac_pe(act, val, tok + 2, 2, tokens_dim, partial[t][row_sel]);
+                mac_pe(act, val, tok + 3, 3, tokens_dim, partial[t][row_sel]);
+                mac_pe(act, val, tok + 4, 4, tokens_dim, partial[t][row_sel]);
+                mac_pe(act, val, tok + 5, 5, tokens_dim, partial[t][row_sel]);
+                mac_pe(act, val, tok + 6, 6, tokens_dim, partial[t][row_sel]);
+                mac_pe(act, val, tok + 7, 7, tokens_dim, partial[t][row_sel]);
             }
         }
     }
