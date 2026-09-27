@@ -37,6 +37,9 @@
 #define MHA_TILE_ENTRY_BITS 16   // packed weight entry: {block-local column (6 b), value (4 b)}
 #define MHA_TILE_PACK 4   // weight entries per 64-bit bank word
 #define MHA_ROW_BLOCKS (MHA_FEATURE_W_MAX / MHA_FEATURE_HEAD)   // row blocks per weight (12; a block = one head's rows)
+#define MHA_COUNT_PACK 16   // counts per transfer when reading them from DDR
+#define MHA_COUNT_WORD_BITS (MHA_COUNT_PACK * 8)   // 128-bit count transfer
+#define MHA_COUNT_HDR_WORDS ((MHA_TILES * 4 + MHA_COUNT_PACK - 1) / MHA_COUNT_PACK)   // words of block offsets in front of the counts
 #define MHA_TILE_NNZ_MAX 2560   // per-bank capacity for one row block; worst cell 2196 (MLP W2) + up to 3 lead-in entries
 #define MHA_TILE_BANK_WORDS (MHA_TILE_NNZ_MAX / MHA_TILE_PACK)   // bank depth in packed words (640, one URAM)
 #define MHA_H_TILE_FEATURES 256   // hidden features per W2 column block (d_h / MHA_TILES)
@@ -60,6 +63,7 @@ typedef ap_uint<MHA_BANK_WORD_BITS> T_MhaBankWord;   // packed bank URAM word: M
 typedef ap_uint<(MHA_TILE_PACK * MHA_TILE_ENTRY_BITS)> T_MhaTileWord;   // packed weight-bank word: MHA_TILE_PACK entries of {col, val} (64-bit)
 typedef ap_uint<8> T_MhaTileCol;   // block-local column: 0..63 for the MHA and W1, 0..255 for the MLP's W2 blocks
 typedef ap_uint<8> T_MhaTileCount;   // nonzeros of one output row inside one block (measured max 62)
+typedef ap_uint<MHA_COUNT_WORD_BITS> T_MhaCountWord;   // one DDR transfer of MHA_COUNT_PACK counts, or of the int32 block offsets
 typedef ap_int<32> T_MhaAcc;   // MAC / scatter accumulator (int8xint8 summed)
 typedef ap_ufixed<32, 1> T_MhaRecip;   // 1/(d+eps) reciprocal LUT output; d is large so recip ~1e-6, needs many frac bits
 typedef ap_fixed<32, 16> T_MhaDiv;   // N*recip ~= N/d ratio (O(1)) before requant

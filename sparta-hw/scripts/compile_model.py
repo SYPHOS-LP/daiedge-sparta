@@ -355,6 +355,9 @@ MLP_TILED_WEIGHTS = ["linear_1", "linear_2"]
 # {8-bit block-local column, 4-bit value} in a 16-bit lane fill a 64-bit word, so one bank is
 # one URAM (72-bit words) and each load reads whole words.
 TILE_PACK = 4
+# Bytes per transfer when the kernel reads the nonzero counts (MHA_COUNT_PACK in mha_cfg.h): the
+# counts are one byte each, so one transfer carries this many of them.
+COUNT_WORD_BYTES = 16
 WMODULE = {
     "w_q": "mha.w_q", "w_k": "mha.w_k", "w_v": "mha.w_v",
     "out_proj": "mha.out_proj", "linear_1": "mlp.linear_1", "linear_2": "mlp.linear_2",
@@ -758,14 +761,25 @@ def emit_layer(model, layer, bw, verify, pot=False, fused=None, pot_scales=None,
         if tiled:
             # Values and columns in one pre-packed array; "counts" holds the per-(block, row)
             # nonzero counts the kernel walks the rows with.
-            # counts = [n_tiles first-word offsets][n_tiles * rows nonzero counts].  The offsets
-            # are prefix sums of each block's padded length, which the kernel would otherwise have
-            # to recompute by reading every count of the weight.
+            # counts blob = [n_tiles first-word offsets, int32, padded to COUNT_WORD_BYTES]
+            #               [one byte per (column block, row) nonzero count]
+            # The offsets are prefix sums of each block's padded length, which the kernel would
+            # otherwise have to recompute by reading every count of the weight.  The counts fit a
+            # byte (a row holds at most the block's width), and the kernel reads them
+            # COUNT_WORD_BYTES at a time, so a row block's counts cost n_tiles * rows / 16 reads
+            # instead of one per count.
             block_words = np.cumsum(
                 np.concatenate(([0], (indptr[:, -1] + TILE_PACK - 1) // TILE_PACK)))[:n_tiles]
+            if ptr.max() > 255:
+                raise ValueError(f"nonzero count {ptr.max()} does not fit a byte")
+            header = block_words.astype("<i4").tobytes()
+            header += b"\x00" * (-len(header) % COUNT_WORD_BYTES)
+            body = ptr.astype("<u1").tobytes()
+            body += b"\x00" * (-len(body) % COUNT_WORD_BYTES)
             ent["bank"]   = bw.put(pack_tiled_bank(vals, idx, pot_weights))
-            ent["counts"] = bw.put(np.concatenate([block_words, ptr]).astype("<i4"))
+            ent["counts"] = bw.put(np.frombuffer(header + body, dtype="<u1"))
             ent["block_words"] = [int(v) for v in block_words]
+            ent["counts_header_bytes"] = len(header)
         else:
             ent["values"] = (bw.put(pot_weight_signexp(vals)) if pot_weights
                              else bw.put(vals.astype(np.int8)))

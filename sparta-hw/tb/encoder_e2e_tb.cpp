@@ -44,8 +44,8 @@ struct LayerMeta { WMeta w[6]; };   // w_q,w_k,w_v,out_proj,linear_1,linear_2
 struct LayerW {
     // All six weights are pre-packed bank words ({column, value} per slot) plus the nonzero counts
     // per (column block, row).
-    std::vector<T_MhaTileWord> bank[6];
-    std::vector<int>           ptr[6];
+    std::vector<T_MhaTileWord>  bank[6];
+    std::vector<T_MhaCountWord> counts[6];
     std::vector<T_Scale>       scales;   // 15
 };
 
@@ -111,9 +111,18 @@ int main(int argc, char** argv) {
             LW[L].bank[w].assign(words + MHA_TILE_PACK, (T_MhaTileWord) 0);
             std::vector<uint64_t> t(words); read_raw(fm, t.data(), words, "w.bank");
             for (int i = 0; i < words; i++) LW[L].bank[w][i] = (T_MhaTileWord) t[i];
-            LW[L].ptr[w].resize(nr + 1);
-            std::vector<int32_t> tp(nr + 1); read_raw(fm, tp.data(), nr + 1, "w.counts");
-            for (int i = 0; i <= nr; i++) LW[L].ptr[w][i] = (int) tp[i];
+            /* The counts blob is bytes: MHA_TILES int32 block offsets padded to a whole transfer,
+             * then one byte per (column block, row) count.  Read it as transfers. */
+            const int count_bytes = MHA_COUNT_HDR_WORDS * MHA_COUNT_PACK
+                                  + (nr + 1) - MHA_TILES;   /* model_index counts the entries */
+            const int count_words = (count_bytes + MHA_COUNT_PACK - 1) / MHA_COUNT_PACK;
+            std::vector<uint8_t> cb(count_words * MHA_COUNT_PACK, 0);
+            read_raw(fm, cb.data(), count_bytes, "w.counts");
+            LW[L].counts[w].assign(count_words, (T_MhaCountWord) 0);
+            for (int i = 0; i < count_bytes; i++) {
+                LW[L].counts[w][i / MHA_COUNT_PACK].range((i % MHA_COUNT_PACK) * 8 + 7,
+                                                          (i % MHA_COUNT_PACK) * 8) = cb[i];
+            }
             (void)read_i32(fm);   // s_row (per-row scale, ignored; scalar scales used)
         }
         // 15 scales: int32 raw ap_fixed<32,16> bit pattern -> reinterpret
@@ -148,12 +157,12 @@ int main(int argc, char** argv) {
             LayerW& w = LW[L];
             encoder_layer_top(
                 cur.data(), D, N, d_h,
-                w.bank[0].data(), w.ptr[0].data(),   // w_q
-                w.bank[1].data(), w.ptr[1].data(),   // w_k
-                w.bank[2].data(), w.ptr[2].data(),   // w_v
-                w.bank[3].data(), w.ptr[3].data(),   // out_proj
-                w.bank[4].data(), w.ptr[4].data(),   // linear_1
-                w.bank[5].data(), w.ptr[5].data(),   // linear_2
+                w.bank[0].data(), w.counts[0].data(),   // w_q
+                w.bank[1].data(), w.counts[1].data(),   // w_k
+                w.bank[2].data(), w.counts[2].data(),   // w_v
+                w.bank[3].data(), w.counts[3].data(),   // out_proj
+                w.bank[4].data(), w.counts[4].data(),   // linear_1
+                w.bank[5].data(), w.counts[5].data(),   // linear_2
                 w.scales.data(),
                 nxt.data(),
                 (L == 0),                            /* first_layer: read the input from memory */

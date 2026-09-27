@@ -72,17 +72,27 @@ static inline void bank_entry(T_MhaTileWord word, int lane, T_MhaWVal &val, T_Mh
  * counts, so this is MHA_TILES reads.  Recomputing them here meant first reading every count of
  * the weight, which cost 83k cycles per layer across the six matrices.
  *
- * @param[in] w_counts  MHA_TILES block offsets, then the nonzeros per (column block, row).
+ * @param[in] w_counts  The counts blob: MHA_TILES int32 block offsets, padded to a whole
+ *                  transfer, then one byte per (column block, row) count.
  * @param[in] which     Weight matrix slot (SpmmWeightSlot).
  */
-void load_weight_bases (int* w_counts, int which) {
+void load_weight_bases (T_MhaCountWord* w_counts, int which) {
 #pragma HLS INLINE off
-    BASE_TILE:
-    for (int t = 0; t < MHA_TILES; t++) {
-        #pragma HLS LOOP_TRIPCOUNT min=MHA_TILES max=MHA_TILES
+    /* The offsets are int32 in the first MHA_COUNT_HDR_WORDS transfers of the blob. */
+    BASE_WORD:
+    for (int w = 0; w < MHA_COUNT_HDR_WORDS; w++) {
+        #pragma HLS LOOP_TRIPCOUNT min=MHA_COUNT_HDR_WORDS max=MHA_COUNT_HDR_WORDS
         #pragma HLS PIPELINE II=1
-        g_block_word0[which][t] = w_counts[t];
-        g_slice_entry[which][t] = 0;
+        const T_MhaCountWord word = w_counts[w];
+        BASE_LANE:
+        for (int p = 0; p < MHA_COUNT_PACK / 4; p++) {
+            #pragma HLS UNROLL
+            const int t = w * (MHA_COUNT_PACK / 4) + p;
+            if (t < MHA_TILES) {
+                g_block_word0[which][t] = (int) word.range(p * 32 + 31, p * 32);
+                g_slice_entry[which][t] = 0;
+            }
+        }
     }
 }
 
@@ -95,14 +105,14 @@ void load_weight_bases (int* w_counts, int which) {
  * hold them, so no unpacking, re-encoding or merging is needed here.
  *
  * @param[in] w_bank       Packed weight entries in DDR, {column, value} per slot, block order.
- * @param[in] w_counts     MHA_TILES block offsets, then the nonzeros per (column block, row).
+ * @param[in] w_counts     The counts blob (see load_weight_bases).
  * @param[in] feature_dim  Output rows of the weight matrix (row stride of w_counts).
  * @param[in] which        Weight matrix slot (SpmmWeightSlot).
  * @param[in] row_base     First output row of this stage.
  * @param[in] rows         Output rows in this stage.
  */
-void load_weight_slice (T_MhaTileWord* w_bank, int* w_counts,
-                               int feature_dim, int which, int row_base, int rows) {
+void load_weight_slice (T_MhaTileWord* w_bank, T_MhaCountWord* w_counts,
+                        int feature_dim, int which, int row_base, int rows) {
 #pragma HLS INLINE off
     /* A bank is 64-bit words, MHA_TILE_BANK_WORDS deep: one URAM each (72 b x 4096), where BRAM
      * would need ~12 BRAM18 per bank for the same data (18 b per port, 1024 deep). */
@@ -118,17 +128,27 @@ void load_weight_slice (T_MhaTileWord* w_bank, int* w_counts,
      * cycle would need 12 concurrent reads on one AXI port. */
     int slice_len[MHA_TILES];
     #pragma HLS ARRAY_PARTITION variable=slice_len complete dim=1
+    /* Counts arrive MHA_COUNT_PACK per transfer.  A block's counts start on a transfer boundary
+     * (the header is a whole number of words, and feature_dim and row_base are multiples of
+     * MHA_COUNT_PACK), so a row block is exactly rows / MHA_COUNT_PACK transfers. */
+    const int count_words = rows / MHA_COUNT_PACK;
     SLICE_COUNT_TILE:
     for (int t = 0; t < MHA_TILES; t++) {
         #pragma HLS LOOP_TRIPCOUNT min=MHA_TILES max=MHA_TILES
+        const int base = MHA_COUNT_HDR_WORDS + (t * feature_dim + row_base) / MHA_COUNT_PACK;
         int len = 0;
-        SLICE_COUNT_ROW:
-        for (int r = 0; r < rows; r++) {
-            #pragma HLS LOOP_TRIPCOUNT min=MHA_FEATURE_HEAD max=MHA_FEATURE_HEAD
+        SLICE_COUNT_WORD:
+        for (int w = 0; w < count_words; w++) {
+            #pragma HLS LOOP_TRIPCOUNT min=(MHA_FEATURE_HEAD/MHA_COUNT_PACK) max=(MHA_FEATURE_HEAD/MHA_COUNT_PACK)
             #pragma HLS PIPELINE II=1
-            const int n = w_counts[MHA_TILES + t * feature_dim + row_base + r];
-            g_bank_count[t][r] = (T_MhaTileCount) n;
-            len += n;
+            const T_MhaCountWord word = w_counts[base + w];
+            SLICE_COUNT_LANE:
+            for (int p = 0; p < MHA_COUNT_PACK; p++) {
+                #pragma HLS UNROLL
+                const T_MhaTileCount n = (T_MhaTileCount) word.range(p * 8 + 7, p * 8);
+                g_bank_count[t][w * MHA_COUNT_PACK + p] = n;
+                len += (int) n;
+            }
         }
         slice_len[t] = len;
     }
