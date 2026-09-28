@@ -71,8 +71,8 @@ defines:
   # The nonzero counts are read this many per transfer: one byte each, so a row block's counts cost
   # MHA_TILES * MHA_FEATURE_HEAD / MHA_COUNT_PACK reads instead of one per count.  The blob starts
   # with the per-column-block DDR offsets as int32, padded to a whole word.
-  - { name: MHA_COUNT_PACK,     value: 16, comment: "counts per transfer when reading them from DDR" }
-  - { name: MHA_COUNT_WORD_BITS, value: "(MHA_COUNT_PACK * 8)", comment: "128-bit count transfer" }
+  - { name: MHA_COUNT_PACK,     value: 8, comment: "counts per transfer when reading them from DDR; 64-bit transfers, since 128-bit ones cost ~5.5k LUT more in the memory interface for ~5k cycles per layer" }
+  - { name: MHA_COUNT_WORD_BITS, value: "(MHA_COUNT_PACK * 8)", comment: "width of one count transfer" }
   - { name: MHA_COUNT_HDR_WORDS, value: "((MHA_TILES * 4 + MHA_COUNT_PACK - 1) / MHA_COUNT_PACK)", comment: "words of block offsets in front of the counts" }
   - { name: MHA_TILE_NNZ_MAX,   value: 2560, comment: "per-bank capacity for one row block; worst cell 2196 (MLP W2) + up to 3 lead-in entries" }
   - { name: MHA_TILE_BANK_WORDS, value: "(MHA_TILE_NNZ_MAX / MHA_TILE_PACK)", comment: "bank depth in packed words (640, one URAM)" }

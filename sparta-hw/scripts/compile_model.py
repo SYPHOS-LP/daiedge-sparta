@@ -357,7 +357,7 @@ MLP_TILED_WEIGHTS = ["linear_1", "linear_2"]
 TILE_PACK = 4
 # Bytes per transfer when the kernel reads the nonzero counts (MHA_COUNT_PACK in mha_cfg.h): the
 # counts are one byte each, so one transfer carries this many of them.
-COUNT_WORD_BYTES = 16
+COUNT_WORD_BYTES = 8
 WMODULE = {
     "w_q": "mha.w_q", "w_k": "mha.w_k", "w_v": "mha.w_v",
     "out_proj": "mha.out_proj", "linear_1": "mlp.linear_1", "linear_2": "mlp.linear_2",

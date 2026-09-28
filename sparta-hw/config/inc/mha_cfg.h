@@ -37,8 +37,8 @@
 #define MHA_TILE_ENTRY_BITS 16   // packed weight entry: {block-local column (6 b), value (4 b)}
 #define MHA_TILE_PACK 4   // weight entries per 64-bit bank word
 #define MHA_ROW_BLOCKS (MHA_FEATURE_W_MAX / MHA_FEATURE_HEAD)   // row blocks per weight (12; a block = one head's rows)
-#define MHA_COUNT_PACK 16   // counts per transfer when reading them from DDR
-#define MHA_COUNT_WORD_BITS (MHA_COUNT_PACK * 8)   // 128-bit count transfer
+#define MHA_COUNT_PACK 8   // counts per transfer when reading them from DDR; 64-bit transfers, since 128-bit ones cost ~5.5k LUT more in the memory interface for ~5k cycles per layer
+#define MHA_COUNT_WORD_BITS (MHA_COUNT_PACK * 8)   // width of one count transfer
 #define MHA_COUNT_HDR_WORDS ((MHA_TILES * 4 + MHA_COUNT_PACK - 1) / MHA_COUNT_PACK)   // words of block offsets in front of the counts
 #define MHA_TILE_NNZ_MAX 2560   // per-bank capacity for one row block; worst cell 2196 (MLP W2) + up to 3 lead-in entries
 #define MHA_TILE_BANK_WORDS (MHA_TILE_NNZ_MAX / MHA_TILE_PACK)   // bank depth in packed words (640, one URAM)
