@@ -168,7 +168,7 @@ static void layer_rows (
     for (int i = 0; i < rows; i++) {
         #pragma HLS LOOP_TRIPCOUNT min=MHA_FEATURE_HEAD max=MHA_FEATURE_HEAD
 
-        tiled_rows_compute(i, 1, tokens_dim, act_base);
+        tiled_rows_compute(i, tokens_dim, act_base);
 
         /* Requantize the accumulated row once, MHA_BANK_PACK values per cycle, into row_q; the
          * tails then only move bytes.  The six tails are mutually exclusive, so giving each its own
@@ -198,7 +198,11 @@ static void layer_rows (
                 T_Activation q    = (T_Activation) 0;   /* as requantized: V, out_proj, MLP output */
                 T_Activation relu = (T_Activation) 0;   /* ReLU'd: K', Q', MLP hidden */
                 if (j < tokens_dim) {
-                    const T_MhaAcc acc = g_proj_rows[0][j];
+                    /* This sweep is also where the engine's lanes are drained, which is why there
+                     * is no merge pass: merging on its own re-read the row this loop reads anyway,
+                     * 12 cycles per output row.  The j < tokens_dim guard makes this cover exactly
+                     * the tokens the engine writes, which is what tiled_lane_sum requires. */
+                    const T_MhaAcc acc = tiled_lane_sum(j);
                     q = requant_to_int8(acc, scale);
                     relu = (acc > (T_MhaAcc) 0) ? q : (T_Activation) 0;
                     row_q[j]    = q;

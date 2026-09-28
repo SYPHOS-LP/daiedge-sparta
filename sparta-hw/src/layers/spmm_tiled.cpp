@@ -40,7 +40,6 @@ static T_MhaTileCount g_bank_count[MHA_TILES][MHA_FEATURE_HEAD];
  * call to tiled_rows_compute() has identical bindings, which is what lets HLS build ONE engine
  * instead of specialising one per call site. */
 static int      g_bank_cursor[MHA_TILES];
-T_MhaAcc g_proj_rows[MHA_ROWS_PER_STEP][MHA_TOKEN_W_MAX];
 
 /* DDR position of the next row block, per weight matrix slot (SpmmWeightSlot) and column block.  g_block_word0 is the column block's first packed word in DDR, g_slice_entry the
  * entry index within the block where the next row block starts, g_slice_cursor0 that entry's lane
@@ -51,6 +50,10 @@ T_MhaAcc g_proj_rows[MHA_ROWS_PER_STEP][MHA_TOKEN_W_MAX];
 static int g_block_word0[SPMM_N_WEIGHTS][MHA_TILES];
 static int g_slice_entry[SPMM_N_WEIGHTS][MHA_TILES];
 static int g_slice_cursor0[MHA_TILES];
+
+/* The engine's accumulators; declared in spmm_tiled.h, which also carries the rule for draining
+ * them (tiled_lane_sum). */
+T_MhaAcc g_lane_partial[MHA_TILES][MHA_TOKEN_W_MAX];
 
 /* Wide DDR views used to fill one packed bank word per read. */
 
@@ -264,15 +267,14 @@ static inline void mac_pe (
  * light row in one block offset a heavy one in another.
  *
  * @param[in]     row_base     First output row of this step.
- * @param[in]     rows_in_step Output rows in this step (<= MHA_ROWS_PER_STEP).
  * @param[in]     tokens_dim   Number of tokens.
  *
- * Reads g_bank / g_act_tile / g_bank_count, advances g_bank_cursor and writes g_proj_rows.
+ * Reads g_bank / g_act_tile / g_bank_count, advances g_bank_cursor and leaves the row's per-lane
+ * partial sums in g_lane_partial, which the caller drains through tiled_lane_sum().
  * act_base selects the activation region inside each tile (see load_activation_tiles).
  */
 void tiled_rows_compute (
     int row_local,
-    int rows_in_step,
     int tokens_dim,
     int act_base
 ) {
@@ -281,22 +283,20 @@ void tiled_rows_compute (
 #pragma HLS ARRAY_PARTITION variable=g_bank       complete dim=1
 #pragma HLS ARRAY_PARTITION variable=g_bank_count complete dim=1
 #pragma HLS ARRAY_PARTITION variable=g_bank_cursor complete dim=1
-#pragma HLS ARRAY_PARTITION variable=g_proj_rows   complete dim=1
-#pragma HLS ARRAY_PARTITION variable=g_proj_rows   cyclic factor=MHA_BANK_PACK dim=2
-
-    /* One partial row per lane: lane t only ever touches partial[t], so the lanes' updates
-     * are independent. */
-    static T_MhaAcc partial[MHA_TILES][MHA_ROWS_PER_STEP][MHA_TOKEN_W_MAX];
-    #pragma HLS ARRAY_PARTITION variable=partial complete dim=1
-    #pragma HLS ARRAY_PARTITION variable=partial complete dim=2
-    #pragma HLS ARRAY_PARTITION variable=partial cyclic factor=MHA_BANK_PACK dim=3
+    /* Lane t only ever touches g_lane_partial[t], so the lanes' updates are independent. */
+#pragma HLS ARRAY_PARTITION variable=g_lane_partial complete dim=1
+#pragma HLS ARRAY_PARTITION variable=g_lane_partial cyclic factor=MHA_BANK_PACK dim=2
     /* The walk below reads, adds and writes one accumulator per token lane every cycle.  Successive
      * iterations move to the next activation word, so within a lane they touch a different address;
      * the same address returns only MHA_BANK_ROW_WORDS iterations later.  Saying so lets the walk
      * run one iteration per cycle -- without it HLS assumes consecutive iterations may collide and
      * halves the rate, and the alternatives (all accumulators in registers, or two-port block
      * memories) cost ~80k registers or 96 memory blocks respectively. */
-    #pragma HLS DEPENDENCE variable=partial type=inter direction=RAW distance=MHA_BANK_ROW_WORDS dependent=true
+    #pragma HLS DEPENDENCE variable=g_lane_partial type=inter direction=RAW distance=MHA_BANK_ROW_WORDS dependent=true
+
+    // One output row per call.  Several rows in flight was measured slower and far larger (see
+    // docs/plans/05-lane-balance.md), so the row index and its bookkeeping are not carried here.
+    static_assert(MHA_ROWS_PER_STEP == 1, "the engine computes one output row per call");
 
     const int row_words = (tokens_dim + MHA_BANK_PACK - 1) / MHA_BANK_PACK;
 
@@ -310,43 +310,14 @@ void tiled_rows_compute (
         }
     }
 
-    CLEAR_PARTIAL_WORD:
-    for (int w = 0; w < row_words; w++) {
-        #pragma HLS LOOP_TRIPCOUNT min=MHA_BANK_ROW_WORDS max=MHA_BANK_ROW_WORDS
-        #pragma HLS PIPELINE II=1
-        for (int t = 0; t < MHA_TILES; t++) {
-            #pragma HLS UNROLL
-            for (int r = 0; r < MHA_ROWS_PER_STEP; r++) {
-                #pragma HLS UNROLL
-                for (int p = 0; p < MHA_BANK_PACK; p++) {
-                    #pragma HLS UNROLL
-                    const int token = w * MHA_BANK_PACK + p;
-                    if (token < tokens_dim) {
-                        partial[t][r][token] = (T_MhaAcc) 0;
-                    }
-                }
-            }
-        }
-    }
-
-    /* Per-lane walk: how many nonzeros this step holds, and where each row starts within them
-     * (prefix[r] is compared against the walk index instead of re-reading the counts). */
+    /* How many nonzeros this row holds in each lane, and the longest of them, which sets the walk. */
     int lane_len[MHA_TILES];
-    int prefix[MHA_TILES][MHA_ROWS_PER_STEP];
     #pragma HLS ARRAY_PARTITION variable=lane_len complete dim=1
-    #pragma HLS ARRAY_PARTITION variable=prefix   complete dim=0
     int max_len = 0;
     LANE_INIT:
     for (int t = 0; t < MHA_TILES; t++) {
         #pragma HLS UNROLL
-        int len = 0;
-        for (int r = 0; r < MHA_ROWS_PER_STEP; r++) {
-            #pragma HLS UNROLL
-            prefix[t][r] = len;
-            if (r < rows_in_step) {
-                len += (int) g_bank_count[t][row_local + r];
-            }
-        }
+        const int len = (int) g_bank_count[t][row_local];
         lane_len[t] = len;
         if (len > max_len) {
             max_len = len;
@@ -378,51 +349,19 @@ void tiled_rows_compute (
                 T_MhaTileCol col;
                 bank_entry(g_bank[t][entry / MHA_TILE_PACK], entry % MHA_TILE_PACK, val, col);
 
-                /* Which of the step's rows this nonzero belongs to. */
-                int row_sel = 0;
-                for (int r = 1; r < MHA_ROWS_PER_STEP; r++) {
-                    #pragma HLS UNROLL
-                    if (k >= prefix[t][r]) {
-                        row_sel = r;
-                    }
-                }
-
                 const T_MhaBankWord act = g_act_tile[t][act_base + (int) col * MHA_BANK_ROW_WORDS + w];
                 const int           tok = w * MHA_BANK_PACK;
                 /* One multiply-accumulate per token in the word: the activation word is the vector,
                  * the weight the scalar applied to all of it.  Written out rather than looped: as a
                  * loop with UNROLL the same eight operations cost ~4.8k LUT more. */
-                mac_pe(act, val, tok + 0, 0, tokens_dim, partial[t][row_sel]);
-                mac_pe(act, val, tok + 1, 1, tokens_dim, partial[t][row_sel]);
-                mac_pe(act, val, tok + 2, 2, tokens_dim, partial[t][row_sel]);
-                mac_pe(act, val, tok + 3, 3, tokens_dim, partial[t][row_sel]);
-                mac_pe(act, val, tok + 4, 4, tokens_dim, partial[t][row_sel]);
-                mac_pe(act, val, tok + 5, 5, tokens_dim, partial[t][row_sel]);
-                mac_pe(act, val, tok + 6, 6, tokens_dim, partial[t][row_sel]);
-                mac_pe(act, val, tok + 7, 7, tokens_dim, partial[t][row_sel]);
-            }
-        }
-    }
-
-    /* Sum the lanes into the output rows, MHA_BANK_PACK tokens per cycle. */
-    MERGE_ROW:
-    for (int r = 0; r < rows_in_step; r++) {
-        #pragma HLS LOOP_TRIPCOUNT min=MHA_ROWS_PER_STEP max=MHA_ROWS_PER_STEP
-        MERGE_WORD:
-        for (int w = 0; w < row_words; w++) {
-            #pragma HLS LOOP_TRIPCOUNT min=MHA_BANK_ROW_WORDS max=MHA_BANK_ROW_WORDS
-            #pragma HLS PIPELINE II=1
-            for (int p = 0; p < MHA_BANK_PACK; p++) {
-                #pragma HLS UNROLL
-                const int token = w * MHA_BANK_PACK + p;
-                if (token < tokens_dim) {
-                    T_MhaAcc sum = (T_MhaAcc) 0;
-                    for (int t = 0; t < MHA_TILES; t++) {
-                        #pragma HLS UNROLL
-                        sum += partial[t][r][token];
-                    }
-                    g_proj_rows[r][token] = sum;
-                }
+                mac_pe(act, val, tok + 0, 0, tokens_dim, g_lane_partial[t]);
+                mac_pe(act, val, tok + 1, 1, tokens_dim, g_lane_partial[t]);
+                mac_pe(act, val, tok + 2, 2, tokens_dim, g_lane_partial[t]);
+                mac_pe(act, val, tok + 3, 3, tokens_dim, g_lane_partial[t]);
+                mac_pe(act, val, tok + 4, 4, tokens_dim, g_lane_partial[t]);
+                mac_pe(act, val, tok + 5, 5, tokens_dim, g_lane_partial[t]);
+                mac_pe(act, val, tok + 6, 6, tokens_dim, g_lane_partial[t]);
+                mac_pe(act, val, tok + 7, 7, tokens_dim, g_lane_partial[t]);
             }
         }
     }

@@ -52,8 +52,38 @@ enum SpmmWeightSlot {
     SPMM_N_WEIGHTS = 6
 };
 
-/* The accumulated output rows of the last tiled_rows_compute() call. */
-extern T_MhaAcc g_proj_rows[MHA_ROWS_PER_STEP][MHA_TOKEN_W_MAX];
+/* Per-lane partial sums of the output row the last tiled_rows_compute() call produced.  They are
+ * the engine's accumulators, so they are kept unmerged: the consumer already sweeps the row once to
+ * requantize and pack it, and summing the lanes in that same sweep costs nothing, where a merge
+ * pass of its own cost a second sweep, 12 cycles per output row.
+ *
+ * Read them only through tiled_lane_sum(), which enforces the other half of that arrangement. */
+extern T_MhaAcc g_lane_partial[MHA_TILES][MHA_TOKEN_W_MAX];
+
+/**
+ * @brief Take one token's accumulator out of the engine: sum the lanes and clear them.
+ *
+ * The engine accumulates into g_lane_partial across a row and never clears it, so every token the
+ * engine may have written has to be drained before the next call to tiled_rows_compute() or the
+ * rows silently add together.  Draining is therefore the consumer's obligation, and doing it here
+ * keeps that rule next to the array instead of in a comment in the consumer's file.
+ *
+ * Inline on purpose: the consumer calls this inside its own pipelined loop, and the adder tree has
+ * to fold into that loop's datapath rather than become a function of its own.
+ *
+ * The caller must cover every token < tokens_dim, since that is exactly the range the engine's MAC
+ * writes.  Tokens past it are never written and must not be drained.
+ */
+static inline T_MhaAcc tiled_lane_sum (int token) {
+#pragma HLS INLINE
+    T_MhaAcc sum = (T_MhaAcc) 0;
+    for (int t = 0; t < MHA_TILES; t++) {
+        #pragma HLS UNROLL
+        sum += g_lane_partial[t][token];
+        g_lane_partial[t][token] = (T_MhaAcc) 0;
+    }
+    return sum;
+}
 
 /* The activation tiles, one memory per column block, in two regions per tile: words
  * [0, MHA_TILE_WORDS) for a 64-feature block, [MHA_H_TILE_BASE, MHA_TILE_WORDS_MAX) for a
@@ -68,6 +98,6 @@ void load_weight_slice (T_MhaTileWord* w_bank, T_MhaCountWord* w_counts,
 
 void load_activation_tiles (T_MhaBankWord* packed_input, int base, int words);
 
-void tiled_rows_compute (int row_local, int rows_in_step, int tokens_dim, int act_base);
+void tiled_rows_compute (int row_local, int tokens_dim, int act_base);
 
 #endif // SPMM_TILED_H
