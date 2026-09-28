@@ -21,6 +21,7 @@ static_assert(MHA_H_TILE_FEATURES % MHA_FEATURE_HEAD == 0,
 static_assert(MLP_HIDDEN_FEATURE_W_MAX == MHA_TILES * MHA_H_TILE_FEATURES,
               "hidden width != MHA_TILES * MHA_H_TILE_FEATURES");
 
+
 /* What a stage does with its accumulated output rows. */
 enum LayerRowsMode {
     ROWS_MHA_K = 0,   /* ReLU + sparsify to CSR, feature-major */
@@ -174,10 +175,15 @@ static void layer_rows (
          * requantize units built 27 multipliers where 8 suffice.  The MLP's hidden output is packed
          * here as well, since its destination takes MHA_BANK_PACK values per word anyway.
          *
-         * requant_to_int8 preserves sign (the scale is positive), so testing the requantized value
-         * against zero is the same ReLU as testing the accumulator. */
+         * The ReLU has to test the ACCUMULATOR, not the requantized value.  requant_to_int8 starts
+         * by casting to T_Scale, which has 16 integer bits, while the accumulators are int32 sums
+         * over feature_dim products and routinely exceed that range, so the cast wraps and a large
+         * negative accumulator can come back positive.  The tails that apply a ReLU therefore keep
+         * the decision on the accumulator, as they did before this pass was shared. */
         T_Activation row_q[MHA_TOKEN_W_MAX];
-        #pragma HLS ARRAY_PARTITION variable=row_q cyclic factor=MHA_BANK_PACK dim=1
+        T_Activation row_relu[MHA_TOKEN_W_MAX];
+        #pragma HLS ARRAY_PARTITION variable=row_q    cyclic factor=MHA_BANK_PACK dim=1
+        #pragma HLS ARRAY_PARTITION variable=row_relu cyclic factor=MHA_BANK_PACK dim=1
 
         REQUANT_ROW:
         for (int w = 0; w < row_words; w++) {
@@ -189,12 +195,15 @@ static void layer_rows (
             for (int p = 0; p < MHA_BANK_PACK; p++) {
                 #pragma HLS UNROLL
                 const int    j = w * MHA_BANK_PACK + p;
-                T_Activation q = (T_Activation) 0;
+                T_Activation q    = (T_Activation) 0;   /* as requantized: V, out_proj, MLP output */
+                T_Activation relu = (T_Activation) 0;   /* ReLU'd: K', Q', MLP hidden */
                 if (j < tokens_dim) {
-                    q = requant_to_int8(g_proj_rows[0][j], scale);
-                    row_q[j] = q;
+                    const T_MhaAcc acc = g_proj_rows[0][j];
+                    q = requant_to_int8(acc, scale);
+                    relu = (acc > (T_MhaAcc) 0) ? q : (T_Activation) 0;
+                    row_q[j]    = q;
+                    row_relu[j] = relu;
                 }
-                const T_Activation relu = (q > (T_Activation) 0) ? q : (T_Activation) 0;
                 packed.range(p * MHA_ACT_ELEM_BITS + MHA_ACT_ELEM_BITS - 1,
                              p * MHA_ACT_ELEM_BITS) = (ap_uint<MHA_ACT_ELEM_BITS>) relu;
                 plain.range(p * MHA_ACT_ELEM_BITS + MHA_ACT_ELEM_BITS - 1,
@@ -216,7 +225,7 @@ static void layer_rows (
             for (int j = 0; j < tokens_dim; j++) {
                 #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_TOKEN max=MHA_TC_TOKEN
                 #pragma HLS PIPELINE II=1
-                const T_Activation quant_out = row_q[j];
+                const T_Activation quant_out = row_relu[j];
                 if (quant_out > (T_Activation) 0) {
 #ifndef __SYNTHESIS__
                     assert(nnz < MHA_HEAD_NNZ_MAX && "K' CSR overflow");
@@ -240,12 +249,10 @@ static void layer_rows (
                     #pragma HLS UNROLL
                     const int j = w * MHA_BANK_PACK + p;
                     if (j < tokens_dim) {
-                        const T_Activation q = row_q[j];
                         if (mode == ROWS_MHA_Q) {
-                            g_q_scratch[i * tokens_dim + j] =
-                                (q > (T_Activation) 0) ? q : (T_Activation) 0;
+                            g_q_scratch[i * tokens_dim + j] = row_relu[j];
                         } else {
-                            g_v_head[i * tokens_dim + j] = q;
+                            g_v_head[i * tokens_dim + j] = row_q[j];
                         }
                     }
                 }

@@ -38,9 +38,12 @@ void residual_add(
             #pragma HLS UNROLL
             const T_Activation av = (T_Activation) a.range(p * 8 + 7, p * 8);
             const T_Activation bv = (T_Activation) b.range(p * 8 + 7, p * 8);
-            const T_Scale sum = (T_Scale)(int) av * residual_scale
-                              + (T_Scale)(int) bv * branch_scale;
-            o.range(p * 8 + 7, p * 8) = (ap_uint<8>) saturate_to_int8(sum);
+            /* Each product is reduced to T_Scale BEFORE the addition.  Folding these into one
+             * expression keeps both products at the multiply's full width and rounds only the sum,
+             * which differs by up to one unit in the last place and changes the odd int8 result. */
+            const T_Scale residual_scaled = (T_Scale)(int) av * residual_scale;
+            const T_Scale branch_scaled   = (T_Scale)(int) bv * branch_scale;
+            o.range(p * 8 + 7, p * 8) = (ap_uint<8>) saturate_to_int8(residual_scaled + branch_scaled);
         }
         residual_output[k] = o;
     }
