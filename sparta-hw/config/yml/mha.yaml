@@ -25,7 +25,13 @@ defines:
   # Sized for 100% ReLU survival, which makes overflow impossible without relying on measured
   # densities (measured peak: Q' 0.45, K' 0.39 in layer 0).
   - { name: MHA_HEAD_NNZ_MAX,  value: "(MHA_FEATURE_HEAD * MHA_TOKEN_W_MAX)", comment: "per-head Q'/K' CSR capacity = fully dense head slice (64*50)" }
-  - { name: MHA_SCR_V_HEAD_CNT, value: "(MHA_FEATURE_HEAD * MHA_TOKEN_W_MAX)", comment: "one head's dense V, and the Q' transpose scratch (int8)" }
+  # V is read MHA_MAC_UNROLL rows at a time by the attention core, so its row stride decides how
+  # those reads spread over the cyclic partitions.  It must be a COMPILE-TIME value or HLS cannot
+  # resolve which partition an access lands in and has to let every access reach every one, which
+  # caps the loop at MHA_MAC_UNROLL / 2 ports = II 8.  Odd, so that consecutive rows land in
+  # different partitions: stride mod MHA_BANK_PACK is then coprime with it and the reads spread.
+  - { name: MHA_V_ROW_STRIDE,   value: "(MHA_TOKEN_W_MAX | 1)", comment: "V row stride: compile-time and odd (see above)" }
+  - { name: MHA_SCR_V_HEAD_CNT, value: "(MHA_FEATURE_HEAD * MHA_V_ROW_STRIDE)", comment: "one head's dense V, and the Q' transpose scratch (int8)" }
 
   # --- MHA weight-row decode buffer bound -----
   - { name: MHA_MAX_W_NNZ, value: 256, comment: "per-row weight-decode buffer depth (measured max 195)" }

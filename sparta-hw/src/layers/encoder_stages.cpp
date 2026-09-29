@@ -262,7 +262,7 @@ static void layer_rows (
                         if (mode == ROWS_MHA_Q) {
                             g_q_scratch[i * tokens_dim + j] = row_relu[j];
                         } else {
-                            g_v_head[i * tokens_dim + j] = row_q[j];
+                            g_v_head[i * MHA_V_ROW_STRIDE + j] = row_q[j];
                         }
                     }
                 }

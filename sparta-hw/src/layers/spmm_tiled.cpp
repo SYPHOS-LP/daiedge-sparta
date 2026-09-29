@@ -134,26 +134,36 @@ void load_weight_slice (T_MhaTileWord* w_bank, T_MhaCountWord* w_counts,
     /* Counts arrive MHA_COUNT_PACK per transfer.  A block's counts start on a transfer boundary
      * (the header is a whole number of words, and feature_dim and row_base are multiples of
      * MHA_COUNT_PACK), so a row block is exactly rows / MHA_COUNT_PACK transfers. */
+    /* One flattened walk over (column block, count word) rather than an inner loop per block.  As
+     * two loops the outer one is not pipelined, so every block paid the DDR read latency again --
+     * ~74 cycles of it, 12 times, for 96 reads of actual work.  Flattened, the reads issue back to
+     * back on the one port and the latencies overlap. */
     const int count_words = rows / MHA_COUNT_PACK;
-    SLICE_COUNT_TILE:
+    const int count_steps = MHA_TILES * count_words;
+
+    SLICE_LEN_INIT:
     for (int t = 0; t < MHA_TILES; t++) {
-        #pragma HLS LOOP_TRIPCOUNT min=MHA_TILES max=MHA_TILES
-        const int base = MHA_COUNT_HDR_WORDS + (t * feature_dim + row_base) / MHA_COUNT_PACK;
+        #pragma HLS UNROLL
+        slice_len[t] = 0;
+    }
+
+    int ct = 0, cw = 0;
+    SLICE_COUNT:
+    for (int i = 0; i < count_steps; i++) {
+        #pragma HLS LOOP_TRIPCOUNT min=(MHA_TILES*MHA_FEATURE_HEAD/MHA_COUNT_PACK) max=(MHA_TILES*MHA_FEATURE_HEAD/MHA_COUNT_PACK)
+        #pragma HLS PIPELINE II=1
+        const int base = MHA_COUNT_HDR_WORDS + (ct * feature_dim + row_base) / MHA_COUNT_PACK;
+        const T_MhaCountWord word = w_counts[base + cw];
         int len = 0;
-        SLICE_COUNT_WORD:
-        for (int w = 0; w < count_words; w++) {
-            #pragma HLS LOOP_TRIPCOUNT min=(MHA_FEATURE_HEAD/MHA_COUNT_PACK) max=(MHA_FEATURE_HEAD/MHA_COUNT_PACK)
-            #pragma HLS PIPELINE II=1
-            const T_MhaCountWord word = w_counts[base + w];
-            SLICE_COUNT_LANE:
-            for (int p = 0; p < MHA_COUNT_PACK; p++) {
-                #pragma HLS UNROLL
-                const T_MhaTileCount n = (T_MhaTileCount) word.range(p * 8 + 7, p * 8);
-                g_bank_count[t][w * MHA_COUNT_PACK + p] = n;
-                len += (int) n;
-            }
+        SLICE_COUNT_LANE:
+        for (int p = 0; p < MHA_COUNT_PACK; p++) {
+            #pragma HLS UNROLL
+            const T_MhaTileCount n = (T_MhaTileCount) word.range(p * 8 + 7, p * 8);
+            g_bank_count[ct][cw * MHA_COUNT_PACK + p] = n;
+            len += (int) n;
         }
-        slice_len[t] = len;
+        slice_len[ct] += len;
+        if (++cw == count_words) { cw = 0; ct++; }
     }
 
     SLICE_PLAN:

@@ -15,7 +15,8 @@
 #define MHA_N_HEADS 12   // attention heads
 #define MHA_FEATURE_HEAD 64   // per-head feature width (MHA_FEATURE_W_MAX / MHA_N_HEADS)
 #define MHA_HEAD_NNZ_MAX (MHA_FEATURE_HEAD * MHA_TOKEN_W_MAX)   // per-head Q'/K' CSR capacity = fully dense head slice (64*50)
-#define MHA_SCR_V_HEAD_CNT (MHA_FEATURE_HEAD * MHA_TOKEN_W_MAX)   // one head's dense V, and the Q' transpose scratch (int8)
+#define MHA_V_ROW_STRIDE (MHA_TOKEN_W_MAX | 1)   // V row stride: compile-time and odd (see above)
+#define MHA_SCR_V_HEAD_CNT (MHA_FEATURE_HEAD * MHA_V_ROW_STRIDE)   // one head's dense V, and the Q' transpose scratch (int8)
 #define MHA_MAX_W_NNZ 256   // per-row weight-decode buffer depth (measured max 195)
 #define MHA_SPARSE_FORMAT_CSR 1   // CSR format guard for the MHA decode paths
 #define MHA_RECIP_LUT_ADDR_BITS 8   // 256 entries

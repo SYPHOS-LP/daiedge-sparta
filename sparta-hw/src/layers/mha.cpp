@@ -29,10 +29,15 @@ static_assert(MHA_FEATURE_HEAD == 64,                  "code assumes d_head == 6
 
 // Per-head buffer sizes must match the head dimensions.
 static_assert(MHA_HEAD_NNZ_MAX   == MHA_FEATURE_HEAD * MHA_TOKEN_W_MAX, "head CSR capacity != 64*N");
-static_assert(MHA_SCR_V_HEAD_CNT == MHA_FEATURE_HEAD * MHA_TOKEN_W_MAX, "V head count != 64*N");
+/* V is stored with a padded row stride rather than tokens_dim; the reasons are in mha.yaml, and
+ * both properties it relies on are asserted here so a config edit cannot quietly undo them. */
+static_assert(MHA_SCR_V_HEAD_CNT == MHA_FEATURE_HEAD * MHA_V_ROW_STRIDE, "V head count != 64 * stride");
+static_assert(MHA_V_ROW_STRIDE >= MHA_TOKEN_W_MAX, "V row stride must cover every token");
+static_assert(MHA_V_ROW_STRIDE % 2 == 1,
+              "V row stride must be odd, or the MHA_MAC_UNROLL reads collide in the partitions");
 static_assert(MHA_SCR_A_CNT      == MHA_FEATURE_HEAD * MHA_FEATURE_HEAD, "A cnt != d_head^2");
 
-// parallel_out_rows_compute manually unrolls the 8 packed lanes of a bank word.
+// The engine's MAC walk manually unrolls the packed lanes of a bank word.
 static_assert(MHA_BANK_PACK >= 8, "MHA_BANK_PACK should cover at least eight tokens per word");
 
 
@@ -100,13 +105,8 @@ void head_core (
     #pragma HLS ARRAY_PARTITION variable=key_value_matrix cyclic factor=MHA_MAC_UNROLL dim=1
     #pragma HLS ARRAY_PARTITION variable=key_sums         complete dim=1
 
-    CLEAR_KEY_VALUE_MATRIX:
-    for (int i = 0; i < MHA_FEATURE_HEAD * MHA_FEATURE_HEAD; i++) {
-        #pragma HLS PIPELINE II=1
-        #pragma HLS UNROLL factor=MHA_MAC_UNROLL
-        key_value_matrix[i] = (T_MhaAcc) 0;
-    }
-
+    /* No clearing pass for key_value_matrix: every entry is written below, from a register
+     * accumulator, rather than accumulated into. */
     CLEAR_KEY_SUMS:
     for (int i = 0; i < MHA_FEATURE_HEAD; i++) {
         #pragma HLS PIPELINE II=1
@@ -120,12 +120,26 @@ void head_core (
         int nz_begin = k_ptr[feature];
         int nz_end   = k_ptr[feature + 1];
 
+        /* One feature's row of the K.V matrix, held in registers while it is accumulated.  In the
+         * matrix itself the accumulation was a read-modify-write of the same memory address on
+         * successive nonzeros, so the loop could not run faster than a BRAM read plus an add plus a
+         * write -- II 3.  In registers each out_feature has its own accumulator and the unroll
+         * visits it once every MHA_FEATURE_HEAD / MHA_MAC_UNROLL iterations, which is slack enough
+         * for the multiply-add's latency. */
+        T_MhaAcc row_acc[MHA_FEATURE_HEAD];
+        #pragma HLS ARRAY_PARTITION variable=row_acc complete dim=1
+        KEY_VALUE_ROW_CLEAR:
+        for (int out_feature = 0; out_feature < MHA_FEATURE_HEAD; out_feature++) {
+            #pragma HLS UNROLL
+            row_acc[out_feature] = (T_MhaAcc) 0;
+        }
+
         KEY_VALUE_NONZERO:
         for (int s = nz_begin; s < nz_end; s++) {
             #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_KP_NNZ max=MHA_TC_KP_NNZ
             int          token   = (int) k_col[s];
             T_Activation key_val = k_val[s];
-            
+
             key_sums[feature] += key_val;
 
             KEY_VALUE_OUT_FEATURE:
@@ -135,9 +149,15 @@ void head_core (
                 #pragma HLS UNROLL factor=MHA_MAC_UNROLL
 
                 /* Multiply-Accumulate K value with MHA_FEATURE_HEAD features of selected token. */
-                key_value_matrix[feature * MHA_FEATURE_HEAD + out_feature] +=
-                    key_val * v_head[out_feature * tokens_dim + token];
+                row_acc[out_feature] += key_val * v_head[out_feature * MHA_V_ROW_STRIDE + token];
             }
+        }
+
+        KEY_VALUE_ROW_STORE:
+        for (int out_feature = 0; out_feature < MHA_FEATURE_HEAD; out_feature++) {
+            #pragma HLS PIPELINE II=1
+            #pragma HLS UNROLL factor=MHA_MAC_UNROLL
+            key_value_matrix[feature * MHA_FEATURE_HEAD + out_feature] = row_acc[out_feature];
         }
     }
 

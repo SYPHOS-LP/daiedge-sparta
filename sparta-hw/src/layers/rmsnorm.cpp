@@ -46,21 +46,36 @@ void rmsnorm (
 
     /* Sum of squares of the raw codes, per token.  No dequantization: the input scale cancels
      * between the sum of squares and its reciprocal square root. */
-    SUM_SQUARE_FEATURE:
-    for (int f = 0; f < feature_dim; f++) {
-        #pragma HLS LOOP_TRIPCOUNT min=RMS_FEATURE_W_MAX max=RMS_FEATURE_W_MAX
-        SUM_SQUARE_WORD:
-        for (int w = 0; w < row_words; w++) {
-            #pragma HLS LOOP_TRIPCOUNT min=RMS_BANK_ROW_WORDS max=RMS_BANK_ROW_WORDS
-            #pragma HLS PIPELINE II=1
-            const T_RmsBankWord word = packed_input[f * RMS_BANK_ROW_WORDS + w];
+    /* One flattened walk over (feature, word).  As two loops the outer one is not pipelined, so the
+     * inner pipeline's fill and drain were paid once per feature -- 12 cycles per feature where the
+     * work is RMS_BANK_ROW_WORDS.  HLS will not flatten them itself because both bounds are runtime
+     * values, so the word axis is walked over its compile-time bound and short rows are predicated
+     * out; that also makes the recurrence distance below a constant.
+     *
+     * The cost of that: the pass now takes time proportional to the CONFIGURED maximum token count
+     * rather than the runtime tokens_dim, so it is a win when the two agree (the kernel is built per
+     * configuration, and this one runs its full RMS_TOKEN_W_MAX) and a loss when a short sequence is
+     * run on a build sized for a long one.  The engine's MAC_STEP makes the same trade. */
+    const int sum_steps = feature_dim * RMS_BANK_ROW_WORDS;
+    int sf = 0, sw = 0;
+
+    SUM_SQUARE_STEP:
+    for (int i = 0; i < sum_steps; i++) {
+        #pragma HLS LOOP_TRIPCOUNT min=(RMS_FEATURE_W_MAX*RMS_BANK_ROW_WORDS) max=(RMS_FEATURE_W_MAX*RMS_BANK_ROW_WORDS)
+        #pragma HLS PIPELINE II=1
+        /* Each lane p is its own partition, and within a lane successive iterations move to the next
+         * word, so one accumulator recurs only every RMS_BANK_ROW_WORDS iterations. */
+        #pragma HLS DEPENDENCE variable=sum_sq type=inter direction=RAW distance=RMS_BANK_ROW_WORDS dependent=true
+        if (sw < row_words) {
+            const T_RmsBankWord word = packed_input[sf * RMS_BANK_ROW_WORDS + sw];
             SUM_SQUARE_LANE:
             for (int p = 0; p < RMS_BANK_PACK; p++) {
                 #pragma HLS UNROLL
                 const T_Activation v = (T_Activation) word.range(p * 8 + 7, p * 8);
-                sum_sq[w * RMS_BANK_PACK + p] += (T_RmsSq) ((int) v * (int) v);
+                sum_sq[sw * RMS_BANK_PACK + p] += (T_RmsSq) ((int) v * (int) v);
             }
         }
+        if (++sw == RMS_BANK_ROW_WORDS) { sw = 0; sf++; }
     }
 
     RSQRT_TOKEN:
