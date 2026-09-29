@@ -48,18 +48,24 @@ static T_Activation   g_q_val[MHA_HEAD_NNZ_MAX];
 static T_MhaHeadIndex g_q_col[MHA_HEAD_NNZ_MAX];
 static int            g_q_ptr[MHA_TOKEN_W_MAX + 1];
 
-/* Packed attention output, all heads: the output projection reads every feature. */
-static T_MhaBankWord g_attn_output[MHA_BANK_WORDS];
+/* Packed per-head attention result, all heads, BEFORE the output projection: that projection reads
+ * every feature, so the heads are gathered here first. */
+static T_MhaBankWord g_attn_heads[MHA_BANK_WORDS];
 
 /* RMSNorm output, packed.  One buffer for both halves of the layer: they run in sequence. */
 static T_MhaBankWord g_norm_input[MHA_BANK_WORDS_ALLOC];
 
-/* The layer's own activations, in the same packed form as everything else on chip: g_act holds the
- * layer input and later the feed-forward branch's output, g_hidden the attention half's output.
- * Keeping them packed is what lets RMSNorm, the residual adds and the tails move MHA_BANK_PACK
- * tokens per cycle; external memory is read once at the start and written once at the end. */
-static T_MhaBankWord g_act[MHA_BANK_WORDS];
-static T_MhaBankWord g_hidden[MHA_BANK_WORDS];
+/* The residual stream, in the same packed form as everything else on chip.  Two buffers, because
+ * each residual add needs its two operands separately, and they alternate roles:
+ *
+ *   g_stream      layer input  ->  (MLP branch output)  ->  layer output
+ *   g_stream_mid  (attention branch output)  ->  stream after the attention residual
+ *
+ * so each holds a branch result until the add that consumes it, then the stream itself.  Keeping
+ * them packed is what lets RMSNorm, the residual adds and the tails move MHA_BANK_PACK tokens per
+ * cycle; external memory is read once at the start and written once at the end. */
+static T_MhaBankWord g_stream[MHA_BANK_WORDS];
+static T_MhaBankWord g_stream_mid[MHA_BANK_WORDS];
 
 
 /**
@@ -217,9 +223,9 @@ static void layer_rows (
             if (mode == ROWS_MLP_H) {
                 g_act_tile[h_tile][MHA_H_TILE_BASE + (h_local + i) * MHA_BANK_ROW_WORDS + w] = relu_word;
             } else if (mode == ROWS_MHA_O) {
-                g_hidden[(row_base + i) * MHA_BANK_ROW_WORDS + w] = quant_word;
+                g_stream_mid[(row_base + i) * MHA_BANK_ROW_WORDS + w] = quant_word;
             } else if (mode == ROWS_MLP_Y) {
-                g_act[(row_base + i) * MHA_BANK_ROW_WORDS + w] = quant_word;
+                g_stream[(row_base + i) * MHA_BANK_ROW_WORDS + w] = quant_word;
             }
         }
 
@@ -320,10 +326,10 @@ void encoder_layer_stages(
     #pragma HLS BIND_STORAGE variable=g_k_col      type=ram_t2p impl=bram
     #pragma HLS BIND_STORAGE variable=g_q_val      type=ram_t2p impl=bram
     #pragma HLS BIND_STORAGE variable=g_q_col      type=ram_t2p impl=bram
-    #pragma HLS BIND_STORAGE   variable=g_attn_output type=ram_t2p impl=uram
-    #pragma HLS ARRAY_PARTITION variable=g_attn_output cyclic factor=MHA_BANK_CYCLIC dim=1
-    #pragma HLS BIND_STORAGE   variable=g_act    type=ram_t2p impl=uram
-    #pragma HLS BIND_STORAGE   variable=g_hidden type=ram_t2p impl=uram
+    #pragma HLS BIND_STORAGE   variable=g_attn_heads type=ram_t2p impl=uram
+    #pragma HLS ARRAY_PARTITION variable=g_attn_heads cyclic factor=MHA_BANK_CYCLIC dim=1
+    #pragma HLS BIND_STORAGE   variable=g_stream    type=ram_t2p impl=uram
+    #pragma HLS BIND_STORAGE   variable=g_stream_mid type=ram_t2p impl=uram
     #pragma HLS BIND_STORAGE   variable=g_norm_input type=ram_t2p impl=uram
     #pragma HLS ARRAY_PARTITION variable=g_norm_input cyclic factor=MHA_BANK_CYCLIC dim=1
 
@@ -345,13 +351,13 @@ void encoder_layer_stages(
     #pragma HLS ALLOCATION instances=rmsnorm            limit=1 function
     #pragma HLS ALLOCATION instances=residual_add       limit=1 function
 
-    /* g_act keeps its contents between calls, and the previous layer left its output there, so only
-     * the first layer reads the activation from external memory and only the last writes it back.
+    /* g_stream keeps its contents between calls, and the previous layer left its output there, so
+     * only the first layer reads the activation from external memory and only the last writes back.
      * Both conversions cost one transfer per byte, the ports carrying bytes. */
     if (first_layer) {
-        pack_activation(input, g_act, tokens_dim, feature_dim);
+        pack_activation(input, g_stream, tokens_dim, feature_dim);
     }
-    rmsnorm(reinterpret_cast<const T_RmsBankWord*>(g_act), tokens_dim, feature_dim,
+    rmsnorm(reinterpret_cast<const T_RmsBankWord*>(g_stream), tokens_dim, feature_dim,
             scales[SCALE_ATT_RMSNORM_OUT_INV_IDX],
             reinterpret_cast<T_RmsBankWord*>(g_norm_input));
     load_activation_tiles(g_norm_input, 0, MHA_TILE_WORDS);
@@ -377,14 +383,14 @@ void encoder_layer_stages(
 
         /* The output projection reads the attention result, not the layer input. */
         if (mode == ROWS_MHA_O && first) {
-            load_activation_tiles(g_attn_output, 0, MHA_TILE_WORDS);
+            load_activation_tiles(g_attn_heads, 0, MHA_TILE_WORDS);
         }
         /* Between the halves: close the attention residual, then normalize for the MLP. */
         if (mode == ROWS_MLP_H && first) {
-            residual_add(g_act, g_hidden, feature_dim * MHA_BANK_ROW_WORDS,
+            residual_add(g_stream, g_stream_mid, feature_dim * MHA_BANK_ROW_WORDS,
                          scales[SCALE_ATT_RESIDUAL_IDX], scales[SCALE_ATT_BRANCH_RATIO_IDX],
-                         g_hidden);
-            rmsnorm(reinterpret_cast<const T_RmsBankWord*>(g_hidden), tokens_dim, feature_dim,
+                         g_stream_mid);
+            rmsnorm(reinterpret_cast<const T_RmsBankWord*>(g_stream_mid), tokens_dim, feature_dim,
                     scales[SCALE_FF_RMSNORM_OUT_INV_IDX],
                     reinterpret_cast<T_RmsBankWord*>(g_norm_input));
             load_activation_tiles(g_norm_input, 0, MHA_TILE_WORDS);
@@ -427,13 +433,13 @@ void encoder_layer_stages(
         head_core(mode == ROWS_MHA_V, head, tokens_dim, scales[SCALE_DIV_OUT_IDX],
                   g_k_val, g_k_col, g_k_ptr,
                   g_q_val, g_q_col, g_q_ptr,
-                  g_v_head, g_attn_output);
+                  g_v_head, g_attn_heads);
     }
 
-    residual_add(g_hidden, g_act, feature_dim * MHA_BANK_ROW_WORDS,
+    residual_add(g_stream_mid, g_stream, feature_dim * MHA_BANK_ROW_WORDS,
                  scales[SCALE_FF_RESIDUAL_IDX], scales[SCALE_FF_BRANCH_RATIO_IDX],
-                 g_act);
+                 g_stream);
     if (last_layer) {
-        unpack_activation(g_act, output, tokens_dim, feature_dim);
+        unpack_activation(g_stream, output, tokens_dim, feature_dim);
     }
 }

@@ -41,9 +41,10 @@ static T_MhaTileCount g_bank_count[MHA_TILES][MHA_FEATURE_HEAD];
  * instead of specialising one per call site. */
 static int      g_bank_cursor[MHA_TILES];
 
-/* DDR position of the next row block, per weight matrix slot (SpmmWeightSlot) and column block.  g_block_word0 is the column block's first packed word in DDR, g_slice_entry the
- * entry index within the block where the next row block starts, g_slice_cursor0 that entry's lane
- * within its packed word.  Reads start at the word boundary below the first entry (up to
+/* DDR position of the next row block, per weight matrix slot (SpmmWeightSlot) and column block.
+ * g_block_word0 is the column block's first packed word in DDR, g_slice_entry the entry index
+ * within the block where the next row block starts, and g_slice_cursor0 that entry's slot within
+ * its packed word.  Reads start at the word boundary below the first entry (up to
  * MHA_TILE_PACK-1 unused entries precede the slice in the bank) so that no data realignment is
  * needed.  The weight matrices are interleaved across stages, so each keeps its own position. */
 static int g_block_word0[SPMM_N_WEIGHTS][MHA_TILES];
