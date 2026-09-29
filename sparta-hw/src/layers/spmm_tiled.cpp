@@ -60,9 +60,9 @@ T_MhaAcc g_lane_partial[MHA_TILES][MHA_TOKEN_W_MAX];
 /**
  * @brief Unpack one weight entry from a bank word: {block-local column, POT value}.
  */
-static inline void bank_entry(T_MhaTileWord word, int lane, T_MhaWVal &val, T_MhaTileCol &col) {
+static inline void bank_entry(T_MhaTileWord word, int slot, T_MhaWVal &val, T_MhaTileCol &col) {
 #pragma HLS INLINE
-    const int lo = lane * MHA_TILE_ENTRY_BITS;
+    const int lo = slot * MHA_TILE_ENTRY_BITS;
     val = (T_MhaWVal)   word.range(lo + MHA_ENTRY_VAL_BITS - 1, lo);
     col = (T_MhaTileCol) word.range(lo + MHA_ENTRY_COL_LSB + 7, lo + MHA_ENTRY_COL_LSB);
 }
@@ -219,8 +219,8 @@ void load_activation_tiles (T_MhaBankWord* packed_input, int base, int words) {
  *
  * @param[in]     input       Packed input
  * @param[in]     weight      Weight used for multiplication
- * @param[in]     token_idx   Token index this chunk maps to
- * @param[in]     chunk       Chunk of packed input to be used
+ * @param[in]     token_idx   Token index this slot maps to
+ * @param[in]     slot        Which of the MHA_BANK_PACK activations in the word to use
  * @param[in]     tokens_dim  Number of tokens, used to skip padding
  * @param[in,out] out_row     Output row
  */
@@ -228,14 +228,14 @@ static inline void mac_pe (
     T_MhaBankWord input,
     T_MhaWVal     weight,
     int           token_idx,
-    int           chunk,
+    int           slot,
     int           tokens_dim,
     T_MhaAcc      out_row[MHA_TOKEN_W_MAX]
 ) {
 #pragma HLS INLINE
     if (token_idx < tokens_dim) {
         /* Unpack */
-        T_Activation input_word = (T_Activation) input.range(chunk * 8 + 7, chunk * 8);
+        T_Activation activation = (T_Activation) input.range(slot * 8 + 7, slot * 8);
 #ifdef POT_SHIFT_MAC
         /* The weight is a power of two, {sign(bit3), exponent(bits0..2)}, so the product is the
          * activation shifted left by the exponent: a barrel shifter instead of a multiplier, and
@@ -243,13 +243,13 @@ static inline void mac_pe (
          * -16384..16256, which fits 16 bits. */
         ap_uint<3> e   = weight.range(2, 0);
         bool       neg = weight[3];
-        ap_int<16> mag = ((ap_int<16>) input_word) << e;
+        ap_int<16> mag = ((ap_int<16>) activation) << e;
         out_row[token_idx] += neg ? (T_MhaAcc)(-mag) : (T_MhaAcc) mag;
 #else
         /* Plain integer weight: a real multiply, on a DSP.  These weights reach +/-64, so the
          * value field is 8 bits wide (see MHA_ENTRY_VAL_BITS). */
         ap_int<8> w    = (ap_int<8>) (ap_uint<8>) weight;
-        T_MhaAcc  prod = (T_MhaAcc) input_word * (T_MhaAcc) w;
+        T_MhaAcc  prod = (T_MhaAcc) activation * (T_MhaAcc) w;
         #pragma HLS BIND_OP variable=prod op=mul impl=dsp
         out_row[token_idx] += prod;
 #endif
@@ -257,20 +257,19 @@ static inline void mac_pe (
 }
 
 /**
- * @brief One step of the tiled SpMM: MHA_ROWS_PER_STEP output rows across MHA_TILES lanes.
+ * @brief Compute one output row of the tiled SpMM across MHA_TILES lanes.
  *
- * Lane t reads only block t's weight bank and only block t's activation tile, so the lanes
- * never contend for a memory and no copy of the activation is needed.  Each lane accumulates
- * into its own partial row; the partials are summed once at the end of the step.  The lanes
- * advance together, so a step costs the busiest lane -- grouping several output rows lets a
- * light row in one block offset a heavy one in another.
+ * Lane t reads only block t's weight bank and only block t's activation tile, so the lanes never
+ * contend for a memory and no copy of the activation is needed.  Each lane accumulates into its own
+ * partial row.  The lanes advance together, so the row costs the busiest lane; removing that cost
+ * is plan B in docs/plans/05-lane-balance.md.
  *
- * @param[in]     row_base     First output row of this step.
- * @param[in]     tokens_dim   Number of tokens.
+ * Reads g_bank / g_act_tile / g_bank_count, advances g_bank_cursor, and leaves the row's per-lane
+ * partial sums in g_lane_partial for the caller to drain through tiled_lane_sum().
  *
- * Reads g_bank / g_act_tile / g_bank_count, advances g_bank_cursor and leaves the row's per-lane
- * partial sums in g_lane_partial, which the caller drains through tiled_lane_sum().
- * act_base selects the activation region inside each tile (see load_activation_tiles).
+ * @param[in] row_local   Output row within the weight slice the banks currently hold (0..rows-1).
+ * @param[in] tokens_dim  Number of tokens.
+ * @param[in] act_base    Which activation region inside each tile (see load_activation_tiles).
  */
 void tiled_rows_compute (
     int row_local,
@@ -308,16 +307,16 @@ void tiled_rows_compute (
     }
 
     /* How many nonzeros this row holds in each lane, and the longest of them, which sets the walk. */
-    int lane_len[MHA_TILES];
-    #pragma HLS ARRAY_PARTITION variable=lane_len complete dim=1
-    int max_len = 0;
+    int lane_nnz[MHA_TILES];
+    #pragma HLS ARRAY_PARTITION variable=lane_nnz complete dim=1
+    int max_nnz = 0;
     LANE_INIT:
     for (int t = 0; t < MHA_TILES; t++) {
         #pragma HLS UNROLL
-        const int len = (int) g_bank_count[t][row_local];
-        lane_len[t] = len;
-        if (len > max_len) {
-            max_len = len;
+        const int nnz = (int) g_bank_count[t][row_local];
+        lane_nnz[t] = nnz;
+        if (nnz > max_nnz) {
+            max_nnz = nnz;
         }
     }
 
@@ -328,20 +327,20 @@ void tiled_rows_compute (
      * Flattening by hand over a compile-time word count lets successive weights flow through the
      * same pipeline at no hardware cost.  A given token's accumulator recurs every
      * MHA_BANK_ROW_WORDS iterations, which is distance enough for one iteration per cycle. */
-    const int mac_steps = max_len * MHA_BANK_ROW_WORDS;
+    const int mac_steps = max_nnz * MHA_BANK_ROW_WORDS;
 
     MAC_STEP:
     for (int idx = 0; idx < mac_steps; idx++) {
         #pragma HLS LOOP_TRIPCOUNT min=(MHA_TC_W_NNZ*MHA_ROWS_PER_STEP/MHA_TILES*MHA_BANK_ROW_WORDS) max=(MHA_TC_W_NNZ*MHA_ROWS_PER_STEP/MHA_TILES*MHA_BANK_ROW_WORDS)
         #pragma HLS PIPELINE II=1
-        const int k = idx / MHA_BANK_ROW_WORDS;
-        const int w = idx - k * MHA_BANK_ROW_WORDS;
+        const int nz = idx / MHA_BANK_ROW_WORDS;   /* which nonzero of this row */
+        const int w  = idx - nz * MHA_BANK_ROW_WORDS;   /* which activation word */
 
         MAC_LANE:
         for (int t = 0; t < MHA_TILES; t++) {
             #pragma HLS UNROLL
-            if (k < lane_len[t]) {
-                const int    entry = g_bank_cursor[t] + k;
+            if (nz < lane_nnz[t]) {
+                const int    entry = g_bank_cursor[t] + nz;
                 T_MhaWVal    val;
                 T_MhaTileCol col;
                 bank_entry(g_bank[t][entry / MHA_TILE_PACK], entry % MHA_TILE_PACK, val, col);
@@ -366,6 +365,6 @@ void tiled_rows_compute (
     CURSOR_ADVANCE:
     for (int t = 0; t < MHA_TILES; t++) {
         #pragma HLS UNROLL
-        g_bank_cursor[t] += lane_len[t];
+        g_bank_cursor[t] += lane_nnz[t];
     }
 }

@@ -23,9 +23,9 @@
 #define MHA_BANK_PACK 8   // tokens packed per activation word: one word is the vector a weight is applied to, so this sets how many multiply-accumulates a lane does per cycle
 #define MHA_ACT_ELEM_BITS 8   // activation bit width (int8)
 #define MHA_BANK_WORD_BITS (MHA_BANK_PACK * MHA_ACT_ELEM_BITS)   // 64-bit packed bank word
-#define MHA_BANK_PAD_TOK (((MHA_TOKEN_W_MAX + MHA_BANK_PACK - 1) / MHA_BANK_PACK) * MHA_BANK_PACK)   // tokens padded up to a multiple of MHA_BANK_PACK (197->200)
-#define MHA_BANK_ROW_WORDS (MHA_BANK_PAD_TOK / MHA_BANK_PACK)   // packed words per feature row (200/8=25)
-#define MHA_BANK_WORDS (MHA_FEATURE_W_MAX * MHA_BANK_ROW_WORDS)   // total packed words in the bank (768*25)
+#define MHA_BANK_PAD_TOK (((MHA_TOKEN_W_MAX + MHA_BANK_PACK - 1) / MHA_BANK_PACK) * MHA_BANK_PACK)   // tokens padded up to a multiple of MHA_BANK_PACK (50->56)
+#define MHA_BANK_ROW_WORDS (MHA_BANK_PAD_TOK / MHA_BANK_PACK)   // packed words per feature row (56/8=7)
+#define MHA_BANK_WORDS (MHA_FEATURE_W_MAX * MHA_BANK_ROW_WORDS)   // total packed words in the bank (768*7)
 #define MHA_MAC_UNROLL 16   // on-chip MAC lanes over tokens + accumulator partition
 #define MHA_BANK_CYCLIC (MHA_MAC_UNROLL / MHA_BANK_PACK)   // word-array cyclic factor = words per MAC-wide read (16/8=2)
 #define MHA_BANK_WORDS_ALLOC (MHA_BANK_WORDS + MHA_BANK_CYCLIC - 1)   // bank array size read by the SpMM: + the spare word(s) the last token tile reads past the final row (value unused)

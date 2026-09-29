@@ -1,16 +1,18 @@
 /**********************************************************************************
  * CSR Bounds
  *
- * Shared dimension bounds for the CSR weight ports of the encoder layers, sized
- * for the ViT-MLP workload (W1 768x3072, W2 3072x768): 
- * MAX_ROWS bounds any matrix's row count / row_ptr length (d_h = 3072),
- * MAX_NNZ bounds the nonzeros of a single CSR row (a W2 row spans up to d_h).
+ * Depth bounds for the kernel's weight ports.  They are AXI port depths only -- HLS uses them to
+ * size bursts, nothing on chip is allocated from them -- so they bound the largest matrix in the
+ * model rather than any one transfer:
+ * MAX_ROWS bounds a weight's output-row count (the MLP's first linear, d_h = 3072),
+ * MAX_NNZ bounds a weight's packed entry count.
+ * Named for the CSR format the weights used before they were packed into block banks.
  *********************************************************************************/
 
 #ifndef CSR_BOUNDS_H
 #define CSR_BOUNDS_H
 
-#define MAX_ROWS 3072   /* max rows in any matrix (d_h); also row_ptr length */
-#define MAX_NNZ  3072   /* max nonzeros buffered for a single CSR row */
+#define MAX_ROWS 3072   /* output rows of the largest weight (d_h) */
+#define MAX_NNZ  3072   /* packed entries of the largest weight */
 
 #endif // CSR_BOUNDS_H

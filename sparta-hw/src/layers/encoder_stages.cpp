@@ -189,8 +189,8 @@ static void layer_rows (
         for (int w = 0; w < row_words; w++) {
             #pragma HLS LOOP_TRIPCOUNT min=MHA_BANK_ROW_WORDS max=MHA_BANK_ROW_WORDS
             #pragma HLS PIPELINE II=1
-            T_MhaBankWord packed = 0;   /* ReLU'd, for the MLP's hidden output */
-            T_MhaBankWord plain  = 0;   /* as requantized, for the two dense outputs */
+            T_MhaBankWord relu_word  = 0;   /* ReLU'd, for the MLP's hidden output */
+            T_MhaBankWord quant_word = 0;   /* as requantized, for the two dense outputs */
             REQUANT_LANE:
             for (int p = 0; p < MHA_BANK_PACK; p++) {
                 #pragma HLS UNROLL
@@ -208,18 +208,18 @@ static void layer_rows (
                     row_q[j]    = q;
                     row_relu[j] = relu;
                 }
-                packed.range(p * MHA_ACT_ELEM_BITS + MHA_ACT_ELEM_BITS - 1,
-                             p * MHA_ACT_ELEM_BITS) = (ap_uint<MHA_ACT_ELEM_BITS>) relu;
-                plain.range(p * MHA_ACT_ELEM_BITS + MHA_ACT_ELEM_BITS - 1,
-                            p * MHA_ACT_ELEM_BITS) = (ap_uint<MHA_ACT_ELEM_BITS>) q;
+                relu_word.range(p * MHA_ACT_ELEM_BITS + MHA_ACT_ELEM_BITS - 1,
+                                p * MHA_ACT_ELEM_BITS) = (ap_uint<MHA_ACT_ELEM_BITS>) relu;
+                quant_word.range(p * MHA_ACT_ELEM_BITS + MHA_ACT_ELEM_BITS - 1,
+                                 p * MHA_ACT_ELEM_BITS) = (ap_uint<MHA_ACT_ELEM_BITS>) q;
             }
             /* The three packed destinations are written here, so those tails cost nothing more. */
             if (mode == ROWS_MLP_H) {
-                g_act_tile[h_tile][MHA_H_TILE_BASE + (h_local + i) * MHA_BANK_ROW_WORDS + w] = packed;
+                g_act_tile[h_tile][MHA_H_TILE_BASE + (h_local + i) * MHA_BANK_ROW_WORDS + w] = relu_word;
             } else if (mode == ROWS_MHA_O) {
-                g_hidden[(row_base + i) * MHA_BANK_ROW_WORDS + w] = plain;
+                g_hidden[(row_base + i) * MHA_BANK_ROW_WORDS + w] = quant_word;
             } else if (mode == ROWS_MLP_Y) {
-                g_act[(row_base + i) * MHA_BANK_ROW_WORDS + w] = plain;
+                g_act[(row_base + i) * MHA_BANK_ROW_WORDS + w] = quant_word;
             }
         }
 
@@ -229,12 +229,12 @@ static void layer_rows (
             for (int j = 0; j < tokens_dim; j++) {
                 #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_TOKEN max=MHA_TC_TOKEN
                 #pragma HLS PIPELINE II=1
-                const T_Activation quant_out = row_relu[j];
-                if (quant_out > (T_Activation) 0) {
+                const T_Activation k_value = row_relu[j];
+                if (k_value > (T_Activation) 0) {
 #ifndef __SYNTHESIS__
                     assert(nnz < MHA_HEAD_NNZ_MAX && "K' CSR overflow");
 #endif
-                    g_k_val[nnz] = quant_out;
+                    g_k_val[nnz] = k_value;
                     g_k_col[nnz] = (T_MhaHeadIndex) j;
                     nnz++;
                 }
@@ -272,16 +272,16 @@ static void layer_rows (
             #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_TOKEN max=MHA_TC_TOKEN
 
             TAIL_Q_FEATURE:
-            for (int bf = 0; bf < MHA_FEATURE_HEAD; bf++) {
+            for (int head_feature = 0; head_feature < MHA_FEATURE_HEAD; head_feature++) {
                 #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_FEATURE_HEAD max=MHA_TC_FEATURE_HEAD
                 #pragma HLS PIPELINE II=1
-                const T_Activation out_data = g_q_scratch[bf * tokens_dim + j];
-                if (out_data > (T_Activation) 0) {
+                const T_Activation q_value = g_q_scratch[head_feature * tokens_dim + j];
+                if (q_value > (T_Activation) 0) {
 #ifndef __SYNTHESIS__
                     assert(nnz < MHA_HEAD_NNZ_MAX && "Q' CSR overflow");
 #endif
-                    g_q_val[nnz] = out_data;
-                    g_q_col[nnz] = (T_MhaHeadIndex) bf;
+                    g_q_val[nnz] = q_value;
+                    g_q_col[nnz] = (T_MhaHeadIndex) head_feature;
                     nnz++;
                 }
             }

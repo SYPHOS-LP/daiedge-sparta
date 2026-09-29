@@ -26,9 +26,9 @@ void residual_add(
         #pragma HLS DEPENDENCE variable=residual_output type=inter false
         #pragma HLS DEPENDENCE variable=branch_input    type=inter false
 
-        const T_MhaBankWord a = residual_input[k];
-        const T_MhaBankWord b = branch_input[k];
-        T_MhaBankWord       o = 0;
+        const T_MhaBankWord res_word    = residual_input[k];
+        const T_MhaBankWord branch_word = branch_input[k];
+        T_MhaBankWord       out_word    = 0;
 
         /* One word carries MHA_BANK_PACK tokens, so the pass costs one cycle per word rather than
          * one per element.  int8 codes in different quantization domains; the folded ratios
@@ -36,15 +36,20 @@ void residual_add(
         RESIDUAL_LANE:
         for (int p = 0; p < MHA_BANK_PACK; p++) {
             #pragma HLS UNROLL
-            const T_Activation av = (T_Activation) a.range(p * 8 + 7, p * 8);
-            const T_Activation bv = (T_Activation) b.range(p * 8 + 7, p * 8);
-            /* Each product is reduced to T_Scale BEFORE the addition.  Folding these into one
-             * expression keeps both products at the multiply's full width and rounds only the sum,
-             * which differs by up to one unit in the last place and changes the odd int8 result. */
-            const T_Scale residual_scaled = (T_Scale)(int) av * residual_scale;
-            const T_Scale branch_scaled   = (T_Scale)(int) bv * branch_scale;
-            o.range(p * 8 + 7, p * 8) = (ap_uint<8>) saturate_to_int8(residual_scaled + branch_scaled);
+            const T_Activation res_v    = (T_Activation) res_word.range(p * 8 + 7, p * 8);
+            const T_Activation branch_v = (T_Activation) branch_word.range(p * 8 + 7, p * 8);
+            /* Each product is reduced to T_Scale BEFORE the addition, which is how the golden data
+             * was produced.  The difference from folding them into one expression is NOT rounding:
+             * an int8 operand times a T_Scale has at most T_Scale's 16 fractional bits, so nothing
+             * is lost narrowing it.  It is overflow -- T_Scale holds 16 integer bits, so a product
+             * past +/-32768 wraps here where the folded form would saturate.  The layer's scales
+             * are of order 1, so the two agree in practice; tb/encoder_units_tb.cpp pins both the
+             * agreement and the wrap.  See docs/plans/00-open-issues.md. */
+            const T_Scale residual_scaled = (T_Scale)(int) res_v * residual_scale;
+            const T_Scale branch_scaled   = (T_Scale)(int) branch_v * branch_scale;
+            out_word.range(p * 8 + 7, p * 8) =
+                (ap_uint<8>) saturate_to_int8(residual_scaled + branch_scaled);
         }
-        residual_output[k] = o;
+        residual_output[k] = out_word;
     }
 }
