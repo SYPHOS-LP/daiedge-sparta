@@ -17,7 +17,6 @@
 #define MHA_HEAD_NNZ_MAX (MHA_FEATURE_HEAD * MHA_TOKEN_W_MAX)   // per-head Q'/K' CSR capacity = fully dense head slice (64*50)
 #define MHA_SCR_V_HEAD_CNT (MHA_FEATURE_HEAD * MHA_TOKEN_W_MAX)   // one head's dense V, and the Q' transpose scratch (int8)
 #define MHA_MAX_W_NNZ 256   // per-row weight-decode buffer depth (measured max 195)
-#define MHA_MAX_W_TOTAL_NNZ 58980   // on-chip full-weight CSR capacity for a dense projection
 #define MHA_SPARSE_FORMAT_CSR 1   // CSR format guard for the MHA decode paths
 #define MHA_RECIP_LUT_ADDR_BITS 8   // 256 entries
 #define MHA_RECIP_LUT_SIZE (1 << MHA_RECIP_LUT_ADDR_BITS)
@@ -56,7 +55,6 @@
 
 // ---- Types ----------------------------------------------------------------
 typedef ap_uint<8> T_MhaWVal;   // raw value field of a packed weight entry: 4-bit POT code, or an 8-bit plain integer weight
-typedef ap_uint<16> T_MhaIndex;   // DDR weight-CSR col index (dims < 65536; 16-bit keeps the AXI burst byte-aligned)
 typedef ap_uint<10> T_MhaWCol;   // on-chip decoded W col buffer (feature < MHA_FEATURE_W_MAX=768)
 typedef ap_uint<8> T_MhaHeadIndex;   // Q'/K' CSR col idx: K'=token(0..196), Q'=BAND-LOCAL feature(0..63) after head-major emit -> both fit 8 bits
 typedef ap_uint<MHA_BANK_WORD_BITS> T_MhaBankWord;   // packed bank URAM word: MHA_BANK_PACK int8 activations (64-bit)

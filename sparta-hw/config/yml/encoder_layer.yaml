@@ -17,5 +17,6 @@ defines:
   # layer dimensions (MAX for buffer sizing; actual counts are runtime args)
   - { name: ENC_FEATURE_W_MAX, value: 768, comment: "maximum feature width (rows, feature-major layout)" }
   - { name: ENC_TOKEN_W_MAX,   value: 50, comment: "maximum token width (columns)" }
+  - { name: ENC_HIDDEN_W_MAX,  value: 3072, comment: "MLP hidden width (d_h); the MLP has no config of its own, it runs on the shared engine" }
 
 types: []

@@ -18,7 +18,7 @@ static_assert(MHA_ROWS_PER_STEP == 1, "the tails assume one output row per engin
 // A W1 row block must fall inside one hidden tile, so a row's packed words go to one memory.
 static_assert(MHA_H_TILE_FEATURES % MHA_FEATURE_HEAD == 0,
               "MHA_H_TILE_FEATURES must be a multiple of MHA_FEATURE_HEAD");
-static_assert(MLP_HIDDEN_FEATURE_W_MAX == MHA_TILES * MHA_H_TILE_FEATURES,
+static_assert(ENC_HIDDEN_W_MAX == MHA_TILES * MHA_H_TILE_FEATURES,
               "hidden width != MHA_TILES * MHA_H_TILE_FEATURES");
 
 
@@ -310,7 +310,7 @@ void encoder_layer_stages(
 #pragma HLS INLINE off
 #ifndef __SYNTHESIS__
     assert(tokens_dim <= MHA_TOKEN_W_MAX && "tokens_dim exceeds MHA_TOKEN_W_MAX");
-    assert(hidden_dim <= MLP_HIDDEN_FEATURE_W_MAX && "hidden_dim exceeds MLP_HIDDEN_FEATURE_W_MAX");
+    assert(hidden_dim <= ENC_HIDDEN_W_MAX && "hidden_dim exceeds ENC_HIDDEN_W_MAX");
 #endif
     #pragma HLS BIND_STORAGE variable=g_v_head     type=ram_t2p impl=bram
     #pragma HLS ARRAY_PARTITION variable=g_v_head cyclic factor=MHA_BANK_PACK dim=1

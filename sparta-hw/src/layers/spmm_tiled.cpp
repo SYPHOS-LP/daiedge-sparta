@@ -46,7 +46,6 @@ static int      g_bank_cursor[MHA_TILES];
  * within its packed word.  Reads start at the word boundary below the first entry (up to
  * MHA_TILE_PACK-1 unused entries precede the slice in the bank) so that no data realignment is
  * needed.  The weight matrices are interleaved across stages, so each keeps its own position. */
-#define MHA_N_WEIGHTS 4
 static int g_block_word0[SPMM_N_WEIGHTS][MHA_TILES];
 static int g_slice_entry[SPMM_N_WEIGHTS][MHA_TILES];
 static int g_slice_cursor0[MHA_TILES];
@@ -297,8 +296,6 @@ void tiled_rows_compute (
     // One output row per call.  Several rows in flight was measured slower and far larger (see
     // docs/plans/05-lane-balance.md), so the row index and its bookkeeping are not carried here.
     static_assert(MHA_ROWS_PER_STEP == 1, "the engine computes one output row per call");
-
-    const int row_words = (tokens_dim + MHA_BANK_PACK - 1) / MHA_BANK_PACK;
 
     /* A slice sits in the banks from the word that contains its first entry, so the walk starts at
      * that entry's lane.  Done here, on the first row, to keep the cursors private to this unit. */

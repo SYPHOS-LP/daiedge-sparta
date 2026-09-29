@@ -22,8 +22,8 @@
 #define ENCODER_STAGES_H
 
 #include "spmm_tiled.h"
-#include "mlp_cfg.h"
 #include "encoder_scales.h"
+#include "encoder_layer_cfg.h"   // ENC_HIDDEN_W_MAX, the bound on the MLP's hidden width
 
 /**
  * @brief Run one encoder layer.

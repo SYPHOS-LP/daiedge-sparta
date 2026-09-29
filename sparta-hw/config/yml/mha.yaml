@@ -30,9 +30,6 @@ defines:
   # --- MHA weight-row decode buffer bound -----
   - { name: MHA_MAX_W_NNZ, value: 256, comment: "per-row weight-decode buffer depth (measured max 195)" }
 
-  # --- on-chip weight-buffer capacity for a full dense projection weight ---
-  - { name: MHA_MAX_W_TOTAL_NNZ, value: 58980, comment: "on-chip full-weight CSR capacity for a dense projection" }
-
   # --- sparse format guard (mha-scoped) ---
   - { name: MHA_SPARSE_FORMAT_CSR, value: 1, comment: "CSR format guard for the MHA decode paths" }
 
@@ -100,7 +97,6 @@ defines:
 
 types:
   - { name: T_MhaWVal,  kind: ap_uint,  width: 8,            comment: "raw value field of a packed weight entry: 4-bit POT code, or an 8-bit plain integer weight" }
-  - { name: T_MhaIndex, kind: ap_uint,  width: 16,           comment: "DDR weight-CSR col index (dims < 65536; 16-bit keeps the AXI burst byte-aligned)" }
   - { name: T_MhaWCol,  kind: ap_uint,  width: 10,           comment: "on-chip decoded W col buffer (feature < MHA_FEATURE_W_MAX=768)" }
   - { name: T_MhaHeadIndex, kind: ap_uint, width: 8,         comment: "Q'/K' CSR col idx: K'=token(0..196), Q'=BAND-LOCAL feature(0..63) after head-major emit -> both fit 8 bits" }
   - { name: T_MhaBankWord, kind: ap_uint, width_expr: "MHA_BANK_WORD_BITS", comment: "packed bank URAM word: MHA_BANK_PACK int8 activations (64-bit)" }

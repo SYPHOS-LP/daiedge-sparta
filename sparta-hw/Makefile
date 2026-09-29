@@ -13,9 +13,9 @@
 #   make clean    - Remove the workspace + generated configs
 #
 # Native regression (g++ against the Vitis HLS headers; no license or device needed):
-#   make native-layer-tb      - synthetic-weight self-checking TB
+#   make native-units         - edge cases the golden data cannot reach
 #   make native-e2e IMAGES=2  - real-model TB on the first IMAGES images in $(E2E_DIR)
-#   make golden-check         - $(E2E_DIR) outputs vs $(E2E_DIR)/golden, bit-exact
+#   make golden-check         - $(E2E_DIR) outputs vs $(GOLDEN_DIR), bit-exact
 #   make regress IMAGES=2     - all three
 #
 # Usage:
@@ -25,7 +25,7 @@
 # ============================================================================
 
 .PHONY: config sim synth full clean help all \
-        native-layer-tb native-e2e golden-check regress \
+        native-units native-e2e golden-check regress \
         $(foreach p,encoder-layer encoder-e2e,config-$(p) sim-$(p) synth-$(p) full-$(p))
 
 # ============================================================================
@@ -47,7 +47,7 @@ HLS_CONFIG  := $(PROJECT_DIR)/hls_config.cfg
 # (encoder_types.yaml -> encoder_types.h is the one naming exception).
 CFG_YML_DIR    := config/yml
 CFG_INC_DIR    := config/inc
-CFG_COMPONENTS := rmsnorm mlp mha encoder_layer
+CFG_COMPONENTS := rmsnorm mha encoder_layer
 CFG_HEADERS    := $(addprefix $(CFG_INC_DIR)/,$(addsuffix _cfg.h,$(CFG_COMPONENTS))) \
                    $(CFG_INC_DIR)/encoder_types.h
 
@@ -105,6 +105,10 @@ full: sim synth
 # ============================================================================
 VITIS_INCLUDE ?= $(firstword $(wildcard $(XILINX_HLS)/include $(XILINX_VITIS)/include /opt/Xilinx/*/Vitis/include))
 E2E_DIR       ?= $(CURDIR)/sim/e2e
+# The reference outputs. They are not always inside E2E_DIR: a payload emitted for a different
+# engine configuration is still checked against the ORIGINAL design's golden, which is the
+# point of the check -- the kernel must stay bit-exact across those changes.
+GOLDEN_DIR    ?= $(E2E_DIR)/golden
 IMAGES        ?= 2
 NATIVE_DIR    := $(WORKSPACE_DIR)/native
 BUILD_DEFINES := $(shell $(PYTHON) -c "import yaml; print(' '.join('-D' + d for d in (yaml.safe_load(open('$(BUILD_CONFIG)')).get('defines') or [])))")
@@ -118,16 +122,16 @@ $(NATIVE_DIR)/%: tb/%.cpp $(KERNEL_SRCS) $(KERNEL_HDRS) $(wildcard tb/*.h) $(BUI
 	@mkdir -p $(NATIVE_DIR)
 	g++ $(NATIVE_CXXFLAGS) $(BUILD_DEFINES) $(NATIVE_INCLUDES) $(KERNEL_SRCS) $< -o $@ -lpthread
 
-native-layer-tb: $(NATIVE_DIR)/encoder_layer_tb
+native-units: $(NATIVE_DIR)/encoder_units_tb
 	$<
 
 native-e2e: $(NATIVE_DIR)/encoder_e2e_tb
 	E2E_DIR=$(E2E_DIR)/ E2E_IMAGES=$(IMAGES) $<
 
 golden-check:
-	$(PYTHON) sim/perm_e2e.py compare --dir $(E2E_DIR) --golden $(E2E_DIR)/golden
+	$(PYTHON) sim/perm_e2e.py compare --dir $(E2E_DIR) --golden $(GOLDEN_DIR)
 
-regress: native-layer-tb native-e2e golden-check
+regress: native-units native-e2e golden-check
 
 # ============================================================================
 # Per-project shorthands (make sim-encoder-layer, etc.)
@@ -166,9 +170,9 @@ help:
 	@echo "  make clean                - remove workspace + generated configs"
 	@echo ""
 	@echo "Native regression (no Vitis license/device needed):"
-	@echo "  make native-layer-tb      - synthetic-weight self-checking TB"
+	@echo "  make native-units         - edge cases the golden data cannot reach"
 	@echo "  make native-e2e IMAGES=2  - real-model TB on the first IMAGES images (E2E_DIR=$(E2E_DIR))"
-	@echo "  make golden-check         - outputs vs E2E_DIR/golden, bit-exact"
+	@echo "  make golden-check         - outputs vs GOLDEN_DIR, bit-exact (default E2E_DIR/golden)"
 	@echo "  make regress IMAGES=2     - all three"
 	@echo ""
 	@echo "Shorthands: make sim-encoder-layer, make synth-encoder-layer, ..."
