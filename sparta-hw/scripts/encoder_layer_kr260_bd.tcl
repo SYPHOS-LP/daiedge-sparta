@@ -122,17 +122,22 @@ if {$dbg} {
         [get_bd_intf_pins axi_timer_0/S_AXI]
 }
 
-# ---- Data path: 7 m_axi masters -> 5 PS slave ports -------------------------
+# ---- Data path: 6 m_axi masters -> 5 PS slave ports -------------------------
 # Each entry is:  <PS port> {<primary master> {<additional masters>}}
 # Bundles are grouped to spread traffic: small load-once buffers together and
-# weights split across ports.  W2 values and row indices are read in the same
-# loop, so they sit on separate bundles.
+# weights split across ports.  The bundle list must match the kernel's
+# `bundle=` pragmas exactly -- get_bd_intf_pins errors on a name that does not
+# exist, so a stale entry here fails the build rather than being skipped.
+#
+# Was 7: w2i_mem carried W2's row indices when the MLP had its own CSR datapath.
+# The MLP now runs on the shared tiled engine and its weights arrive as packed
+# banks on w2_mem, so that bundle is gone.
 set groups {
     S_AXI_HPC0_FPD {sc_mem      {in_mem}}
     S_AXI_HPC1_FPD {y_mem       {}}
     S_AXI_HP0_FPD  {w_mha_mem   {}}
     S_AXI_HP1_FPD  {w1_mem      {}}
-    S_AXI_HP2_FPD  {w2_mem      {w2i_mem}}
+    S_AXI_HP2_FPD  {w2_mem      {}}
 }
 
 # Pass 1: connect the first master on each port with connection automation,
