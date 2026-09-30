@@ -50,6 +50,7 @@ import ctypes
 import os
 import re
 import sys
+import time
 
 import numpy as np
 
@@ -61,6 +62,12 @@ from SPARTALoader import Loader
 ENC_D = 768          # feature width           (ENC_D)
 ENC_N = 50           # tokens                  (ENC_MAX_BATCH)
 ACT_ELEMS = ENC_D * ENC_N   # feature-major int8 activation buffer size
+
+# Fabric clock, for turning measured time into cycles.  Set by the app's device-tree overlay, NOT
+# by anything here -- check it on the board with
+#   sudo cat /sys/kernel/debug/clk/clk_summary | grep -i pl
+# and override with --clock-mhz if it differs.
+CLOCK_HZ = 190e6
 
 
 # ============================================================================
@@ -684,12 +691,19 @@ def run_encoder(model_dir, e2e_dir, n_images=1, bitstream=None, instance=None,
     d_h = {L: mp.layer(L).weights["linear_1"].shape[0] for L in layers}
 
     bad = 0
+    per_image = []
+    # invoke() returns its own ap_start -> ap_done wall time, so summing those separates the
+    # kernel's time from the host's register writes and struct building.  Worth having: the
+    # difference is how much of the frame rate Python is responsible for.
+    per_image_kernel = []
     try:
         for img in range(n_images):
+            t_img = time.monotonic()
             a[:] = inputs[img].reshape(-1)
             a.sync_to_device()
             x_buf, y_buf = a, b
 
+            kernel_s = 0.0
             for L in layers:
                 # The activation stays on chip between layers: only the first reads it
                 # from DDR and only the last writes it back.
@@ -697,12 +711,14 @@ def run_encoder(model_dir, e2e_dir, n_images=1, bitstream=None, instance=None,
                                    first_layer=(L == layers[0]),
                                    last_layer=(L == layers[-1]))
                 try:
-                    kernel.invoke(args)
+                    kernel_s += kernel.invoke(args)
                 except TimeoutError as e:
                     raise RuntimeError(f"image {img} layer {L} hung: {e}") from e
                 x_buf, y_buf = y_buf, x_buf
 
             x_buf.sync_from_device()
+            per_image.append(time.monotonic() - t_img)
+            per_image_kernel.append(kernel_s)
             got = np.array(x_buf[:ACT_ELEMS], dtype=np.int8).reshape(ENC_D, ENC_N)
             diff = int(np.count_nonzero(got != want[img]))
             if diff:
@@ -717,10 +733,24 @@ def run_encoder(model_dir, e2e_dir, n_images=1, bitstream=None, instance=None,
         kernel.close()
 
     print(f"\n{n_images - bad}/{n_images} images bit-exact")
+    if per_image:
+        # Wall clock per image, which includes the host's per-layer register writes and the
+        # ap_start/ap_done handshake -- so it is the end-to-end rate, not the fabric's alone.
+        best, mean = min(per_image), sum(per_image) / len(per_image)
+        print(f"per image: {1000 * mean:.1f} ms mean, {1000 * best:.1f} ms best"
+              f"  ({1.0 / mean:.1f} FPS mean, {1.0 / best:.1f} FPS best)")
+        print(f"per layer: {1000 * mean / 12:.2f} ms mean over {len(per_image)} image(s)")
+        kmean = sum(per_image_kernel) / len(per_image_kernel)
+        print(f"  of which kernel (ap_start -> ap_done): {1000 * kmean:.1f} ms "
+              f"({100 * kmean / mean:.1f} %), host {1000 * (mean - kmean):.1f} ms")
+        print(f"  kernel per layer: {1000 * kmean / 12:.2f} ms"
+              f"  =  {kmean / 12 * CLOCK_HZ / 1e6:.2f} M cycles at "
+              f"{CLOCK_HZ / 1e6:.0f} MHz")
     return bad
 
 
 def main():
+    global CLOCK_HZ
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-d", "--model-dir", default=None,
@@ -751,6 +781,9 @@ def main():
                          "checked against the ORIGINAL design's golden")
     ap.add_argument("-n", "--images", type=int, default=1,
                     help="how many images from the payload to run (default 1)")
+    ap.add_argument("--clock-mhz", type=float, default=CLOCK_HZ / 1e6,
+                    help="fabric clock, for reporting cycles (default %(default)s); the app's "
+                         "device-tree overlay sets the real one")
     ap.add_argument("--hw-header", default=None,
                     help="HLS-generated xencoder_layer_top_hw.h to read the register "
                          "offsets from (default: the built-in REGMAP)")
@@ -760,6 +793,7 @@ def main():
     if not args.bitstream and not args.no_download:
         ap.error("-b/--bitstream is required unless --no-download is given")
     base = int(args.base_addr, 0) if args.base_addr else None
+    CLOCK_HZ = args.clock_mhz * 1e6
 
     if args.selftest:
         kernel = HwKernel(args.bitstream, instance=args.instance,
