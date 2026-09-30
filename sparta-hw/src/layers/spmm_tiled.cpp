@@ -181,17 +181,45 @@ void load_weight_slice (T_MhaTileWord* w_bank, T_MhaCountWord* w_counts,
         slice_words[t]     = (lane + slice_len[t] + MHA_TILE_PACK - 1) / MHA_TILE_PACK;
     }
 
-    /* One read per bank word: compile_model.py emits the entries already packed. */
-    BANK_TILE:
+    /* One read per bank word: compile_model.py emits the entries already packed.
+     *
+     * One flattened walk over (column block, word) rather than a loop per block.  As two loops the
+     * outer one is not pipelined, so every block paid the DDR read latency again -- measured at 74
+     * cycles from this loop's own latency (trip + 74 at every trip count), so 12 x 74 = 888 cycles
+     * a stage, ~96 k a layer, for ~1 250 words of actual work.  Flattened, the reads issue back to
+     * back and the latencies overlap.  This is the same defect fixed in SLICE_COUNT above and in
+     * three other loops (see docs/plans/04-tiled-mlp.md); it survived longest here because
+     * BANK_WORD's trip count is a runtime value, so csynth reports no latency for it and it never
+     * appears in a loop table sorted by cost.
+     *
+     * Prefix sums rather than running counters: a column block CAN have zero words (an empty row
+     * block in that block), and a single increment cannot skip past one. */
+    int bank_prefix[MHA_TILES + 1];
+    #pragma HLS ARRAY_PARTITION variable=bank_prefix complete dim=1
+    bank_prefix[0] = 0;
+    BANK_PREFIX:
     for (int t = 0; t < MHA_TILES; t++) {
-        #pragma HLS LOOP_TRIPCOUNT min=MHA_TILES max=MHA_TILES
-        const int words = slice_words[t];
-        BANK_WORD:
-        for (int w = 0; w < words; w++) {
-            #pragma HLS LOOP_TRIPCOUNT min=64 avg=104 max=MHA_TILE_BANK_WORDS
-            #pragma HLS PIPELINE II=1
-            g_bank[t][w] = w_bank[slice_word0[t] + w];
+        #pragma HLS UNROLL
+        bank_prefix[t + 1] = bank_prefix[t] + slice_words[t];
+    }
+    const int bank_words = bank_prefix[MHA_TILES];
+
+    BANK_LOAD:
+    for (int i = 0; i < bank_words; i++) {
+        #pragma HLS LOOP_TRIPCOUNT min=(MHA_TILES*64) avg=(MHA_TILES*104) max=(MHA_TILES*MHA_TILE_BANK_WORDS)
+        #pragma HLS PIPELINE II=1
+        /* Which column block this word belongs to: the last t whose prefix has been passed.
+         * Twelve comparisons, unrolled, so it is combinational rather than a search. */
+        int t = 0;
+        BANK_WHICH:
+        for (int k = 1; k < MHA_TILES; k++) {
+            #pragma HLS UNROLL
+            if (i >= bank_prefix[k]) {
+                t = k;
+            }
         }
+        const int w = i - bank_prefix[t];
+        g_bank[t][w] = w_bank[slice_word0[t] + w];
     }
 }
 
@@ -339,6 +367,7 @@ void tiled_rows_compute (
      * same pipeline at no hardware cost.  A given token's accumulator recurs every
      * MHA_BANK_ROW_WORDS iterations, which is distance enough for one iteration per cycle. */
     const int mac_steps = max_nnz * MHA_BANK_ROW_WORDS;
+
 
     MAC_STEP:
     for (int idx = 0; idx < mac_steps; idx++) {
