@@ -2,14 +2,18 @@
 """Python host: run the 12-layer ViT encoder on the Kria (xck26) accelerator.
 
 Pipeline:
-    input image -> [preprocess stub] -> X (768x197 int8, feature-major)
+    X (768x50 int8, feature-major)
     for L in 0..11:  X = encoder_layer_top(X, weights[L], scales[L])   (on FPGA)
-    Y -> [postprocess stub] -> logits
+
+Run as a script this checks the accelerator against the simulation's golden data,
+which needs nothing but numpy and pynq.  Classifying a real image needs the SW
+embedding and classifier head as well -- that is infer_hw.py, which imports this
+file for the hardware seam and brings the image pipeline with it.
 
 Division of labour (all Python; PYNQ is the only hardware dependency):
   - SPARTALoader.Loader   : parse model.bin / manifest -> numpy views.
   - this file (Python)    : allocate + fill DDR buffers (PYNQ), the 12-layer loop,
-                            ping-pong activations, pre/post.
+                            ping-pong activations, golden comparison.
   - HwKernel (this file)  : the ONE hardware seam — programs the PL from the .bit
                             and invokes encoder_layer_top by writing the PHYSICAL
                             DDR ADDRESSES of those buffers into its s_axi_control
@@ -24,10 +28,19 @@ from the HLS-generated xencoder_layer_top_hw.h; see REGMAP below.
 Requires: pynq (on-device) and numpy.  pynq is imported lazily so this file can
 be linted/inspected on the dev host without it present.
 
-BRING-UP: on a new bitstream, check the control path before anything else --
-    sudo python3 SPARTA.py -b enc_system_wrapper.bit --selftest
-which write/read-backs every argument register without touching DDR or starting
-the kernel.  If that fails, no datapath debugging is worth doing yet.
+BRING-UP, in this order:
+  1. control path only -- no DDR, no ap_start:
+       sudo -E python3 SPARTA.py --no-download --selftest --hw-header <x..._hw.h>
+     If this fails, no datapath debugging is worth doing yet.
+  2. datapath against the simulation's golden:
+       sudo -E python3 SPARTA.py --no-download -d <payload> -e <sim/e2e_tiled12> \
+            --golden-dir <sim/e2e/golden> --hw-header <x..._hw.h>
+  3. real images end to end: infer_hw.py (needs torch + brevitas as well).
+
+PASS --hw-header WHEREVER POSSIBLE.  The built-in REGMAP is a transcription and
+goes stale the moment an argument is added or removed; the generated header
+cannot.  With the header a mismatch is refused at construction, without it the
+arguments are silently written to the wrong registers.
 """
 
 from __future__ import annotations
@@ -66,6 +79,10 @@ ACT_ELEMS = ENC_D * ENC_N   # feature-major int8 activation buffer size
 # `scales`), and the DDR h_val/h_col/h_ptr CSR (H now streams on-chip through
 # the MLP's DATAFLOW region).  SPARTALoader still exposes gammas/scale_rows
 # from model.bin -- they are simply no longer kernel arguments.
+#
+# All six weights are packed banks: the MLP's two linears moved onto the shared
+# tiled engine, so W1/W2 take {bank, counts} like the MHA's four rather than the
+# {values, col_idx, row_ptr} CSR triplets they used before.
 # ============================================================================
 class SpartaLayerArgs(ctypes.Structure):
     _fields_ = [
@@ -77,8 +94,8 @@ class SpartaLayerArgs(ctypes.Structure):
         ("wk_bank", ctypes.c_uint64), ("wk_counts", ctypes.c_uint64),
         ("wv_bank", ctypes.c_uint64), ("wv_counts", ctypes.c_uint64),
         ("wo_bank", ctypes.c_uint64), ("wo_counts", ctypes.c_uint64),
-        ("w1_values", ctypes.c_uint64), ("w1_col_idx", ctypes.c_uint64), ("w1_row_ptr", ctypes.c_uint64),
-        ("w2_values", ctypes.c_uint64), ("w2_col_idx", ctypes.c_uint64), ("w2_row_ptr", ctypes.c_uint64),
+        ("w1_bank", ctypes.c_uint64), ("w1_counts", ctypes.c_uint64),
+        ("w2_bank", ctypes.c_uint64), ("w2_counts", ctypes.c_uint64),
         ("scales", ctypes.c_uint64),
         ("output", ctypes.c_uint64),
         # The kernel keeps the activation on-chip between layers: only the first layer reads it
@@ -109,20 +126,30 @@ AP_CONTINUE = 0x10       # bit4  W/SC  -- releases the latched done state
 # name -> (offset, is_64bit).  Order is documentation only: the AXI-Lite map is
 # addressed, not positional, so unlike the XRT set_arg path a misordered entry
 # here cannot silently shift the other arguments.
+# Transcribed from workspace/encoder_layer/hls/impl/misc/drivers/
+# encoder_layer_top_v1_0/src/xencoder_layer_top_hw.h of the CURRENT build.
+#
+# This table is a convenience for bring-up; prefer --hw-header, which reads the
+# generated header directly and therefore cannot drift.  It matters because the
+# offsets shift whenever an argument is added or removed: when the MLP's two CSR
+# triplets became {bank, counts} pairs the list lost two entries, and every
+# offset from w2_bank onward moved down by two slots.  A table left at the old
+# offsets does not fail -- it silently aims `output` and `scales` at whatever
+# address the neighbouring argument left behind.
 REGMAP = {
     "input":            (0x010, True),
     "feature_dim":      (0x01c, False),
     "tokens_dim":       (0x024, False),
     "intermediate_dim": (0x02c, False),
-    "wq_bank":   (0x034, True), "wq_counts": (0x040, True),
-    "wk_bank":   (0x04c, True), "wk_counts": (0x058, True),
-    "wv_bank":   (0x064, True), "wv_counts": (0x070, True),
-    "wo_bank":   (0x07c, True), "wo_counts": (0x088, True),
-    "w1_values": (0x094, True), "w1_col_idx": (0x0a0, True), "w1_row_ptr": (0x0ac, True),
-    "w2_values": (0x0b8, True), "w2_col_idx": (0x0c4, True), "w2_row_ptr": (0x0d0, True),
-    "scales":    (0x0dc, True),
-    "output":    (0x0e8, True),
-    "first_layer": (0x0f4, False), "last_layer": (0x0fc, False),
+    "wq_bank": (0x034, True), "wq_counts": (0x040, True),
+    "wk_bank": (0x04c, True), "wk_counts": (0x058, True),
+    "wv_bank": (0x064, True), "wv_counts": (0x070, True),
+    "wo_bank": (0x07c, True), "wo_counts": (0x088, True),
+    "w1_bank": (0x094, True), "w1_counts": (0x0a0, True),
+    "w2_bank": (0x0ac, True), "w2_counts": (0x0b8, True),
+    "scales":  (0x0c4, True),
+    "output":  (0x0d0, True),
+    "first_layer": (0x0dc, False), "last_layer": (0x0e4, False),
 }
 
 
@@ -227,7 +254,10 @@ class HwKernel:
         On the attach path the timer base is passed explicitly (--timer-base).  
         On the overlay path we try to discover an axi_timer IP from the metadata.  
         Absent either, self.timer stays None and invoke() reports no cycles,
-        so a non-debug bitstream just works with the timing feature silently off."""
+        so a non-debug bitstream just works with the timing feature silently off.
+
+        The host reads the counter itself, around ap_start and ap_done; the kernel
+        is not involved and has no timer argument."""
         base = self._timer_base
         if base is None and self.overlay is not None:
             # Best-effort discovery in the overlay's IP dict.
@@ -246,18 +276,6 @@ class HwKernel:
         # LOAD0 (bit5) pulses TLR0 -> TCR0, then drop it and enable+auto-reload.
         self.timer.write(self.TMR_TCSR0, (1 << 5))
         self.timer.write(self.TMR_TCSR0, self.TMR_TCSR0_RUN)
-
-        # The kernel reads the timer over its OWN m_axi port whose base address
-        # is an s_axilite offset register (dbg_timer @ 0x160, 64-bit). We must 
-        # write the timer's physical base there so the kernel's per-block TCR0 
-        # reads hit the real timer.
-        self.DBG_TIMER_ARG = 0x160
-        try:
-            self.ip.write(self.DBG_TIMER_ARG,     base & 0xFFFFFFFF)
-            self.ip.write(self.DBG_TIMER_ARG + 4, (base >> 32) & 0xFFFFFFFF)
-        except Exception as e:
-            print(f"  [dbg-blk] warning: could not write dbg_timer reg 0x160: {e}",
-                  flush=True)
 
     def _timer_cycles(self):
         """Read Timer0's free-running counter (32-bit), or None if no timer."""
@@ -518,25 +536,32 @@ class HwKernel:
 
 
 # ============================================================================
-# pre / post processing  (STUBS — fill in with the real image pipeline)
+# Reference vectors from the simulation payload
+#
+# The image pipeline (patch embed, quantizer, classifier head) lives in
+# infer_hw.py, which borrows it from the sparta-sw brevitas model.  What is here
+# instead is the check that needs no torch: the encoder inputs and expected
+# outputs that sim/ already produced, so the board can be held to the same
+# bit-exact standard as the native testbench.
 # ============================================================================
-def preprocess(image) -> np.ndarray:
-    """image -> X : (ENC_D*ENC_N,) int8 feature-major activations for layer 0.
-
-    STUB.  The real path is: patch-embed + cls token + pos-embed + the input
-    quantizer (quant_input scale) that turns the embedded tokens into int8.
-    Returns zeros of the right shape/type so the plumbing runs end-to-end.
-    """
-    return np.zeros(ACT_ELEMS, dtype=np.int8)
+MAGIC_INPUTS = 0x45324E49    # 'IN2E', sim/emit_e2e.py
+MAGIC_OUTPUT = 0x45324F55    # 'OU2E', tb/encoder_e2e_tb.cpp
 
 
-def postprocess(y: np.ndarray):
-    """Y (final encoder output, int8 feature-major) -> logits / class.
-
-    STUB.  The real path is: take the cls-token row, layernorm + classifier head
-    (dequant with the head scales), argmax -> CIFAR-10 class.
-    """
-    return None
+def read_e2e_blob(path, magic):
+    """(n_images, D, N) int8 from an inputs.bin / hw_out.bin, header checked."""
+    import struct
+    blob = open(path, "rb").read()
+    if len(blob) < 16:
+        raise SystemExit(f"{path}: too short to hold a header")
+    m, n, d, tokens = struct.unpack("<I3i", blob[:16])
+    if m != magic:
+        raise SystemExit(f"{path}: bad magic {m:#x} (expected {magic:#x})")
+    body = np.frombuffer(blob[16:], dtype=np.int8)
+    if body.size < n * d * tokens:
+        raise SystemExit(f"{path}: holds {body.size} bytes, header claims "
+                         f"{n}x{d}x{tokens} = {n * d * tokens}")
+    return body[:n * d * tokens].reshape(n, d, tokens)
 
 
 # ============================================================================
@@ -586,7 +611,7 @@ def _stage_layer(alloc, layer):
 def stage_model(alloc, loader):
     """Stage every layer's payload into DDR once: {layer: named device buffers}.
 
-    The whole 12-layer model is ~26 MB, so it stays resident for the lifetime of the
+    The whole 12-layer model is ~18 MB, so it stays resident for the lifetime of the
     kernel and per-image work is only activation I/O.  Free with free_staged()."""
     return {L: _stage_layer(alloc, loader.layer(L)) for L in loader.layer_indices()}
 
@@ -615,25 +640,39 @@ def _build_args(x_buf, y_buf, lb, n_tokens, d, d_h, first_layer=1, last_layer=1)
         wk_bank=_addr(lb["w_k.bank"]), wk_counts=_addr(lb["w_k.counts"]),
         wv_bank=_addr(lb["w_v.bank"]), wv_counts=_addr(lb["w_v.counts"]),
         wo_bank=_addr(lb["out_proj.bank"]), wo_counts=_addr(lb["out_proj.counts"]),
-        w1_values=_addr(lb["linear_1.values"]), w1_col_idx=_addr(lb["linear_1.col"]), w1_row_ptr=_addr(lb["linear_1.rowptr"]),
-        w2_values=_addr(lb["linear_2.values"]), w2_col_idx=_addr(lb["linear_2.col"]), w2_row_ptr=_addr(lb["linear_2.rowptr"]),
+        w1_bank=_addr(lb["linear_1.bank"]), w1_counts=_addr(lb["linear_1.counts"]),
+        w2_bank=_addr(lb["linear_2.bank"]), w2_counts=_addr(lb["linear_2.counts"]),
         scales=_addr(lb["scales"]),
         first_layer=int(first_layer), last_layer=int(last_layer),
         output=_addr(y_buf),
     )
 
 
-def run_encoder(model_dir, image=None, bitstream=None, instance=None,
-                download=True, base_addr=None, hw_header=None):
-    """Load payload, run the 12 encoder layers on the FPGA, return postprocess(Y).
+def run_encoder(model_dir, e2e_dir, n_images=1, bitstream=None, instance=None,
+                download=True, base_addr=None, hw_header=None, golden_dir=None):
+    """Run encoder inputs from the simulation payload and compare against its golden.
 
-    Python allocates/fills all DDR buffers (PYNQ) and drives the loop; HwKernel
-    performs each kernel invocation over AXI-Lite."""
+    This is the datapath check that needs no torch: `e2e_dir/inputs.bin` holds the
+    exact int8 encoder inputs the native testbench uses, and the golden holds what
+    it produced, so the board is held to the same bit-exact standard.  A pass means
+    the whole chain agrees -- register map, buffer addresses, weight payload and
+    arithmetic.  For classifying real images use infer_hw.py, which brings the
+    image pipeline with it.
+
+    Returns the number of mismatching images (0 on success).
+    """
     from pynq import allocate            # on-device only; import lazily.
+
+    inputs = read_e2e_blob(os.path.join(e2e_dir, "inputs.bin"), MAGIC_INPUTS)
+    want = read_e2e_blob(os.path.join(golden_dir or os.path.join(e2e_dir, "golden"),
+                                      "hw_out.bin"), MAGIC_OUTPUT)
+    if inputs.shape[1:] != (ENC_D, ENC_N):
+        raise SystemExit(f"payload is {inputs.shape[1]}x{inputs.shape[2]}, "
+                         f"this build is ENC_D={ENC_D} x ENC_N={ENC_N}")
+    n_images = min(n_images, inputs.shape[0], want.shape[0])
 
     mp = Loader(model_dir)
     layers = mp.layer_indices()
-
     kernel = HwKernel(bitstream, instance=instance, download=download,
                       base_addr=base_addr,
                       regmap=load_regmap(hw_header) if hw_header else None)
@@ -641,35 +680,44 @@ def run_encoder(model_dir, image=None, bitstream=None, instance=None,
     # activation ping-pong: X (in) / Y (out).
     a = _allocate(allocate, ACT_ELEMS, np.int8)
     b = _allocate(allocate, ACT_ELEMS, np.int8)
-
-    # ---- all layers' weights staged into DDR once ----
     staged = stage_model(allocate, mp)
+    d_h = {L: mp.layer(L).weights["linear_1"].shape[0] for L in layers}
 
-    # ---- preprocess -> X into buffer `a` ----
-    x0 = preprocess(image)
-    a[:] = x0
-    a.sync_to_device()
-    x_buf, y_buf = a, b
-
+    bad = 0
     try:
-        for L in layers:
-            d_h = mp.layer(L).weights["linear_1"].shape[0]
-            args = _build_args(x_buf, y_buf, staged[L], ENC_N, ENC_D, d_h)
-            try:
-                kernel.invoke(args)
-            except TimeoutError as e:
-                raise RuntimeError(f"encoder layer {L} hung: {e}") from e
-            y_buf.sync_from_device()
-            x_buf, y_buf = y_buf, x_buf     # output becomes next input
+        for img in range(n_images):
+            a[:] = inputs[img].reshape(-1)
+            a.sync_to_device()
+            x_buf, y_buf = a, b
 
-        # after the loop the last output is in x_buf (post-swap).
-        x_buf.sync_from_device()
-        y = np.array(x_buf[:ACT_ELEMS], dtype=np.int8)
+            for L in layers:
+                # The activation stays on chip between layers: only the first reads it
+                # from DDR and only the last writes it back.
+                args = _build_args(x_buf, y_buf, staged[L], ENC_N, ENC_D, d_h[L],
+                                   first_layer=(L == layers[0]),
+                                   last_layer=(L == layers[-1]))
+                try:
+                    kernel.invoke(args)
+                except TimeoutError as e:
+                    raise RuntimeError(f"image {img} layer {L} hung: {e}") from e
+                x_buf, y_buf = y_buf, x_buf
+
+            x_buf.sync_from_device()
+            got = np.array(x_buf[:ACT_ELEMS], dtype=np.int8).reshape(ENC_D, ENC_N)
+            diff = int(np.count_nonzero(got != want[img]))
+            if diff:
+                bad += 1
+                worst = int(np.abs(got.astype(int) - want[img].astype(int)).max())
+                print(f"  image {img}: {diff} of {ACT_ELEMS} bytes differ, "
+                      f"max |difference| {worst}")
+            else:
+                print(f"  image {img}: bit-exact")
     finally:
         free_staged(staged)
         kernel.close()
 
-    return postprocess(y)
+    print(f"\n{n_images - bad}/{n_images} images bit-exact")
+    return bad
 
 
 def main():
@@ -694,7 +742,15 @@ def main():
                     help="write/read-back every control register and exit; "
                          "checks the AXI-Lite control path only (no DDR, no "
                          "ap_start). Run this first on a new bitstream.")
-    ap.add_argument("--image", default=None, help="input image (preprocess stub ignores it)")
+    ap.add_argument("-e", "--e2e-dir", default=None,
+                    help="sim payload dir with inputs.bin (and golden/hw_out.bin) to "
+                         "check against; not needed with --selftest")
+    ap.add_argument("--golden-dir", default=None,
+                    help="dir holding the reference hw_out.bin (default: <e2e-dir>/golden). "
+                         "A payload emitted for a different engine configuration is still "
+                         "checked against the ORIGINAL design's golden")
+    ap.add_argument("-n", "--images", type=int, default=1,
+                    help="how many images from the payload to run (default 1)")
     ap.add_argument("--hw-header", default=None,
                     help="HLS-generated xencoder_layer_top_hw.h to read the register "
                          "offsets from (default: the built-in REGMAP)")
@@ -711,14 +767,14 @@ def main():
         failures = kernel.selftest()
         return 1 if failures else 0
 
-    if not args.model_dir:
-        ap.error("-d/--model-dir is required unless --selftest is given")
+    if not args.model_dir or not args.e2e_dir:
+        ap.error("-d/--model-dir and -e/--e2e-dir are required unless --selftest is given")
 
-    result = run_encoder(args.model_dir, image=args.image, bitstream=args.bitstream,
-                         instance=args.instance, download=not args.no_download,
-                         base_addr=base, hw_header=args.hw_header)
-    print(f"encoder done; postprocess -> {result}")
-    return 0
+    bad = run_encoder(args.model_dir, args.e2e_dir, n_images=args.images,
+                      bitstream=args.bitstream, instance=args.instance,
+                      download=not args.no_download, base_addr=base,
+                      hw_header=args.hw_header, golden_dir=args.golden_dir)
+    return 1 if bad else 0
 
 
 if __name__ == "__main__":
