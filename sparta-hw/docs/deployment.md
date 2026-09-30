@@ -151,20 +151,16 @@ That has to match `HwKernel.CONTROL_BASE` in `runtime/SPARTA.py`.
 
 ## Stage 5b - synthesis, implementation, bitstream
 
-This is the stage that will fight you on a small-memory host. Run it under a memory limit so that
-Vivado is what gets killed if the budget is exceeded, rather than your desktop:
+Run it plainly, one job:
 
-    systemd-run --user --scope -p MemoryMax=9G -p MemorySwapMax=0 \
-      nice -n 10 vivado -mode batch -nojournal -nolog \
+    nice -n 10 vivado -mode batch -nojournal -nolog \
         -source scripts/build_bitstream.tcl -tclargs 200 0 1
 
 Arguments are clock MHz, debug flag, **jobs**, and optionally **threads**. `jobs` bounds how many
 runs go in parallel; `threads` bounds the threads inside one run, which `-jobs` does not control.
-Add `2` as a fourth argument if a serial run still struggles.
 
-`MemorySwapMax=0` is the important half. It forbids swap for that scope, so the process is killed
-cleanly instead of dragging the machine into thrashing -- see the freeze trap below. Close your
-editor for the duration too; it is what the OOM killer picks first.
+**Do not wrap this in a systemd scope with `MemoryMax`.** It looks like the responsible thing to do
+and it is not -- see the memory trap below.
 
 30-60 minutes, longer at `jobs 1`. Reports worst negative slack and **fails if it is negative**, because a design that
 misses timing gives intermittently wrong answers rather than not working -- much harder to diagnose
@@ -196,19 +192,26 @@ takes it as a parameter for exactly this reason -- pass the same number as stage
 
 ## Stage 7 - board bring-up
 
-Copy, from the host:
+Copy, from the host.  `$BOARD` below is whatever root you use on the board -- nothing hardcodes a
+path, every location is a command-line argument:
 
-    ssh kria 'mkdir -p ~/sparta/{runtime,payload,golden,hw}'
-    scp runtime/*.py                              kria:~/sparta/runtime/
+    BOARD=~/sparta-a            # or wherever
+    ssh kria "mkdir -p $BOARD/{runtime,payload,golden,hw}"
+    scp runtime/*.py                              kria:$BOARD/runtime/
     scp sim/e2e_tiled12/model.bin \
         sim/e2e_tiled12/manifest.json \
-        sim/e2e_tiled12/inputs.bin                kria:~/sparta/payload/
-    scp sim/e2e/golden/hw_out.bin                 kria:~/sparta/golden/
+        sim/e2e_tiled12/inputs.bin                kria:$BOARD/payload/
+    scp sim/e2e/golden/hw_out.bin                 kria:$BOARD/golden/
     scp ip/encoder_layer/drivers/encoder_layer_top_v1_0/src/xencoder_layer_top_hw.h \
-                                                  kria:~/sparta/hw/
+                                                  kria:$BOARD/hw/
     scp -r deploy/sparta-tiled-v1                 kria:~/
 
-About 20.6 MB. `model_index.bin` is not needed on the board -- it is the native testbench's guard.
+About 20.6 MB. **Re-copy `runtime/*.py` and the register header whenever either changes on the
+host** -- a stale driver whose CLI predates a change fails visibly, but a stale *header* does not:
+it writes arguments to the wrong registers silently.  `md5sum` the header against the host's copy
+before trusting it.
+
+`model_index.bin` is not needed on the board -- it is the native testbench's guard.
 The loader reads only `manifest.json` and `model.bin`, and asserts their sizes agree.
 
 Load the bitstream, on the board:
@@ -223,8 +226,8 @@ a hunt. `$PY` below is the venv interpreter -- see the first trap.
 
 **1. Control path only.** No memory, does not start the kernel.
 
-    cd ~/sparta/runtime
-    sudo -E $PY SPARTA.py --no-download --selftest --hw-header ~/sparta/hw/xencoder_layer_top_hw.h
+    cd $BOARD/runtime
+    sudo -E $PY SPARTA.py --no-download --selftest --hw-header $BOARD/hw/xencoder_layer_top_hw.h
 
 Writes and reads back every argument register with five patterns. Four are uniform (stuck and
 shorted lines); the fifth gives every register a different value and writes them all before reading
@@ -235,9 +238,9 @@ doing.
 **2. Datapath, bit-exact against the simulation's golden.** Needs only numpy and pynq.
 
     sudo -E $PY SPARTA.py --no-download \
-        -d ~/sparta/payload -e ~/sparta/payload \
-        --golden-dir ~/sparta/golden \
-        --hw-header ~/sparta/hw/xencoder_layer_top_hw.h -n 1
+        -d $BOARD/payload -e $BOARD/payload \
+        --golden-dir $BOARD/golden \
+        --hw-header $BOARD/hw/xencoder_layer_top_hw.h -n 1
 
 This holds the board to the same standard as `make golden-check`. A pass means the whole chain
 agrees: register map, buffer addresses, weight payload and arithmetic. Raise `-n` once it passes.
@@ -269,26 +272,62 @@ This is not hypothetical: when the MLP moved onto the shared engine its two CSR 
 `{bank, counts}` pairs, the argument list lost two entries, and every offset from `w2_bank` onward
 moved down two slots.
 
-**Stage 5b is memory-bound, and it fails in two different ways.** On a 15 GB host both were seen,
-and they look nothing alike:
+**Stage 5b needs ~5 GB, not the 13 GB I first assumed.** Measured rather than guessed: Vivado's own
+log reports `peak = 4748.938` MB at Timing Optimization, and a cgroup kill caught the process at
+anon-rss 3.4 GB. What needs care is the **job count**, not the per-process budget.
 
-- `-jobs 12` -> a clean out-of-memory kill. Each parallel run is a separate Vivado process of
-  several GB, and the block design has eight out-of-context IP runs that launch together. The OOM
-  killer took the **desktop**, not Vivado -- an editor usually scores higher -- so the run was lost
-  and the session with it.
-- `-jobs 2` -> the machine **froze** instead. With 15 GB of RAM against 2 GB of swap it thrashes
-  long before the kernel kills anything, which is worse, because an OOM at least ends.
+Three failures were seen on a 15 GB host, and only the first was a genuine shortage:
+
+- `-jobs 12`, no limit -> a genuine system out-of-memory kill. Twelve concurrent Vivado processes
+  at ~5 GB each does not fit. The OOM killer took the **desktop**, not Vivado -- an editor usually
+  scores higher -- so the run was lost and the session with it. At ~5 GB per run, jobs=2 needs
+  ~12 GB free and jobs=1 is right for this host.
+- `-jobs 2`, no limit -> the machine **froze** rather than being killed, thrashing against a 2 GB
+  swapfile. Worse than an OOM, because an OOM at least ends.
+- `MemoryMax=9G` then `12G`, jobs 1 -> **killed both times, by the cgroup, with Vivado at ~4 GB.**
+  The limit was the cause, not the cure. `cgroup v2` charges **page cache** to the cgroup as well as
+  the process: Vivado's file I/O fills it, `MemorySwapMax=0` leaves dirty pages unreclaimable until
+  written back, and the cgroup hits its ceiling while the process is nowhere near it. A
+  `MemoryMax` scope does not protect a run that does heavy I/O -- it ends it.
+
+**A killed synthesis reports no error**, which is what made the cgroup cases so confusing.
+`runme.log` contains no `ERROR` line -- a process that is killed never gets to write one. The
+evidence is instead:
+
+| where | what |
+|---|---|
+| `runme.log`, near the end | `rdiArgs.sh: line 60: NNNNN Killed "$RDI_PROG" "$@"` |
+| the run directory | a pile of `hs_err_pid*.log` worker crash dumps |
+| `runme.log` last phase | which stage it reached, e.g. cross-boundary optimization |
+| `journalctl --user` | `A process of this unit has been killed by the OOM killer` |
+| `journalctl -k` | `constraint=CONSTRAINT_MEMCG` means the **cgroup limit**, not the system |
+
+That last row is the one that settles it. `CONSTRAINT_MEMCG` means a cgroup limit fired; the absence
+of any OOM record at all means something else ended the process. And the kill line reports the
+victim's actual `anon-rss`, which is how the ~4 GB figure came out -- worth reading before concluding
+that a design needs more memory.
+
+If a host genuinely cannot supply ~5 GB plus page cache, the targeted lever is
+`-flatten_hierarchy none` on the kernel's IP run: it keeps the module hierarchy rather than
+flattening it, which is where that phase's memory goes. It costs quality of result, so it is a last
+resort -- at 81 % LUT, closing 200 MHz without cross-boundary optimization is not a given.
 
 So: budget ~3 GB per job plus headroom, run under `systemd-run` with `MemorySwapMax=0` as shown in
 stage 5b, drop to `jobs 1`, cap `threads`, and close the editor. If it still will not complete, the
 design wants more memory than the host has and should be built elsewhere -- synthesis peak scales
 with design size, and this is 81 % LUT on the part.
 
-**Nothing needs cleaning up after a killed run.** No lock files are left unless Vivado died holding
-the project open for write. Completed out-of-context IP runs keep their `.dcp` checkpoints and are
-reused, so a rerun skips them -- after one interrupted attempt, six of the eight were already done.
-`build_bitstream.tcl` resets `synth_1` and `impl_1` itself. Just check disk headroom first:
-implementation writes several GB of intermediate checkpoints.
+**A killed run leaves one thing behind, and the script now clears it.** A process killed
+mid-synthesis strands a `__synthesis_is_running__` marker in its run directory, and Vivado then
+refuses to relaunch that run because it believes it is still going. `build_bitstream.tcl` resets
+every run that is not at 100 % before launching, which clears the marker while keeping the
+checkpoints of the runs that did finish -- so a retry only redoes what actually failed. After two
+interrupted attempts, seven of the eight out-of-context IP runs were already complete and only the
+kernel's needed redoing.
+
+No lock files are left unless Vivado died holding the project open for write, which it does not
+during a run. Check disk headroom before retrying, though: implementation writes several GB of
+intermediate checkpoints.
 
 **A stale bitstream will pass the selftest.** The selftest only proves the processor can address the
 control registers; the loaded bitstream may have a completely different argument layout. When we ran
