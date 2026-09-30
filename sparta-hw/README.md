@@ -1,7 +1,7 @@
 # SPARTA — Sparse Transformer Accelerator
 
 A sparse Vision Transformer (ViT) encoder implemented in Vitis HLS C++, targeting
-the Xilinx/AMD Kria KV260 (`xck26-sfvc784-2LV-c`). The encoder runs int8
+the Xilinx/AMD Kria KR260 (`xck26-sfvc784-2LV-c`). The encoder runs int8
 activations against 4-bit sparse weights in CSR format, with all
 quantization scales folded and passed as runtime arguments so a single set of
 kernels serves every layer of a 12-layer ViT-Base model.
@@ -165,6 +165,10 @@ loop — with `SPARTALoader.py` parsing `model.bin` into the per-layer buffers a
 `sim/` runs whole images through the kernel in C-simulation and checks that the
 hardware classifies them identically to the software model — see
 [`sim/README.md`](sim/README.md).
+
+For the board: **[`docs/deployment.md`](docs/deployment.md)** is the runbook —
+all seven stages from the model export to the accelerator running on the KR260,
+with the reasoning for each and the traps that cost time.
 
 ## Requirements
 
