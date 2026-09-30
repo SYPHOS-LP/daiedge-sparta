@@ -16,6 +16,7 @@
 #   make native-units         - edge cases the golden data cannot reach
 #   make native-e2e IMAGES=2  - real-model TB on the first IMAGES images in $(E2E_DIR)
 #   make golden-check         - $(E2E_DIR) outputs vs $(GOLDEN_DIR), bit-exact
+#   make ip                   - package as IP-XACT into ip/ for the block design
 #   make regress IMAGES=2     - all three
 #
 # Usage:
@@ -25,7 +26,7 @@
 # ============================================================================
 
 .PHONY: config sim synth full clean help all \
-        native-units native-e2e golden-check regress \
+        native-units native-e2e golden-check regress ip \
         $(foreach p,encoder-layer encoder-e2e,config-$(p) sim-$(p) synth-$(p) full-$(p))
 
 # ============================================================================
@@ -93,6 +94,45 @@ sim: config
 synth: config
 	@echo "Running HLS synthesis: $(PROJECT)"
 	$(VPP) -c --mode hls --config $(HLS_CONFIG) --work_dir $(PROJECT_DIR)
+
+# ============================================================================
+# IP: package the kernel as IP-XACT for the block design
+#
+# `synth` packages an .xo for the Vitis link flow.  The board build does not use
+# that flow: scripts/encoder_layer_kr260_bd.tcl places the kernel in a Vivado
+# block design and needs IP-XACT instead, so this runs the same synthesis with
+# package.output.format=ip_catalog and copies the result to ip/encoder_layer,
+# where the BD script looks for it.
+#
+# The register map changes whenever a kernel argument is added or removed, so
+# after this, re-read the offsets from
+#   $(IP_DIR)/../hls/impl/misc/drivers/encoder_layer_top_v1_0/src/xencoder_layer_top_hw.h
+# and pass it to the host as --hw-header rather than trusting SPARTA.REGMAP.
+# ============================================================================
+# The config lives beside the normal one: gen_hls_config.py derives the project
+# name from its PARENT DIRECTORY, so it has to stay in $(PROJECT_DIR).  Only the
+# work_dir is separate, to keep the .xo build's reports intact.
+IP_PROJECT_DIR := $(PROJECT_DIR)_ip
+IP_HLS_CONFIG  := $(PROJECT_DIR)/hls_config_ip.cfg
+IP_DIR         := ip/$(PROJECT)
+
+ip: config
+	@echo "Packaging $(PROJECT) as IP-XACT for the block design..."
+	@mkdir -p $(IP_PROJECT_DIR)
+	@$(PYTHON) $(GEN_HLS_CONFIG) $(BUILD_CONFIG) $(IP_HLS_CONFIG) ip_catalog
+	$(VPP) -c --mode hls --config $(IP_HLS_CONFIG) --work_dir $(IP_PROJECT_DIR)
+	@echo "Running the packaging step (v++ -c synthesises only)..."
+	$(VITIS_RUN) --mode hls --package --config $(IP_HLS_CONFIG) --work_dir $(IP_PROJECT_DIR)
+	@rm -rf $(IP_DIR)
+	@mkdir -p $(dir $(IP_DIR))
+	@src=$$(find $(IP_PROJECT_DIR) -name component.xml -printf '%h\n' | head -1); \
+	 if [ -z "$$src" ]; then \
+	   echo "ERROR: no component.xml under $(IP_PROJECT_DIR); packaging did not produce IP-XACT"; \
+	   exit 1; \
+	 fi; \
+	 cp -r "$$src" $(IP_DIR); \
+	 echo "IP-XACT in $(IP_DIR) (from $$src)"
+	@echo "Next: vivado -mode batch -source scripts/encoder_layer_kr260_bd.tcl -tclargs <mhz>"
 
 # ============================================================================
 # Full flow: config -> sim -> synth
@@ -173,6 +213,9 @@ help:
 	@echo "  make native-units         - edge cases the golden data cannot reach"
 	@echo "  make native-e2e IMAGES=2  - real-model TB on the first IMAGES images (E2E_DIR=$(E2E_DIR))"
 	@echo "  make golden-check         - outputs vs GOLDEN_DIR, bit-exact (default E2E_DIR/golden)"
+	@echo ""
+	@echo "Board build:"
+	@echo "  make ip                   - package as IP-XACT into ip/ (the block design needs this)"
 	@echo "  make regress IMAGES=2     - all three"
 	@echo ""
 	@echo "Shorthands: make sim-encoder-layer, make synth-encoder-layer, ..."
