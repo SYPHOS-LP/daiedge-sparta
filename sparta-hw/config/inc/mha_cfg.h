@@ -42,7 +42,7 @@
 #define MHA_COUNT_HDR_WORDS ((MHA_TILES * 4 + MHA_COUNT_PACK - 1) / MHA_COUNT_PACK)   // words of block offsets in front of the counts
 #define MHA_TILE_NNZ_MAX 2560   // per-bank capacity for one row block; worst cell 2196 (MLP W2) + up to 3 lead-in entries
 #define MHA_TILE_BANK_WORDS (MHA_TILE_NNZ_MAX / MHA_TILE_PACK)   // bank depth in packed words (640, one URAM)
-#define MHA_H_TILE_FEATURES 256   // hidden features per W2 column block (d_h / MHA_TILES)
+#define MHA_H_TILE_FEATURES 256   // hidden features per W2 column block (d_h / MHA_TILES); asserted against ENC_HIDDEN_W_MAX in encoder_stages.cpp
 #define MHA_H_TILE_WORDS (MHA_H_TILE_FEATURES * MHA_BANK_ROW_WORDS)   // packed words of one H tile (256*7=1792)
 #define MHA_H_TILE_BASE MHA_TILE_WORDS   // first word of the H region inside a tile
 #define MHA_TILE_WORDS_MAX (MHA_TILE_WORDS + MHA_H_TILE_WORDS)   // tile depth covering both regions (2240, one URAM)

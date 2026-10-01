@@ -85,7 +85,7 @@ defines:
   # the 64 features of an MHA / W1 column block, words [MHA_H_TILE_BASE, ...) hold the 256 hidden
   # features of an MLP W2 column block.  Keeping H in the same memories lets the MLP's second stage
   # read it in place, with no copy between the stages.
-  - { name: MHA_H_TILE_FEATURES, value: 256, comment: "hidden features per W2 column block (d_h / MHA_TILES)" }
+  - { name: MHA_H_TILE_FEATURES, value: 256, comment: "hidden features per W2 column block (d_h / MHA_TILES); asserted against ENC_HIDDEN_W_MAX in encoder_stages.cpp" }
   - { name: MHA_H_TILE_WORDS,    value: "(MHA_H_TILE_FEATURES * MHA_BANK_ROW_WORDS)", comment: "packed words of one H tile (256*7=1792)" }
   - { name: MHA_H_TILE_BASE,     value: "MHA_TILE_WORDS", comment: "first word of the H region inside a tile" }
   - { name: MHA_TILE_WORDS_MAX,  value: "(MHA_TILE_WORDS + MHA_H_TILE_WORDS)", comment: "tile depth covering both regions (2240, one URAM)" }

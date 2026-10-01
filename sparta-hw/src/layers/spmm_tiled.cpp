@@ -118,7 +118,11 @@ void load_weight_slice (T_MhaTileWord* w_bank, T_MhaCountWord* w_counts,
                         int feature_dim, int which, int row_base, int rows) {
 #pragma HLS INLINE off
     /* A bank is 64-bit words, MHA_TILE_BANK_WORDS deep: one URAM each (72 b x 4096), where BRAM
-     * would need ~12 BRAM18 per bank for the same data (18 b per port, 1024 deep). */
+     * would need ~12 BRAM18 per bank for the same data (18 b per port, 1024 deep).
+     *
+     * If MHA_TILES is ever raised, the banks shrink and URAM becomes the wrong home for them --
+     * see the 24-lane attempt in docs/plans/05-lane-balance.md, where they had to move to BRAM and
+     * BRAM then saturated instead. */
     #pragma HLS BIND_STORAGE variable=g_bank type=ram_t2p impl=uram
     #pragma HLS ARRAY_PARTITION variable=g_bank_count complete dim=1
     int slice_words[MHA_TILES], slice_word0[MHA_TILES];
