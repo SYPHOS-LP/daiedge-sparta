@@ -61,7 +61,30 @@ from SPARTALoader import Loader
 # baseline: a 7x7 patch grid + 1 CLS token (was 197 on the 16x16-patch model).
 ENC_D = 768          # feature width           (ENC_D)
 ENC_N = 50           # tokens                  (ENC_MAX_BATCH)
-ACT_ELEMS = ENC_D * ENC_N   # feature-major int8 activation buffer size
+ACT_ELEMS = ENC_D * ENC_N   # the logical activation: D x N int8
+
+# The kernel's activation ports carry PACKED 64-bit words, not bytes: ENC_PACK tokens per word,
+# ENC_ROW_WORDS words per feature, a feature's trailing slots zero.  The host packs because on the
+# port a byte at a time cost ~8 cycles each -- 310 k cycles to read one activation and 123 k to
+# write it, against the 43 k csynth predicted (the port is 64 bits wide, so seven eighths of each
+# transfer was empty and the byte requests did not merge into bursts).
+ENC_PACK      = 8
+ENC_ROW_WORDS = -(-ENC_N // ENC_PACK)          # 7 at N=50
+ACT_WORDS     = ENC_D * ENC_ROW_WORDS          # what the DMA buffer holds
+ACT_BYTES     = ACT_WORDS * ENC_PACK
+
+
+def pack_rows(a):
+    """(ENC_D, ENC_N) int8  ->  (ACT_WORDS,) uint64, the form the kernel's port expects."""
+    padded = np.zeros((ENC_D, ENC_ROW_WORDS * ENC_PACK), dtype=np.uint8)
+    padded[:, :ENC_N] = np.ascontiguousarray(a, dtype=np.int8).view(np.uint8)
+    return padded.reshape(-1).view(np.uint64)
+
+
+def unpack_rows(w):
+    """(ACT_WORDS,) uint64  ->  (ENC_D, ENC_N) int8.  Drops the per-feature padding."""
+    b = np.asarray(w, dtype=np.uint64).view(np.uint8).reshape(ENC_D, ENC_ROW_WORDS * ENC_PACK)
+    return np.ascontiguousarray(b[:, :ENC_N]).view(np.int8)
 
 # Fabric clock, for turning measured time into cycles.  Set by the app's device-tree overlay, NOT
 # by anything here -- check it on the board with
@@ -689,9 +712,9 @@ def run_encoder(model_dir, e2e_dir, n_images=1, bitstream=None, instance=None,
                       base_addr=base_addr,
                       regmap=load_regmap(hw_header) if hw_header else None)
 
-    # activation ping-pong: X (in) / Y (out).
-    a = _allocate(allocate, ACT_ELEMS, np.int8)
-    b = _allocate(allocate, ACT_ELEMS, np.int8)
+    # activation ping-pong: X (in) / Y (out), in the packed word form the ports carry.
+    a = allocate(shape=(ACT_WORDS,), dtype=np.uint64)
+    b = allocate(shape=(ACT_WORDS,), dtype=np.uint64)
     staged = stage_model(allocate, mp)
     d_h = {L: mp.layer(L).weights["linear_1"].shape[0] for L in layers}
 
@@ -705,7 +728,7 @@ def run_encoder(model_dir, e2e_dir, n_images=1, bitstream=None, instance=None,
     try:
         for img in range(n_images):
             t_img = time.monotonic()
-            a[:] = inputs[img].reshape(-1)
+            a[:] = pack_rows(inputs[img])
             a.sync_to_device()
             x_buf, y_buf = a, b
 
@@ -727,7 +750,7 @@ def run_encoder(model_dir, e2e_dir, n_images=1, bitstream=None, instance=None,
             x_buf.sync_from_device()
             per_image.append(time.monotonic() - t_img)
             per_image_kernel.append(kernel_s)
-            got = np.array(x_buf[:ACT_ELEMS], dtype=np.int8).reshape(ENC_D, ENC_N)
+            got = unpack_rows(np.array(x_buf[:ACT_WORDS], dtype=np.uint64))
             diff = int(np.count_nonzero(got != want[img]))
             if diff:
                 bad += 1

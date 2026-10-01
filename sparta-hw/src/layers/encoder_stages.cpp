@@ -69,65 +69,38 @@ static T_MhaBankWord g_stream_mid[MHA_BANK_WORDS];
 
 
 /**
- * @brief Read the layer input from external memory into the packed on-chip form.
+ * @brief Move the layer activation between external memory and the on-chip buffer.
  *
- * The external buffer is feature-major with tokens_dim bytes per feature and no padding, while a
- * packed row is MHA_BANK_ROW_WORDS words (MHA_BANK_PACK tokens each), so the trailing slots of the
- * last word of each feature are zeroed.  One byte per transfer, because the port carries bytes.
+ * The external buffer carries the SAME packed form everything on chip uses: MHA_BANK_ROW_WORDS
+ * words per feature, MHA_BANK_PACK tokens in each, with the trailing slots of a feature's last word
+ * zero.  So this is a flat copy, one word per cycle.
+ *
+ * It used to cross the port as individual int8 bytes, and that was expensive in a way csynth did not
+ * show: the port is 64 bits wide, so seven eighths of every transfer was empty, and the byte
+ * requests did not merge into bursts.  Measured on the board at ~8 cycles per byte against the one
+ * the scheduler assumed -- 310 k cycles to read 38 400 bytes and 123 k to write them, where csynth
+ * predicted 43 k for each.  As words it is 5 376 transfers instead of 38 400.
+ *
+ * The host now does the packing, which is where it belongs: it is a numpy reshape there, and the
+ * padding it has to add is the same padding the kernel was generating anyway.
  */
-static void pack_activation (const T_Activation *src, T_MhaBankWord *dst,
-                             int tokens_dim, int feature_dim) {
+static void copy_activation_in (const T_MhaBankWord *src, T_MhaBankWord *dst, int words) {
 #pragma HLS INLINE off
-    const int row_words = (tokens_dim + MHA_BANK_PACK - 1) / MHA_BANK_PACK;
-    PACK_FEATURE:
-    for (int f = 0; f < feature_dim; f++) {
-        #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_FEATURE max=MHA_TC_FEATURE
-        PACK_WORD:
-        for (int w = 0; w < row_words; w++) {
-            #pragma HLS LOOP_TRIPCOUNT min=MHA_BANK_ROW_WORDS max=MHA_BANK_ROW_WORDS
-            T_MhaBankWord word = 0;
-            PACK_LANE:
-            for (int p = 0; p < MHA_BANK_PACK; p++) {
-                #pragma HLS PIPELINE II=1
-                const int    j = w * MHA_BANK_PACK + p;
-                T_Activation v = (T_Activation) 0;
-                if (j < tokens_dim) {
-                    v = src[f * tokens_dim + j];
-                }
-                word.range(p * MHA_ACT_ELEM_BITS + MHA_ACT_ELEM_BITS - 1,
-                           p * MHA_ACT_ELEM_BITS) = (ap_uint<MHA_ACT_ELEM_BITS>) v;
-            }
-            dst[f * MHA_BANK_ROW_WORDS + w] = word;
-        }
+    ACT_COPY_IN:
+    for (int w = 0; w < words; w++) {
+        #pragma HLS LOOP_TRIPCOUNT min=MHA_BANK_WORDS max=MHA_BANK_WORDS
+        #pragma HLS PIPELINE II=1
+        dst[w] = src[w];
     }
 }
 
-
-/**
- * @brief Write the packed on-chip activation out to external memory, unpadded.
- */
-static void unpack_activation (const T_MhaBankWord *src, T_Activation *dst,
-                               int tokens_dim, int feature_dim) {
+static void copy_activation_out (const T_MhaBankWord *src, T_MhaBankWord *dst, int words) {
 #pragma HLS INLINE off
-    const int row_words = (tokens_dim + MHA_BANK_PACK - 1) / MHA_BANK_PACK;
-    UNPACK_FEATURE:
-    for (int f = 0; f < feature_dim; f++) {
-        #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_FEATURE max=MHA_TC_FEATURE
-        UNPACK_WORD:
-        for (int w = 0; w < row_words; w++) {
-            #pragma HLS LOOP_TRIPCOUNT min=MHA_BANK_ROW_WORDS max=MHA_BANK_ROW_WORDS
-            const T_MhaBankWord word = src[f * MHA_BANK_ROW_WORDS + w];
-            UNPACK_LANE:
-            for (int p = 0; p < MHA_BANK_PACK; p++) {
-                #pragma HLS PIPELINE II=1
-                const int j = w * MHA_BANK_PACK + p;
-                if (j < tokens_dim) {
-                    dst[f * tokens_dim + j] =
-                        (T_Activation) word.range(p * MHA_ACT_ELEM_BITS + MHA_ACT_ELEM_BITS - 1,
-                                                  p * MHA_ACT_ELEM_BITS);
-                }
-            }
-        }
+    ACT_COPY_OUT:
+    for (int w = 0; w < words; w++) {
+        #pragma HLS LOOP_TRIPCOUNT min=MHA_BANK_WORDS max=MHA_BANK_WORDS
+        #pragma HLS PIPELINE II=1
+        dst[w] = src[w];
     }
 }
 
@@ -298,7 +271,7 @@ static void layer_rows (
 
 
 void encoder_layer_stages(
-    const T_Activation *input,
+    const T_MhaBankWord *input,
     int                 tokens_dim,
     int                 feature_dim,
     int                 hidden_dim,
@@ -309,7 +282,7 @@ void encoder_layer_stages(
     T_MhaTileWord *w1_bank, T_MhaCountWord *w1_counts,
     T_MhaTileWord *w2_bank, T_MhaCountWord *w2_counts,
     const T_Scale      *scales,
-    T_Activation       *output,
+    T_MhaBankWord     *output,
     int                 first_layer,
     int                 last_layer
 ) {
@@ -355,7 +328,7 @@ void encoder_layer_stages(
      * only the first layer reads the activation from external memory and only the last writes back.
      * Both conversions cost one transfer per byte, the ports carrying bytes. */
     if (first_layer) {
-        pack_activation(input, g_stream, tokens_dim, feature_dim);
+        copy_activation_in(input, g_stream, feature_dim * MHA_BANK_ROW_WORDS);
     }
     rmsnorm(reinterpret_cast<const T_RmsBankWord*>(g_stream), tokens_dim, feature_dim,
             scales[SCALE_ATT_RMSNORM_OUT_INV_IDX],
@@ -440,6 +413,6 @@ void encoder_layer_stages(
                  scales[SCALE_FF_RESIDUAL_IDX], scales[SCALE_FF_BRANCH_RATIO_IDX],
                  g_stream);
     if (last_layer) {
-        unpack_activation(g_stream, output, tokens_dim, feature_dim);
+        copy_activation_out(g_stream, output, feature_dim * MHA_BANK_ROW_WORDS);
     }
 }

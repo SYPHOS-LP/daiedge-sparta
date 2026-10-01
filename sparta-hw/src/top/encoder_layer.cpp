@@ -18,7 +18,7 @@ static_assert(ENC_TOKEN_W_MAX == MHA_TOKEN_W_MAX,
               "ENC_TOKEN_W_MAX must match MHA_TOKEN_W_MAX");
 
 void encoder_layer_top(
-    const T_Activation*   input,
+    const T_MhaBankWord*  input,
     int               feature_dim,
     int               tokens_dim,
     int               intermediate_dim,
@@ -29,31 +29,46 @@ void encoder_layer_top(
     T_MhaTileWord* w1_bank, T_MhaCountWord* w1_counts,
     T_MhaTileWord* w2_bank, T_MhaCountWord* w2_counts,
     const T_Scale* scales,
-    T_Activation* output,
+    T_MhaBankWord* output,
     int           first_layer,
     int           last_layer
 ) {
+    /* AXI read/write FIFO sizing.  MEASURED ON THE BOARD, and not what it looks like.
+     *
+     * Vitis sizes an m_axi data FIFO at roughly max_read_burst_length x num_read_outstanding, so
+     * 256 x 16 is 4096 entries of 64 bits, 32 KB per port -- 56 BRAM18 of the design's 136.  That
+     * looks wildly oversized for a consumer that takes one word per cycle against ~60 cycles of
+     * latency, and it was cut to 4 outstanding on exactly that reasoning.
+     *
+     * It cost 795 000 cycles PER LAYER, a 37 % slowdown.  The weight loads are latency-bound, and
+     * the outstanding read count is what hides the latency: each request in flight is another burst
+     * whose address phase overlaps the previous burst's data.  Twelve fewer of them exposed the
+     * latency that had been hidden all along.
+     *
+     * So keep the outstanding count HIGH, and buy the BRAM back from the burst length instead: the
+     * depth is the product, but the benefit is the count.  32 x 64 holds 2048 entries -- twice the
+     * requests in flight as the original, at half its FIFO. */
     #pragma HLS INTERFACE s_axilite port=return     bundle=control
     #pragma HLS INTERFACE s_axilite port=tokens_dim bundle=control
-    #pragma HLS INTERFACE m_axi port=scales bundle=sc_mem depth=SCALE_IDX_MAX num_read_outstanding=16 num_write_outstanding=2 max_read_burst_length=256
+    #pragma HLS INTERFACE m_axi port=scales bundle=sc_mem depth=SCALE_IDX_MAX num_read_outstanding=32 num_write_outstanding=2 max_read_burst_length=64
     #pragma HLS INTERFACE s_axilite port=intermediate_dim bundle=control
     #pragma HLS INTERFACE s_axilite port=first_layer      bundle=control
     #pragma HLS INTERFACE s_axilite port=last_layer       bundle=control
     #pragma HLS INTERFACE s_axilite port=feature_dim      bundle=control
-    #pragma HLS INTERFACE m_axi port=input     bundle=in_mem depth=(ENC_FEATURE_W_MAX*ENC_TOKEN_W_MAX) num_read_outstanding=16 num_write_outstanding=2 max_read_burst_length=256
-    #pragma HLS INTERFACE m_axi port=wq_bank  bundle=w_mha_mem depth=MAX_NNZ num_read_outstanding=4 num_write_outstanding=2 max_read_burst_length=256
-    #pragma HLS INTERFACE m_axi port=wq_counts bundle=w_mha_mem depth=(MHA_TILES*(MAX_ROWS+1)) num_read_outstanding=4 num_write_outstanding=2 max_read_burst_length=256
-    #pragma HLS INTERFACE m_axi port=wk_bank  bundle=w_mha_mem depth=MAX_NNZ num_read_outstanding=4 num_write_outstanding=2 max_read_burst_length=256
-    #pragma HLS INTERFACE m_axi port=wk_counts bundle=w_mha_mem depth=(MHA_TILES*(MAX_ROWS+1)) num_read_outstanding=4 num_write_outstanding=2 max_read_burst_length=256
-    #pragma HLS INTERFACE m_axi port=wv_bank  bundle=w_mha_mem depth=MAX_NNZ num_read_outstanding=4 num_write_outstanding=2 max_read_burst_length=256
-    #pragma HLS INTERFACE m_axi port=wv_counts bundle=w_mha_mem depth=(MHA_TILES*(MAX_ROWS+1)) num_read_outstanding=4 num_write_outstanding=2 max_read_burst_length=256
-    #pragma HLS INTERFACE m_axi port=wo_bank  bundle=w_mha_mem depth=MAX_NNZ num_read_outstanding=4 num_write_outstanding=2 max_read_burst_length=256
-    #pragma HLS INTERFACE m_axi port=wo_counts bundle=w_mha_mem depth=(MHA_TILES*(MAX_ROWS+1)) num_read_outstanding=4 num_write_outstanding=2 max_read_burst_length=256
-    #pragma HLS INTERFACE m_axi port=w1_bank  bundle=w1_mem depth=MAX_NNZ num_read_outstanding=16 num_write_outstanding=2 max_read_burst_length=256
-    #pragma HLS INTERFACE m_axi port=w1_counts bundle=w1_mem depth=(MHA_TILES*(ENC_HIDDEN_W_MAX+1)) num_read_outstanding=16 num_write_outstanding=2 max_read_burst_length=256
-    #pragma HLS INTERFACE m_axi port=w2_bank  bundle=w2_mem depth=MAX_NNZ num_read_outstanding=16 num_write_outstanding=2 max_read_burst_length=256
-    #pragma HLS INTERFACE m_axi port=w2_counts bundle=w2_mem depth=(MHA_TILES*(MAX_ROWS+1)) num_read_outstanding=16 num_write_outstanding=2 max_read_burst_length=256
-    #pragma HLS INTERFACE m_axi port=output bundle=y_mem depth=(ENC_FEATURE_W_MAX*ENC_TOKEN_W_MAX) num_read_outstanding=16 num_write_outstanding=16 max_read_burst_length=256 max_write_burst_length=256
+    #pragma HLS INTERFACE m_axi port=input     bundle=in_mem depth=MHA_BANK_WORDS num_read_outstanding=32 num_write_outstanding=2 max_read_burst_length=64
+    #pragma HLS INTERFACE m_axi port=wq_bank  bundle=w_mha_mem depth=MAX_NNZ num_read_outstanding=32 num_write_outstanding=2 max_read_burst_length=64
+    #pragma HLS INTERFACE m_axi port=wq_counts bundle=w_mha_mem depth=(MHA_TILES*(MAX_ROWS+1)) num_read_outstanding=32 num_write_outstanding=2 max_read_burst_length=64
+    #pragma HLS INTERFACE m_axi port=wk_bank  bundle=w_mha_mem depth=MAX_NNZ num_read_outstanding=32 num_write_outstanding=2 max_read_burst_length=64
+    #pragma HLS INTERFACE m_axi port=wk_counts bundle=w_mha_mem depth=(MHA_TILES*(MAX_ROWS+1)) num_read_outstanding=32 num_write_outstanding=2 max_read_burst_length=64
+    #pragma HLS INTERFACE m_axi port=wv_bank  bundle=w_mha_mem depth=MAX_NNZ num_read_outstanding=32 num_write_outstanding=2 max_read_burst_length=64
+    #pragma HLS INTERFACE m_axi port=wv_counts bundle=w_mha_mem depth=(MHA_TILES*(MAX_ROWS+1)) num_read_outstanding=32 num_write_outstanding=2 max_read_burst_length=64
+    #pragma HLS INTERFACE m_axi port=wo_bank  bundle=w_mha_mem depth=MAX_NNZ num_read_outstanding=32 num_write_outstanding=2 max_read_burst_length=64
+    #pragma HLS INTERFACE m_axi port=wo_counts bundle=w_mha_mem depth=(MHA_TILES*(MAX_ROWS+1)) num_read_outstanding=32 num_write_outstanding=2 max_read_burst_length=64
+    #pragma HLS INTERFACE m_axi port=w1_bank  bundle=w1_mem depth=MAX_NNZ num_read_outstanding=32 num_write_outstanding=2 max_read_burst_length=64
+    #pragma HLS INTERFACE m_axi port=w1_counts bundle=w1_mem depth=(MHA_TILES*(ENC_HIDDEN_W_MAX+1)) num_read_outstanding=32 num_write_outstanding=2 max_read_burst_length=64
+    #pragma HLS INTERFACE m_axi port=w2_bank  bundle=w2_mem depth=MAX_NNZ num_read_outstanding=32 num_write_outstanding=2 max_read_burst_length=64
+    #pragma HLS INTERFACE m_axi port=w2_counts bundle=w2_mem depth=(MHA_TILES*(MAX_ROWS+1)) num_read_outstanding=32 num_write_outstanding=2 max_read_burst_length=64
+    #pragma HLS INTERFACE m_axi port=output bundle=y_mem depth=MHA_BANK_WORDS num_read_outstanding=32 num_write_outstanding=8 max_read_burst_length=64 max_write_burst_length=64
     /* DDR-resident activation scratch: Q'/K' + H (single region each). */
     /* Each CSR array on its OWN bundle: sharing a bundle across val/col/ptr blocks HLS bursting
      * ("multiple potential writes to the same bundle in the same region"). One array per bundle

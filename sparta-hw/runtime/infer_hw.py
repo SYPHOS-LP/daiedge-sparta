@@ -211,9 +211,9 @@ class HwEncoder:
             print(f" {len(self.layers)} layers", flush=True)
             print("  allocating DDR buffers...", end="", flush=True)
 
-        n = SPARTA.ACT_ELEMS
-        self.a = allocate(shape=(n,), dtype=np.int8)
-        self.b = allocate(shape=(n,), dtype=np.int8)
+        n = SPARTA.ACT_WORDS
+        self.a = allocate(shape=(n,), dtype=np.uint64)
+        self.b = allocate(shape=(n,), dtype=np.uint64)
         if verbose:
             mb = (3 * n) / (1024 * 1024)
             print(f" {mb:.1f} MB (act 3x{n})", flush=True)
@@ -245,7 +245,7 @@ class HwEncoder:
 
         layers = self.layers if n_layers is None else self.layers[:n_layers]
 
-        self.a[:] = flat
+        self.a[:] = SPARTA.pack_rows(enc_in)
         self.a.sync_to_device()
         x_buf, y_buf = self.a, self.b
 
@@ -282,13 +282,11 @@ class HwEncoder:
             x_buf, y_buf = y_buf, x_buf
 
         x_buf.sync_from_device()
-        out = np.array(x_buf[:SPARTA.ACT_ELEMS], dtype=np.int8)
-        return out.reshape(SPARTA.ENC_D, SPARTA.ENC_N)
+        return SPARTA.unpack_rows(np.array(x_buf[:SPARTA.ACT_WORDS], dtype=np.uint64))
 
     def _dump(self, tag, layer_idx, buf):
         """Write one layer's output, feature-major (D, N), as .npy."""
-        arr = np.array(buf[:SPARTA.ACT_ELEMS], dtype=np.int8).reshape(
-            SPARTA.ENC_D, SPARTA.ENC_N)
+        arr = SPARTA.unpack_rows(np.array(buf[:SPARTA.ACT_WORDS], dtype=np.uint64))
         path = os.path.join(self.debug_dir, f"{tag}_L{layer_idx:02d}.npy")
         np.save(path, arr)
 

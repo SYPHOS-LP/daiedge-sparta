@@ -52,7 +52,7 @@
  *                         the next layer.
  */
 void encoder_layer_stages(
-    const T_Activation *input,
+    const T_MhaBankWord *input,
     int                 tokens_dim,
     int                 feature_dim,
     int                 hidden_dim,
@@ -63,7 +63,7 @@ void encoder_layer_stages(
     T_MhaTileWord *w1_bank, T_MhaCountWord *w1_counts,
     T_MhaTileWord *w2_bank, T_MhaCountWord *w2_counts,
     const T_Scale      *scales,
-    T_Activation       *output,
+    T_MhaBankWord     *output,
     int                 first_layer,
     int                 last_layer
 );

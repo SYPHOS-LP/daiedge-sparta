@@ -138,14 +138,42 @@ int main(int argc, char** argv) {
     if (!fo) die("cannot open hw_out.bin");
     { int32_t hdr[4] = { (int32_t)0x45324F55, n_images, D, N }; std::fwrite(hdr, 4, 4, fo); }
 
-    std::vector<T_Activation> cur(XY), hidden(XY), nxt(XY);
+    /* The kernel's activation ports carry PACKED words now, not bytes: MHA_BANK_ROW_WORDS words
+     * per feature, MHA_BANK_PACK tokens each, a feature's trailing slots zero.  The host does the
+     * packing because on the port it was costing ~8 cycles per byte (see encoder_stages.cpp).
+     * These two helpers are what the Python host does with a numpy reshape. */
+    const int ROW_WORDS = MHA_BANK_ROW_WORDS, PACKED = D * ROW_WORDS;
+    std::vector<T_MhaBankWord> cur(PACKED), nxt(PACKED);
+
+    auto pack_rows = [&](const std::vector<int8_t>& flat, std::vector<T_MhaBankWord>& out) {
+        for (int f = 0; f < D; f++) {
+            for (int w = 0; w < ROW_WORDS; w++) {
+                T_MhaBankWord word = 0;
+                for (int p = 0; p < MHA_BANK_PACK; p++) {
+                    const int t = w * MHA_BANK_PACK + p;
+                    const int8_t v = (t < N) ? flat[f * N + t] : (int8_t) 0;
+                    word.range(p * 8 + 7, p * 8) = (ap_uint<8>) (uint8_t) v;
+                }
+                out[f * ROW_WORDS + w] = word;
+            }
+        }
+    };
+    auto unpack_rows = [&](const std::vector<T_MhaBankWord>& in, std::vector<int8_t>& flat) {
+        for (int f = 0; f < D; f++) {
+            for (int t = 0; t < N; t++) {
+                const T_MhaBankWord word = in[f * ROW_WORDS + t / MHA_BANK_PACK];
+                const int p = t % MHA_BANK_PACK;
+                flat[f * N + t] = (int8_t)(ap_int<8>)(ap_uint<8>) word.range(p * 8 + 7, p * 8);
+            }
+        }
+    };
 
     std::printf("E2E TB: %d of %d images, %d layers, D=%d N=%d d_h=%d\n",
                 n_images, n_in_file, n_layers, D, N, d_h);
 
     for (int img = 0; img < n_images; img++) {
         { std::vector<int8_t> t(XY); read_raw(fin, t.data(), XY, "img input");
-          for (int i = 0; i < XY; i++) cur[i] = (T_Activation)t[i]; }
+          pack_rows(t, cur); }
 
         /* The kernel keeps the activation on-chip between layers, so only the first layer reads it
          * from memory and only the last writes it back.  Image 0 forces the write on every layer so
@@ -169,14 +197,14 @@ int main(int argc, char** argv) {
                 (fdbg != nullptr) || (L == n_layers - 1));   /* last_layer: write the result out */
             if (fdbg) {
                 std::vector<int8_t> ty(XY);
-                for (int i = 0; i < XY; i++) { ty[i] = (int8_t)nxt[i]; }
+                unpack_rows(nxt, ty);
                 std::fwrite(ty.data(), 1, XY, fdbg);
             }
             cur.swap(nxt);
         }
         if (fdbg) { std::fflush(fdbg); std::fclose(fdbg); }
 
-        { std::vector<int8_t> t(XY); for (int i = 0; i < XY; i++) t[i] = (int8_t)cur[i];
+        { std::vector<int8_t> t(XY); unpack_rows(cur, t);
           std::fwrite(t.data(), 1, XY, fo); std::fflush(fo); }
         std::fprintf(stderr, "  image %d/%d done\n", img, n_images); std::fflush(stderr);
     }

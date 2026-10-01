@@ -125,7 +125,7 @@
  * (zero-padded) up to the next multiple of 32 elements.
  */
 void encoder_layer_top(
-    const T_Activation *input,
+    const T_MhaBankWord *input,
     int                 feature_dim,
     int                 tokens_dim,
     int                 intermediate_dim,
@@ -136,7 +136,7 @@ void encoder_layer_top(
     T_MhaTileWord *w1_bank, T_MhaCountWord *w1_counts,
     T_MhaTileWord *w2_bank, T_MhaCountWord *w2_counts,
     const T_Scale *scales,
-    T_Activation  *output,
+    T_MhaBankWord *output,
     int            first_layer,
     int            last_layer
 );
