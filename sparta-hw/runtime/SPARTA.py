@@ -656,7 +656,8 @@ def _build_args(x_buf, y_buf, lb, n_tokens, d, d_h, first_layer=1, last_layer=1)
 
 
 def run_encoder(model_dir, e2e_dir, n_images=1, bitstream=None, instance=None,
-                download=True, base_addr=None, hw_header=None, golden_dir=None):
+                download=True, base_addr=None, hw_header=None, golden_dir=None,
+                n_layers=None):
     """Run encoder inputs from the simulation payload and compare against its golden.
 
     This is the datapath check that needs no torch: `e2e_dir/inputs.bin` holds the
@@ -680,6 +681,10 @@ def run_encoder(model_dir, e2e_dir, n_images=1, bitstream=None, instance=None,
 
     mp = Loader(model_dir)
     layers = mp.layer_indices()
+    if n_layers is not None:
+        # Running a prefix of the encoder leaves the result partway through, so the golden
+        # comparison is meaningless -- this is for timing, not accuracy.
+        layers = layers[:n_layers]
     kernel = HwKernel(bitstream, instance=instance, download=download,
                       base_addr=base_addr,
                       regmap=load_regmap(hw_header) if hw_header else None)
@@ -692,6 +697,7 @@ def run_encoder(model_dir, e2e_dir, n_images=1, bitstream=None, instance=None,
 
     bad = 0
     per_image = []
+    per_layer_s = {}       # layer position -> summed kernel time, to see if the twelve differ
     # invoke() returns its own ap_start -> ap_done wall time, so summing those separates the
     # kernel's time from the host's register writes and struct building.  Worth having: the
     # difference is how much of the frame rate Python is responsible for.
@@ -704,16 +710,18 @@ def run_encoder(model_dir, e2e_dir, n_images=1, bitstream=None, instance=None,
             x_buf, y_buf = a, b
 
             kernel_s = 0.0
-            for L in layers:
+            for n, L in enumerate(layers):
                 # The activation stays on chip between layers: only the first reads it
                 # from DDR and only the last writes it back.
                 args = _build_args(x_buf, y_buf, staged[L], ENC_N, ENC_D, d_h[L],
                                    first_layer=(L == layers[0]),
                                    last_layer=(L == layers[-1]))
+                before = kernel_s
                 try:
                     kernel_s += kernel.invoke(args)
                 except TimeoutError as e:
                     raise RuntimeError(f"image {img} layer {L} hung: {e}") from e
+                per_layer_s[n] = per_layer_s.get(n, 0.0) + (kernel_s - before)
                 x_buf, y_buf = y_buf, x_buf
 
             x_buf.sync_from_device()
@@ -743,9 +751,16 @@ def run_encoder(model_dir, e2e_dir, n_images=1, bitstream=None, instance=None,
         kmean = sum(per_image_kernel) / len(per_image_kernel)
         print(f"  of which kernel (ap_start -> ap_done): {1000 * kmean:.1f} ms "
               f"({100 * kmean / mean:.1f} %), host {1000 * (mean - kmean):.1f} ms")
-        print(f"  kernel per layer: {1000 * kmean / 12:.2f} ms"
-              f"  =  {kmean / 12 * CLOCK_HZ / 1e6:.2f} M cycles at "
+        print(f"  kernel per layer: {1000 * kmean / len(layers):.2f} ms"
+              f"  =  {kmean / len(layers) * CLOCK_HZ / 1e6:.2f} M cycles at "
               f"{CLOCK_HZ / 1e6:.0f} MHz")
+        # Layers 0 and the last are the only ones that convert the activation to/from DDR
+        # (first_layer / last_layer), so they should stand out by a known amount.
+        print("\n  per-layer kernel time (ms) and cycles:")
+        for n in sorted(per_layer_s):
+            t = per_layer_s[n] / len(per_image)
+            print(f"    layer {layers[n]:2d}: {1000 * t:7.3f} ms  "
+                  f"{t * CLOCK_HZ / 1e6:6.3f} M cycles")
     return bad
 
 
@@ -781,6 +796,9 @@ def main():
                          "checked against the ORIGINAL design's golden")
     ap.add_argument("-n", "--images", type=int, default=1,
                     help="how many images from the payload to run (default 1)")
+    ap.add_argument("--n-layers", type=int, default=None,
+                    help="run only the first N encoder layers; for TIMING only, the result is "
+                         "partway through the encoder so the golden comparison will fail")
     ap.add_argument("--clock-mhz", type=float, default=CLOCK_HZ / 1e6,
                     help="fabric clock, for reporting cycles (default %(default)s); the app's "
                          "device-tree overlay sets the real one")
@@ -807,7 +825,8 @@ def main():
     bad = run_encoder(args.model_dir, args.e2e_dir, n_images=args.images,
                       bitstream=args.bitstream, instance=args.instance,
                       download=not args.no_download, base_addr=base,
-                      hw_header=args.hw_header, golden_dir=args.golden_dir)
+                      hw_header=args.hw_header, golden_dir=args.golden_dir,
+                      n_layers=args.n_layers)
     return 1 if bad else 0
 
 

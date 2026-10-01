@@ -96,8 +96,17 @@ if {[get_property PROGRESS [get_runs synth_1]] ne "100%"} {
 puts "CHECKPOINT: synthesis complete"
 
 # ---- implementation + bitstream -------------------------------------------
-puts "\n=== implementation and bitstream ==="
+# Post-route physical optimisation is OFF in Vivado's default strategy and this design needs it.
+# The first build missed 200 MHz by 0.080 ns on four paths out of 161 868, and two of those were
+# only two logic levels deep -- a URAM output reaching a DSP input, where the delay is almost all
+# routing.  No amount of arithmetic restructuring shortens a wire; moving the cells does, which is
+# exactly what this step is for, and it routinely recovers 0.05-0.15 ns.
+#
+# Try this before changing the datapath for a violation this small.
+puts "\n=== implementation and bitstream (with post-route phys_opt) ==="
 reset_run impl_1
+set_property STEPS.POST_ROUTE_PHYS_OPT_DESIGN.IS_ENABLED true [get_runs impl_1]
+set_property STEPS.POST_ROUTE_PHYS_OPT_DESIGN.ARGS.DIRECTIVE AggressiveExplore [get_runs impl_1]
 launch_runs impl_1 -to_step write_bitstream -jobs $jobs
 wait_on_run impl_1
 if {[get_property PROGRESS [get_runs impl_1]] ne "100%"} {
