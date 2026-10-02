@@ -57,7 +57,15 @@ int main(int argc, char** argv) {
     FILE* fi = std::fopen((g_dir + "model_index.bin").c_str(), "rb");
     if (!fi) die("cannot open model_index.bin");
     if ((uint32_t)read_i32(fi) != 0x45324D49u) die("bad model_index magic");
-    const int n_layers = read_i32(fi);
+    int n_layers = read_i32(fi);
+    /* E2E_LAYERS=<k> stops after k layers.  For co-simulation, where one layer is already over a
+     * million cycles of RTL and twelve are impractical; one covers every stage mode.  Safe to
+     * truncate here: model_index.bin is closed straight after, and model.bin is read sequentially
+     * and simply stops early. */
+    if (const char* e = std::getenv("E2E_LAYERS")) {
+        const int k = std::atoi(e);
+        if (k > 0 && k < n_layers) n_layers = k;
+    }
     const int D        = read_i32(fi);
     const int d_h      = read_i32(fi);
     (void)read_i32(fi);   // n_heads
@@ -108,7 +116,14 @@ int main(int argc, char** argv) {
             const int nnz = lm[L].w[w].nnz, nr = lm[L].w[w].n_rows;
             if (nnz % MHA_TILE_PACK) die("weight nnz is not a multiple of MHA_TILE_PACK");
             const int words = nnz / MHA_TILE_PACK;
-            LW[L].bank[w].assign(words + MHA_TILE_PACK, (T_MhaTileWord) 0);
+            /* Co-simulation copies exactly `depth` elements from each m_axi pointer, so a buffer
+             * shorter than its port's declared depth is read off the end -- a SIGSEGV in the
+             * instrumented testbench rather than a diagnostic.  Pad to the depth the pragma in
+             * encoder_layer.cpp declares.  Costs nothing worth measuring: ~59 MB across all twelve
+             * layers, and co-simulation runs one. */
+            if (words > MAX_NNZ) die("weight bank exceeds MAX_NNZ (raise it in csr_bounds.h)");
+            LW[L].bank[w].assign(words + MHA_TILE_PACK > MAX_NNZ ? words + MHA_TILE_PACK : MAX_NNZ,
+                                 (T_MhaTileWord) 0);
             std::vector<uint64_t> t(words); read_raw(fm, t.data(), words, "w.bank");
             for (int i = 0; i < words; i++) LW[L].bank[w][i] = (T_MhaTileWord) t[i];
             /* The counts blob is bytes: MHA_TILES int32 block offsets padded to a whole transfer,
@@ -118,7 +133,12 @@ int main(int argc, char** argv) {
             const int count_words = (count_bytes + MHA_COUNT_PACK - 1) / MHA_COUNT_PACK;
             std::vector<uint8_t> cb(count_words * MHA_COUNT_PACK, 0);
             read_raw(fm, cb.data(), count_bytes, "w.counts");
-            LW[L].counts[w].assign(count_words, (T_MhaCountWord) 0);
+            /* Same reason as the bank above; this is the one that actually crashed cosim, because
+             * the counts ports declare MHA_TILES*(MAX_ROWS+1) -- a count of the blob's BYTES used
+             * as a number of 64-bit transfers, so 8x what the blob needs. */
+            const int counts_depth = MHA_TILES * (MAX_ROWS + 1);
+            LW[L].counts[w].assign(count_words > counts_depth ? count_words : counts_depth,
+                                   (T_MhaCountWord) 0);
             for (int i = 0; i < count_bytes; i++) {
                 LW[L].counts[w][i / MHA_COUNT_PACK].range((i % MHA_COUNT_PACK) * 8 + 7,
                                                           (i % MHA_COUNT_PACK) * 8) = cb[i];

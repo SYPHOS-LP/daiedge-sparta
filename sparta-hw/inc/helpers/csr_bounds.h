@@ -13,6 +13,11 @@
 #define CSR_BOUNDS_H
 
 #define MAX_ROWS 3072   /* output rows of the largest weight (d_h) */
-#define MAX_NNZ  3072   /* packed entries of the largest weight */
+/* Packed WORDS of the largest weight, not entries: the MLP's first linear holds 235 944 entries in
+ * the shipping payload, 58 986 words of MHA_TILE_PACK.  Only co-simulation reads this -- it copies
+ * exactly `depth` elements per m_axi port, so too small means the kernel reads past what was copied
+ * and gets garbage.  Verified to leave synthesis byte-identical (same LUT/FF/BRAM/URAM/DSP and
+ * latency), so it cannot move the bitstream.  Raise it if a denser model is compiled. */
+#define MAX_NNZ  65536  /* packed words of the largest weight, with headroom */
 
 #endif // CSR_BOUNDS_H

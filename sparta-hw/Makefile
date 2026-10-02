@@ -26,7 +26,7 @@
 # ============================================================================
 
 .PHONY: config sim synth full clean help all \
-        native-units native-e2e golden-check regress ip \
+        native-units native-e2e golden-check regress ip cosim \
         $(foreach p,encoder-layer encoder-e2e,config-$(p) sim-$(p) synth-$(p) full-$(p))
 
 # ============================================================================
@@ -94,6 +94,25 @@ sim: config
 synth: config
 	@echo "Running HLS synthesis: $(PROJECT)"
 	$(VPP) -c --mode hls --config $(HLS_CONFIG) --work_dir $(PROJECT_DIR)
+
+# ============================================================================
+# Cosim: run the synthesised RTL against the C testbench and compare
+#
+# The only check short of hardware that executes the pragmas.  The native build and csim both
+# ignore them, so neither can see a DATAFLOW handoff that hands the engine the wrong weight-bank
+# copy -- see docs/plans/06-load-compute-overlap.md.
+#
+# One layer of one image by default: that is already ~1.2 M cycles of RTL and still covers every
+# stage mode (K/Q/V, the output projection, both MLP linears) and many swaps of the bank copies.
+# Needs `make synth PROJECT=encoder_e2e` first, in the same work_dir.
+# ============================================================================
+COSIM_IMAGES ?= 1
+COSIM_LAYERS ?= 1
+
+cosim: config
+	@echo "Running C/RTL co-simulation: $(PROJECT) ($(COSIM_IMAGES) image(s), $(COSIM_LAYERS) layer(s))"
+	E2E_DIR=$(E2E_DIR)/ E2E_IMAGES=$(COSIM_IMAGES) E2E_LAYERS=$(COSIM_LAYERS) \
+	  $(VITIS_RUN) --mode hls --cosim --config $(HLS_CONFIG) --work_dir $(PROJECT_DIR)
 
 # ============================================================================
 # IP: package the kernel as IP-XACT for the block design
