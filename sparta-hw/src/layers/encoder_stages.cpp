@@ -335,31 +335,22 @@ void encoder_layer_stages(
             reinterpret_cast<T_RmsBankWord*>(g_norm_input));
     load_activation_tiles(g_norm_input, 0, MHA_TILE_WORDS);
 
-    /* Three loops, not one, split on where the mode stops changing.
-     *
-     * The MHA loop still carries the per-stage branching: K/Q/V alternate every iteration, the
-     * output projection follows, and head_core runs after each V.  The two MLP loops do not -- each
-     * is a run of row blocks of ONE weight, so the mode, the weight pointer and the scale are all
-     * loop-invariant and the body is just load-then-compute.
-     *
-     * That is what makes them candidates for overlapping the load of the next row block with the
-     * compute of the current one: a DATAFLOW region requires a body of plain function calls, which
-     * the combined loop could never be (HLS reported 12 form violations and merged every process).
-     *
-     * layer_rows and the loaders stay single-instance through the ALLOCATION pragmas above, so
-     * splitting the loop does not duplicate the engine.
-     */
-
-    MHA_STAGE:
-    for (int stage = 0; stage < h_first; stage++) {
-        #pragma HLS LOOP_TRIPCOUNT min=48 max=48
+    LAYER_STAGE:
+    for (int stage = 0; stage < y_first + y_stages; stage++) {
+        #pragma HLS LOOP_TRIPCOUNT min=108 max=108
         #pragma HLS LOOP_FLATTEN off
 
-        const int mode = (stage < o_first) ? ((stage % 3 == 0) ? ROWS_MHA_K
+        /* Which weight this stage computes, and which of its row blocks. */
+        const int mode = (stage <  o_first) ? ((stage % 3 == 0) ? ROWS_MHA_K
                                             : (stage % 3 == 1) ? ROWS_MHA_Q : ROWS_MHA_V)
-                                           : ROWS_MHA_O;
+                       : (stage <  h_first) ? ROWS_MHA_O
+                       : (stage <  y_first) ? ROWS_MLP_H
+                                            : ROWS_MLP_Y;
         const int head  = (stage < o_first) ? (stage / 3) : 0;
-        const int block = (stage < o_first) ? head : (stage - o_first);
+        const int block = (stage <  o_first) ? head
+                        : (stage <  h_first) ? (stage - o_first)
+                        : (stage <  y_first) ? (stage - h_first)
+                                             : (stage - y_first);
         const int row_base = block * MHA_FEATURE_HEAD;
         const int first    = (block == 0);
 
@@ -367,7 +358,19 @@ void encoder_layer_stages(
         if (mode == ROWS_MHA_O && first) {
             load_activation_tiles(g_attn_heads, 0, MHA_TILE_WORDS);
         }
+        /* Between the halves: close the attention residual, then normalize for the MLP. */
+        if (mode == ROWS_MLP_H && first) {
+            residual_add(g_stream, g_stream_mid, feature_dim * MHA_BANK_ROW_WORDS,
+                         scales[SCALE_ATT_RESIDUAL_IDX], scales[SCALE_ATT_BRANCH_RATIO_IDX],
+                         g_stream_mid);
+            rmsnorm(reinterpret_cast<const T_RmsBankWord*>(g_stream_mid), tokens_dim, feature_dim,
+                    scales[SCALE_FF_RMSNORM_OUT_INV_IDX],
+                    reinterpret_cast<T_RmsBankWord*>(g_norm_input));
+            load_activation_tiles(g_norm_input, 0, MHA_TILE_WORDS);
+        }
 
+        /* This stage's weight; one branch each, all in this scope, so HLS multiplexes the AXI
+         * ports itself rather than needing a pointer selection in source. */
         if (mode == ROWS_MHA_K) {
             if (first) { load_weight_bases(wk_counts, SPMM_W_K); }
             load_weight_slice(wk_bank, wk_counts, feature_dim, SPMM_W_K, row_base, MHA_FEATURE_HEAD);
@@ -377,15 +380,23 @@ void encoder_layer_stages(
         } else if (mode == ROWS_MHA_V) {
             if (first) { load_weight_bases(wv_counts, SPMM_W_V); }
             load_weight_slice(wv_bank, wv_counts, feature_dim, SPMM_W_V, row_base, MHA_FEATURE_HEAD);
-        } else {
+        } else if (mode == ROWS_MHA_O) {
             if (first) { load_weight_bases(wo_counts, SPMM_W_O); }
             load_weight_slice(wo_bank, wo_counts, feature_dim, SPMM_W_O, row_base, MHA_FEATURE_HEAD);
+        } else if (mode == ROWS_MLP_H) {
+            if (first) { load_weight_bases(w1_counts, SPMM_W_MLP1); }
+            load_weight_slice(w1_bank, w1_counts, hidden_dim, SPMM_W_MLP1, row_base, MHA_FEATURE_HEAD);
+        } else {
+            if (first) { load_weight_bases(w2_counts, SPMM_W_MLP2); }
+            load_weight_slice(w2_bank, w2_counts, feature_dim, SPMM_W_MLP2, row_base, MHA_FEATURE_HEAD);
         }
 
         const T_Scale scale = (mode == ROWS_MHA_K) ? scales[SCALE_K_IDX]
                             : (mode == ROWS_MHA_Q) ? scales[SCALE_Q_IDX]
                             : (mode == ROWS_MHA_V) ? scales[SCALE_V_IDX]
-                                                   : scales[SCALE_LINEAR_OUT_IDX];
+                            : (mode == ROWS_MHA_O) ? scales[SCALE_LINEAR_OUT_IDX]
+                            : (mode == ROWS_MLP_H) ? scales[SCALE_FC1_IDX]
+                                                   : scales[SCALE_FC2_IDX];
 
         layer_rows(mode, row_base, MHA_FEATURE_HEAD, tokens_dim, scale);
 
@@ -396,36 +407,6 @@ void encoder_layer_stages(
                   g_k_val, g_k_col, g_k_ptr,
                   g_q_val, g_q_col, g_q_ptr,
                   g_v_head, g_attn_heads);
-    }
-
-    /* Between the halves: close the attention residual, then normalize for the MLP. */
-    residual_add(g_stream, g_stream_mid, feature_dim * MHA_BANK_ROW_WORDS,
-                 scales[SCALE_ATT_RESIDUAL_IDX], scales[SCALE_ATT_BRANCH_RATIO_IDX],
-                 g_stream_mid);
-    rmsnorm(reinterpret_cast<const T_RmsBankWord*>(g_stream_mid), tokens_dim, feature_dim,
-            scales[SCALE_FF_RMSNORM_OUT_INV_IDX],
-            reinterpret_cast<T_RmsBankWord*>(g_norm_input));
-    load_activation_tiles(g_norm_input, 0, MHA_TILE_WORDS);
-    load_weight_bases(w1_counts, SPMM_W_MLP1);
-
-    MLP1_STAGE:
-    for (int block = 0; block < h_stages; block++) {
-        #pragma HLS LOOP_TRIPCOUNT min=48 max=48
-        #pragma HLS LOOP_FLATTEN off
-        const int row_base = block * MHA_FEATURE_HEAD;
-        load_weight_slice(w1_bank, w1_counts, hidden_dim, SPMM_W_MLP1, row_base, MHA_FEATURE_HEAD);
-        layer_rows(ROWS_MLP_H, row_base, MHA_FEATURE_HEAD, tokens_dim, scales[SCALE_FC1_IDX]);
-    }
-
-    load_weight_bases(w2_counts, SPMM_W_MLP2);
-
-    MLP2_STAGE:
-    for (int block = 0; block < y_stages; block++) {
-        #pragma HLS LOOP_TRIPCOUNT min=12 max=12
-        #pragma HLS LOOP_FLATTEN off
-        const int row_base = block * MHA_FEATURE_HEAD;
-        load_weight_slice(w2_bank, w2_counts, feature_dim, SPMM_W_MLP2, row_base, MHA_FEATURE_HEAD);
-        layer_rows(ROWS_MLP_Y, row_base, MHA_FEATURE_HEAD, tokens_dim, scales[SCALE_FC2_IDX]);
     }
 
     residual_add(g_stream_mid, g_stream, feature_dim * MHA_BANK_ROW_WORDS,
