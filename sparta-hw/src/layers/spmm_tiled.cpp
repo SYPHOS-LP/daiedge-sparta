@@ -33,8 +33,6 @@ static_assert((int)T_MhaWVal::width >= MHA_ENTRY_VAL_BITS,
  * MHA_TILE_PACK word, plus the per-(column block, row) nonzero counts.
  * ------------------------------------------------------------------------------------ */
 T_MhaBankWord  g_act_tile[MHA_TILES][MHA_TILE_WORDS_MAX];
-static T_MhaTileWord  g_bank[MHA_TILES][MHA_TILE_BANK_WORDS];
-static T_MhaTileCount g_bank_count[MHA_TILES][MHA_FEATURE_HEAD];
 
 /* Engine state kept at file scope on purpose: with no caller-specific pointer arguments every
  * call to tiled_rows_compute() has identical bindings, which is what lets HLS build ONE engine
@@ -42,14 +40,14 @@ static T_MhaTileCount g_bank_count[MHA_TILES][MHA_FEATURE_HEAD];
 static int      g_bank_cursor[MHA_TILES];
 
 /* DDR position of the next row block, per weight matrix slot (SpmmWeightSlot) and column block.
- * g_block_word0 is the column block's first packed word in DDR, g_slice_entry the entry index
- * within the block where the next row block starts, and g_slice_cursor0 that entry's slot within
- * its packed word.  Reads start at the word boundary below the first entry (up to
- * MHA_TILE_PACK-1 unused entries precede the slice in the bank) so that no data realignment is
- * needed.  The weight matrices are interleaved across stages, so each keeps its own position. */
+ * g_block_word0 is the column block's first packed word in DDR and g_slice_entry the entry index
+ * within the block where the next row block starts; the slot that entry occupies within its packed
+ * word goes to the engine through the slice's `cursor0` argument.  Reads start at the word boundary
+ * below the first entry (up to MHA_TILE_PACK-1 unused entries precede the slice in the bank) so
+ * that no data realignment is needed.  The weight matrices are interleaved across stages, so each
+ * keeps its own position.  Both are loader-private: the engine never reads them. */
 static int g_block_word0[SPMM_N_WEIGHTS][MHA_TILES];
 static int g_slice_entry[SPMM_N_WEIGHTS][MHA_TILES];
-static int g_slice_cursor0[MHA_TILES];
 
 /* The engine's accumulators; declared in spmm_tiled.h, which also carries the rule for draining
  * them (tiled_lane_sum). */
@@ -112,19 +110,21 @@ void load_weight_bases (T_MhaCountWord* w_counts, int which) {
  * @param[in] feature_dim  Output rows of the weight matrix (row stride of w_counts).
  * @param[in] which        Weight matrix slot (SpmmWeightSlot).
  * @param[in] row_base     First output row of this stage.
- * @param[in] rows         Output rows in this stage.
+ * @param[in]  rows        Output rows in this stage.
+ * @param[out] bank        Packed entries of this slice, one bank per column block.
+ * @param[out] counts      Nonzeros of this slice per (column block, row).
+ * @param[out] cursor0     Slot within its packed word that each block's first entry occupies.
  */
 void load_weight_slice (T_MhaTileWord* w_bank, T_MhaCountWord* w_counts,
-                        int feature_dim, int which, int row_base, int rows) {
+                        int feature_dim, int which, int row_base, int rows,
+                        T_MhaSliceBank   bank,
+                        T_MhaSliceCount  counts,
+                        T_MhaSliceCursor cursor0) {
 #pragma HLS INLINE off
-    /* A bank is 64-bit words, MHA_TILE_BANK_WORDS deep: one URAM each (72 b x 4096), where BRAM
-     * would need ~12 BRAM18 per bank for the same data (18 b per port, 1024 deep).
-     *
-     * If MHA_TILES is ever raised, the banks shrink and URAM becomes the wrong home for them --
-     * see the 24-lane attempt in docs/plans/05-lane-balance.md, where they had to move to BRAM and
-     * BRAM then saturated instead. */
-    #pragma HLS BIND_STORAGE variable=g_bank type=ram_t2p impl=uram
-    #pragma HLS ARRAY_PARTITION variable=g_bank_count complete dim=1
+    /* The banks are declared by the caller (encoder_stages.cpp), which is also where their storage
+     * is chosen; here they are just an output port per column block. */
+    #pragma HLS ARRAY_PARTITION variable=counts  complete dim=1
+    #pragma HLS ARRAY_PARTITION variable=cursor0 complete dim=1
     int slice_words[MHA_TILES], slice_word0[MHA_TILES];
     #pragma HLS ARRAY_PARTITION variable=slice_words complete dim=1
     #pragma HLS ARRAY_PARTITION variable=slice_word0 complete dim=1
@@ -163,7 +163,7 @@ void load_weight_slice (T_MhaTileWord* w_bank, T_MhaCountWord* w_counts,
         for (int p = 0; p < MHA_COUNT_PACK; p++) {
             #pragma HLS UNROLL
             const T_MhaTileCount n = (T_MhaTileCount) word.range(p * 8 + 7, p * 8);
-            g_bank_count[ct][cw * MHA_COUNT_PACK + p] = n;
+            counts[ct][cw * MHA_COUNT_PACK + p] = n;
             len += (int) n;
         }
         slice_len[ct] += len;
@@ -179,7 +179,7 @@ void load_weight_slice (T_MhaTileWord* w_bank, T_MhaCountWord* w_counts,
         assert(lane + slice_len[t] <= MHA_TILE_NNZ_MAX &&
                "weight row block exceeds MHA_TILE_NNZ_MAX (raise the cap)");
 #endif
-        g_slice_cursor0[t]      = lane;
+        cursor0[t]              = lane;
         g_slice_entry[which][t] = start + slice_len[t];
         slice_word0[t]          = g_block_word0[which][t] + start / MHA_TILE_PACK;
         slice_words[t]     = (lane + slice_len[t] + MHA_TILE_PACK - 1) / MHA_TILE_PACK;
@@ -223,7 +223,7 @@ void load_weight_slice (T_MhaTileWord* w_bank, T_MhaCountWord* w_counts,
             }
         }
         const int w = i - bank_prefix[t];
-        g_bank[t][w] = w_bank[slice_word0[t] + w];
+        bank[t][w] = w_bank[slice_word0[t] + w];
     }
 }
 
@@ -307,22 +307,30 @@ static inline void mac_pe (
  * partial row.  The lanes advance together, so the row costs the busiest lane; removing that cost
  * is plan B in docs/plans/05-lane-balance.md.
  *
- * Reads g_bank / g_act_tile / g_bank_count, advances g_bank_cursor, and leaves the row's per-lane
- * partial sums in g_lane_partial for the caller to drain through tiled_lane_sum().
+ * Reads the slice the loader produced (bank / counts / cursor0) and g_act_tile, advances
+ * g_bank_cursor, and leaves the row's per-lane partial sums in g_lane_partial for the caller to
+ * drain through tiled_lane_sum().
  *
  * @param[in] row_local   Output row within the weight slice the banks currently hold (0..rows-1).
  * @param[in] tokens_dim  Number of tokens.
  * @param[in] act_base    Which activation region inside each tile (see load_activation_tiles).
+ * @param[in] bank        Packed entries of the slice being computed.
+ * @param[in] counts      Its nonzeros per (column block, row).
+ * @param[in] cursor0     Its first entry's slot within its packed word, per column block.
  */
 void tiled_rows_compute (
     int row_local,
     int tokens_dim,
-    int act_base
+    int act_base,
+    const T_MhaSliceBank   bank,
+    const T_MhaSliceCount  counts,
+    const T_MhaSliceCursor cursor0
 ) {
 #pragma HLS INLINE off
 #pragma HLS ARRAY_PARTITION variable=g_act_tile   complete dim=1
-#pragma HLS ARRAY_PARTITION variable=g_bank       complete dim=1
-#pragma HLS ARRAY_PARTITION variable=g_bank_count complete dim=1
+#pragma HLS ARRAY_PARTITION variable=bank         complete dim=1
+#pragma HLS ARRAY_PARTITION variable=counts       complete dim=1
+#pragma HLS ARRAY_PARTITION variable=cursor0      complete dim=1
 #pragma HLS ARRAY_PARTITION variable=g_bank_cursor complete dim=1
     /* Lane t only ever touches g_lane_partial[t], so the lanes' updates are independent. */
 #pragma HLS ARRAY_PARTITION variable=g_lane_partial complete dim=1
@@ -345,7 +353,7 @@ void tiled_rows_compute (
         CURSOR_RESET:
         for (int t = 0; t < MHA_TILES; t++) {
             #pragma HLS UNROLL
-            g_bank_cursor[t] = g_slice_cursor0[t];
+            g_bank_cursor[t] = cursor0[t];
         }
     }
 
@@ -356,7 +364,7 @@ void tiled_rows_compute (
     LANE_INIT:
     for (int t = 0; t < MHA_TILES; t++) {
         #pragma HLS UNROLL
-        const int nnz = (int) g_bank_count[t][row_local];
+        const int nnz = (int) counts[t][row_local];
         lane_nnz[t] = nnz;
         if (nnz > max_nnz) {
             max_nnz = nnz;
@@ -387,7 +395,7 @@ void tiled_rows_compute (
                 const int    entry = g_bank_cursor[t] + nz;
                 T_MhaWVal    val;
                 T_MhaTileCol col;
-                bank_entry(g_bank[t][entry / MHA_TILE_PACK], entry % MHA_TILE_PACK, val, col);
+                bank_entry(bank[t][entry / MHA_TILE_PACK], entry % MHA_TILE_PACK, val, col);
 
                 const T_MhaBankWord act = g_act_tile[t][act_base + (int) col * MHA_BANK_ROW_WORDS + w];
                 const int           tok = w * MHA_BANK_PACK;

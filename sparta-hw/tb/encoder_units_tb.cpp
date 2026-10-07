@@ -127,12 +127,19 @@ static void fill_tiles(const std::vector<std::vector<int>> &act, int tokens) {
 
 /* Run the engine over every row and return out[row][token], draining as the kernel's tail does. */
 static std::vector<std::vector<long>> run_engine(Payload &p, int rows, int cols, int tokens) {
+    /* The slice the loader hands to the engine; the kernel declares the same three inside its
+     * stage loop.  Static, because a bank is 60 kB and this runs on the host stack. */
+    static T_MhaSliceBank   bank;
+    static T_MhaSliceCount  counts;
+    static T_MhaSliceCursor cursor0;
+
     load_weight_bases(p.counts.data(), SPMM_W_K);
-    load_weight_slice(p.bank.data(), p.counts.data(), rows, SPMM_W_K, 0, rows);
+    load_weight_slice(p.bank.data(), p.counts.data(), rows, SPMM_W_K, 0, rows,
+                      bank, counts, cursor0);
 
     std::vector<std::vector<long>> out(rows, std::vector<long>(tokens, 0));
     for (int r = 0; r < rows; r++) {
-        tiled_rows_compute(r, tokens, 0);
+        tiled_rows_compute(r, tokens, 0, bank, counts, cursor0);
         /* Every token below tokens_dim must be drained, or the next row inherits the leftovers --
          * which is exactly the contract this testbench is here to police. */
         for (int tok = 0; tok < tokens; tok++) {

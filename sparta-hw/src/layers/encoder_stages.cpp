@@ -119,13 +119,19 @@ static void copy_activation_out (const T_MhaBankWord *src, T_MhaBankWord *dst, i
  * @param[in]  rows        Output rows in this block.
  * @param[in]  tokens_dim  Number of tokens.
  * @param[in]  scale       Folded requantization scale of this weight.
+ * @param[in]  bank        This row block's packed entries, from load_weight_slice.
+ * @param[in]  counts      Its nonzeros per (column block, row).
+ * @param[in]  cursor0     Its first entry's slot within its packed word, per column block.
  */
 static void layer_rows (
     int           mode,
     int           row_base,
     int           rows,
     int           tokens_dim,
-    T_Scale       scale
+    T_Scale       scale,
+    const T_MhaSliceBank   bank,
+    const T_MhaSliceCount  counts,
+    const T_MhaSliceCursor cursor0
 ) {
 #pragma HLS INLINE off
     const int row_words = (tokens_dim + MHA_BANK_PACK - 1) / MHA_BANK_PACK;
@@ -147,7 +153,7 @@ static void layer_rows (
     for (int i = 0; i < rows; i++) {
         #pragma HLS LOOP_TRIPCOUNT min=MHA_FEATURE_HEAD max=MHA_FEATURE_HEAD
 
-        tiled_rows_compute(i, tokens_dim, act_base);
+        tiled_rows_compute(i, tokens_dim, act_base, bank, counts, cursor0);
 
         /* Requantize the accumulated row once, MHA_BANK_PACK values per cycle, into row_q; the
          * tails then only move bytes.  The six tails are mutually exclusive, so giving each its own
@@ -270,6 +276,236 @@ static void layer_rows (
 }
 
 
+/* ------------------------------------------------------------------------------------
+ * The stage loop, as a loader half and a compute half
+ *
+ * The two halves are concurrent processes, so stage N+1's weight slice is fetched while stage N is
+ * still being computed (docs/plans/06-load-compute-overlap.md).  Three constraints follow, and all
+ * three are why this is one loop of two calls rather than the readable single loop it replaces:
+ *
+ *  - ONE loop over every stage.  A DATAFLOW region cannot share hardware with anything outside it,
+ *    so an engine inside a per-weight region is a SECOND engine; marking two MLP loops was measured
+ *    at 3 copies of layer_rows and 2x the LUT.  One region means one loop.
+ *  - A body of nothing but calls.  Every per-stage choice -- which weight, which tail, which scale,
+ *    which boundary work -- therefore moves inside the two halves, which derive it from `stage`.
+ *  - The slice reaches the engine as arguments, not globals, so HLS can place the second copy that
+ *    lets one half write while the other reads.
+ * ------------------------------------------------------------------------------------ */
+
+/**
+ * @brief What stage `stage` computes: which weight, which row block of it, and whether that block
+ *        is the weight's first (the point at which its DDR bases must be re-read).
+ *
+ * Derived from the stage index alone, so the two halves agree on the schedule without exchanging
+ * anything -- the loader is a stage ahead and cannot be told where it is.
+ */
+static void stage_plan (int stage, int o_first, int h_first, int y_first,
+                        int &mode, int &head, int &row_base, int &first) {
+#pragma HLS INLINE
+    int block;
+    if (stage < o_first) {
+        const int phase = stage % 3;
+        mode  = (phase == 0) ? ROWS_MHA_K : (phase == 1) ? ROWS_MHA_Q : ROWS_MHA_V;
+        head  = stage / 3;
+        block = head;
+    } else if (stage < h_first) {
+        mode = ROWS_MHA_O; head = 0; block = stage - o_first;
+    } else if (stage < y_first) {
+        mode = ROWS_MLP_H; head = 0; block = stage - h_first;
+    } else {
+        mode = ROWS_MLP_Y; head = 0; block = stage - y_first;
+    }
+    row_base = block * MHA_FEATURE_HEAD;
+    first    = (block == 0);
+}
+
+/**
+ * @brief Loader half: fetch this stage's weight slice into the banks.
+ *
+ * Reads DDR and the loader's own position state and nothing else, so it depends on nothing the
+ * compute half produces.  That independence is what lets it run a stage ahead.
+ */
+static void stage_load (
+    int stage, int o_first, int h_first, int y_first,
+    int feature_dim, int hidden_dim,
+    T_MhaTileWord *wq_bank, T_MhaCountWord *wq_counts,
+    T_MhaTileWord *wk_bank, T_MhaCountWord *wk_counts,
+    T_MhaTileWord *wv_bank, T_MhaCountWord *wv_counts,
+    T_MhaTileWord *wo_bank, T_MhaCountWord *wo_counts,
+    T_MhaTileWord *w1_bank, T_MhaCountWord *w1_counts,
+    T_MhaTileWord *w2_bank, T_MhaCountWord *w2_counts,
+    T_MhaSliceBank bank, T_MhaSliceCount counts, T_MhaSliceCursor cursor0
+) {
+#pragma HLS INLINE off
+    #pragma HLS ALLOCATION instances=load_weight_slice limit=1 function
+    #pragma HLS ALLOCATION instances=load_weight_bases limit=1 function
+
+    int mode, head, row_base, first;
+    stage_plan(stage, o_first, h_first, y_first, mode, head, row_base, first);
+
+    /* The counts' row stride is the weight's output row count: the feature width for the four
+     * projections and the MLP's second linear, the hidden width for its first. */
+    if (mode == ROWS_MHA_K) {
+        if (first) { load_weight_bases(wk_counts, SPMM_W_K); }
+        load_weight_slice(wk_bank, wk_counts, feature_dim, SPMM_W_K, row_base, MHA_FEATURE_HEAD,
+                          bank, counts, cursor0);
+    } else if (mode == ROWS_MHA_Q) {
+        if (first) { load_weight_bases(wq_counts, SPMM_W_Q); }
+        load_weight_slice(wq_bank, wq_counts, feature_dim, SPMM_W_Q, row_base, MHA_FEATURE_HEAD,
+                          bank, counts, cursor0);
+    } else if (mode == ROWS_MHA_V) {
+        if (first) { load_weight_bases(wv_counts, SPMM_W_V); }
+        load_weight_slice(wv_bank, wv_counts, feature_dim, SPMM_W_V, row_base, MHA_FEATURE_HEAD,
+                          bank, counts, cursor0);
+    } else if (mode == ROWS_MHA_O) {
+        if (first) { load_weight_bases(wo_counts, SPMM_W_O); }
+        load_weight_slice(wo_bank, wo_counts, feature_dim, SPMM_W_O, row_base, MHA_FEATURE_HEAD,
+                          bank, counts, cursor0);
+    } else if (mode == ROWS_MLP_H) {
+        if (first) { load_weight_bases(w1_counts, SPMM_W_MLP1); }
+        load_weight_slice(w1_bank, w1_counts, hidden_dim, SPMM_W_MLP1, row_base, MHA_FEATURE_HEAD,
+                          bank, counts, cursor0);
+    } else {
+        if (first) { load_weight_bases(w2_counts, SPMM_W_MLP2); }
+        load_weight_slice(w2_bank, w2_counts, feature_dim, SPMM_W_MLP2, row_base, MHA_FEATURE_HEAD,
+                          bank, counts, cursor0);
+    }
+}
+
+/**
+ * @brief Compute half: the boundary work this stage opens with, then the engine over its row block.
+ *
+ * RMSNorm, both residual adds and the activation tiling live here rather than between loops because
+ * only one process may touch g_stream / g_stream_mid / g_act_tile if those are to stay ordinary
+ * memories instead of becoming channels.  Each of the three phases reads a different activation, so
+ * each opens with the work that produces it.
+ */
+static void stage_compute (
+    int stage, int n_stages, int o_first, int h_first, int y_first,
+    int tokens_dim, int feature_dim,
+    const T_Scale *scales,
+    const T_MhaSliceBank bank, const T_MhaSliceCount counts, const T_MhaSliceCursor cursor0
+) {
+#pragma HLS INLINE off
+    #pragma HLS ALLOCATION instances=layer_rows            limit=1 function
+    #pragma HLS ALLOCATION instances=load_activation_tiles limit=1 function
+    #pragma HLS ALLOCATION instances=rmsnorm               limit=1 function
+    #pragma HLS ALLOCATION instances=residual_add          limit=1 function
+
+    #pragma HLS BIND_STORAGE    variable=g_v_head     type=ram_t2p impl=bram
+    #pragma HLS ARRAY_PARTITION variable=g_v_head cyclic factor=MHA_BANK_PACK dim=1
+    #pragma HLS BIND_STORAGE    variable=g_q_scratch  type=ram_t2p impl=bram
+    #pragma HLS ARRAY_PARTITION variable=g_q_scratch cyclic factor=MHA_BANK_PACK dim=1
+    #pragma HLS BIND_STORAGE    variable=g_k_val      type=ram_t2p impl=bram
+    #pragma HLS BIND_STORAGE    variable=g_k_col      type=ram_t2p impl=bram
+    #pragma HLS BIND_STORAGE    variable=g_q_val      type=ram_t2p impl=bram
+    #pragma HLS BIND_STORAGE    variable=g_q_col      type=ram_t2p impl=bram
+    #pragma HLS BIND_STORAGE    variable=g_attn_heads type=ram_t2p impl=uram
+    #pragma HLS ARRAY_PARTITION variable=g_attn_heads cyclic factor=MHA_BANK_CYCLIC dim=1
+    #pragma HLS BIND_STORAGE    variable=g_stream_mid type=ram_t2p impl=uram
+    #pragma HLS BIND_STORAGE    variable=g_norm_input type=ram_t2p impl=uram
+    #pragma HLS ARRAY_PARTITION variable=g_norm_input cyclic factor=MHA_BANK_CYCLIC dim=1
+
+    int mode, head, row_base, first;
+    stage_plan(stage, o_first, h_first, y_first, mode, head, row_base, first);
+
+    const int stream_words = feature_dim * MHA_BANK_ROW_WORDS;
+
+    if (stage == 0) {
+        /* The attention input: the layer input, normalized. */
+        rmsnorm(reinterpret_cast<const T_RmsBankWord*>(g_stream), tokens_dim, feature_dim,
+                scales[SCALE_ATT_RMSNORM_OUT_INV_IDX],
+                reinterpret_cast<T_RmsBankWord*>(g_norm_input));
+        load_activation_tiles(g_norm_input, 0, MHA_TILE_WORDS);
+    } else if (stage == o_first) {
+        /* The output projection reads the attention result, not the layer input. */
+        load_activation_tiles(g_attn_heads, 0, MHA_TILE_WORDS);
+    } else if (stage == h_first) {
+        /* Between the halves: close the attention residual, then normalize for the MLP. */
+        residual_add(g_stream, g_stream_mid, stream_words,
+                     scales[SCALE_ATT_RESIDUAL_IDX], scales[SCALE_ATT_BRANCH_RATIO_IDX],
+                     g_stream_mid);
+        rmsnorm(reinterpret_cast<const T_RmsBankWord*>(g_stream_mid), tokens_dim, feature_dim,
+                scales[SCALE_FF_RMSNORM_OUT_INV_IDX],
+                reinterpret_cast<T_RmsBankWord*>(g_norm_input));
+        load_activation_tiles(g_norm_input, 0, MHA_TILE_WORDS);
+    }
+
+    const T_Scale scale = (mode == ROWS_MHA_K) ? scales[SCALE_K_IDX]
+                        : (mode == ROWS_MHA_Q) ? scales[SCALE_Q_IDX]
+                        : (mode == ROWS_MHA_V) ? scales[SCALE_V_IDX]
+                        : (mode == ROWS_MHA_O) ? scales[SCALE_LINEAR_OUT_IDX]
+                        : (mode == ROWS_MLP_H) ? scales[SCALE_FC1_IDX]
+                                               : scales[SCALE_FC2_IDX];
+
+    layer_rows(mode, row_base, MHA_FEATURE_HEAD, tokens_dim, scale, bank, counts, cursor0);
+
+    /* V is the last of a head's three projections, so the head's attention runs here.  Called
+     * unconditionally with an enable: a call inside an `if` makes HLS specialise the body for that
+     * case, which duplicates layer_rows. */
+    head_core(mode == ROWS_MHA_V, head, tokens_dim, scales[SCALE_DIV_OUT_IDX],
+              g_k_val, g_k_col, g_k_ptr,
+              g_q_val, g_q_col, g_q_ptr,
+              g_v_head, g_attn_heads);
+
+    /* The feed-forward residual closes the layer. */
+    if (stage == n_stages - 1) {
+        residual_add(g_stream_mid, g_stream, stream_words,
+                     scales[SCALE_FF_RESIDUAL_IDX], scales[SCALE_FF_BRANCH_RATIO_IDX],
+                     g_stream);
+    }
+}
+
+/**
+ * @brief Every stage of the layer, the loader running one ahead of the engine.
+ *
+ * `n_stages` is an argument rather than an expression because a DATAFLOW loop's bound has to be a
+ * constant or a function argument.
+ */
+static void stage_loop (
+    int n_stages, int o_first, int h_first, int y_first,
+    int tokens_dim, int feature_dim, int hidden_dim,
+    T_MhaTileWord *wq_bank, T_MhaCountWord *wq_counts,
+    T_MhaTileWord *wk_bank, T_MhaCountWord *wk_counts,
+    T_MhaTileWord *wv_bank, T_MhaCountWord *wv_counts,
+    T_MhaTileWord *wo_bank, T_MhaCountWord *wo_counts,
+    T_MhaTileWord *w1_bank, T_MhaCountWord *w1_counts,
+    T_MhaTileWord *w2_bank, T_MhaCountWord *w2_counts,
+    const T_Scale *scales
+) {
+#pragma HLS INLINE off
+    STAGE:
+    for (int stage = 0; stage < n_stages; stage++) {
+        #pragma HLS LOOP_TRIPCOUNT min=108 max=108
+        #pragma HLS DATAFLOW
+        /* The weight slice in flight, declared inside the region because that is what makes it a
+         * channel: one iteration's slice, which HLS gives two copies of so the loader can fill the
+         * next while the engine reads this one.  Declared outside the loop it is an ordinary shared
+         * memory instead, and HLS says so (214-113).
+         *
+         * A bank is 64-bit words, MHA_TILE_BANK_WORDS deep: one URAM each (72 b x 4096), where BRAM
+         * would need ~12 BRAM18 per bank for the same data (18 b per port, 1024 deep).  If
+         * MHA_TILES is ever raised the banks shrink and URAM becomes the wrong home for them -- see
+         * the 24-lane attempt in docs/plans/05-lane-balance.md, where they moved to BRAM and BRAM
+         * then saturated instead. */
+        T_MhaSliceBank   bank;
+        T_MhaSliceCount  counts;
+        T_MhaSliceCursor cursor0;
+        #pragma HLS BIND_STORAGE    variable=bank type=ram_t2p impl=uram
+        #pragma HLS ARRAY_PARTITION variable=bank    complete dim=1
+        #pragma HLS ARRAY_PARTITION variable=counts  complete dim=1
+        #pragma HLS ARRAY_PARTITION variable=cursor0 complete dim=1
+
+        stage_load(stage, o_first, h_first, y_first, feature_dim, hidden_dim,
+                   wq_bank, wq_counts, wk_bank, wk_counts, wv_bank, wv_counts,
+                   wo_bank, wo_counts, w1_bank, w1_counts, w2_bank, w2_counts,
+                   bank, counts, cursor0);
+        stage_compute(stage, n_stages, o_first, h_first, y_first, tokens_dim, feature_dim,
+                      scales, bank, counts, cursor0);
+    }
+}
+
+
 void encoder_layer_stages(
     const T_MhaBankWord *input,
     int                 tokens_dim,
@@ -291,24 +527,10 @@ void encoder_layer_stages(
     assert(tokens_dim <= MHA_TOKEN_W_MAX && "tokens_dim exceeds MHA_TOKEN_W_MAX");
     assert(hidden_dim <= ENC_HIDDEN_W_MAX && "hidden_dim exceeds ENC_HIDDEN_W_MAX");
 #endif
-    #pragma HLS BIND_STORAGE variable=g_v_head     type=ram_t2p impl=bram
-    #pragma HLS ARRAY_PARTITION variable=g_v_head cyclic factor=MHA_BANK_PACK dim=1
-    #pragma HLS BIND_STORAGE variable=g_q_scratch  type=ram_t2p impl=bram
-    #pragma HLS ARRAY_PARTITION variable=g_q_scratch cyclic factor=MHA_BANK_PACK dim=1
-    #pragma HLS BIND_STORAGE variable=g_k_val      type=ram_t2p impl=bram
-    #pragma HLS BIND_STORAGE variable=g_k_col      type=ram_t2p impl=bram
-    #pragma HLS BIND_STORAGE variable=g_q_val      type=ram_t2p impl=bram
-    #pragma HLS BIND_STORAGE variable=g_q_col      type=ram_t2p impl=bram
-    #pragma HLS BIND_STORAGE   variable=g_attn_heads type=ram_t2p impl=uram
-    #pragma HLS ARRAY_PARTITION variable=g_attn_heads cyclic factor=MHA_BANK_CYCLIC dim=1
     #pragma HLS BIND_STORAGE   variable=g_stream    type=ram_t2p impl=uram
-    #pragma HLS BIND_STORAGE   variable=g_stream_mid type=ram_t2p impl=uram
-    #pragma HLS BIND_STORAGE   variable=g_norm_input type=ram_t2p impl=uram
-    #pragma HLS ARRAY_PARTITION variable=g_norm_input cyclic factor=MHA_BANK_CYCLIC dim=1
 
     /* Stage layout: 3 per head for K/Q/V, then the output projection's row blocks, then the two
-     * MLP linears' row blocks.  All of it in one loop, so layer_rows and the weight loaders have
-     * one call site each. */
+     * MLP linears' row blocks. */
     const int qkv_stages = 3 * MHA_N_HEADS;
     const int o_stages   = feature_dim / MHA_FEATURE_HEAD;
     const int h_stages   = hidden_dim  / MHA_FEATURE_HEAD;
@@ -316,13 +538,7 @@ void encoder_layer_stages(
     const int o_first    = qkv_stages;
     const int h_first    = o_first + o_stages;
     const int y_first    = h_first + h_stages;
-
-    #pragma HLS ALLOCATION instances=layer_rows         limit=1 function
-    #pragma HLS ALLOCATION instances=load_weight_slice  limit=1 function
-    #pragma HLS ALLOCATION instances=load_weight_bases  limit=1 function
-    #pragma HLS ALLOCATION instances=load_activation_tiles limit=1 function
-    #pragma HLS ALLOCATION instances=rmsnorm            limit=1 function
-    #pragma HLS ALLOCATION instances=residual_add       limit=1 function
+    const int n_stages   = y_first + y_stages;
 
     /* g_stream keeps its contents between calls, and the previous layer left its output there, so
      * only the first layer reads the activation from external memory and only the last writes back.
@@ -330,88 +546,12 @@ void encoder_layer_stages(
     if (first_layer) {
         copy_activation_in(input, g_stream, feature_dim * MHA_BANK_ROW_WORDS);
     }
-    rmsnorm(reinterpret_cast<const T_RmsBankWord*>(g_stream), tokens_dim, feature_dim,
-            scales[SCALE_ATT_RMSNORM_OUT_INV_IDX],
-            reinterpret_cast<T_RmsBankWord*>(g_norm_input));
-    load_activation_tiles(g_norm_input, 0, MHA_TILE_WORDS);
 
-    LAYER_STAGE:
-    for (int stage = 0; stage < y_first + y_stages; stage++) {
-        #pragma HLS LOOP_TRIPCOUNT min=108 max=108
-        #pragma HLS LOOP_FLATTEN off
+    stage_loop(n_stages, o_first, h_first, y_first, tokens_dim, feature_dim, hidden_dim,
+               wq_bank, wq_counts, wk_bank, wk_counts, wv_bank, wv_counts,
+               wo_bank, wo_counts, w1_bank, w1_counts, w2_bank, w2_counts,
+               scales);
 
-        /* Which weight this stage computes, and which of its row blocks. */
-        const int mode = (stage <  o_first) ? ((stage % 3 == 0) ? ROWS_MHA_K
-                                            : (stage % 3 == 1) ? ROWS_MHA_Q : ROWS_MHA_V)
-                       : (stage <  h_first) ? ROWS_MHA_O
-                       : (stage <  y_first) ? ROWS_MLP_H
-                                            : ROWS_MLP_Y;
-        const int head  = (stage < o_first) ? (stage / 3) : 0;
-        const int block = (stage <  o_first) ? head
-                        : (stage <  h_first) ? (stage - o_first)
-                        : (stage <  y_first) ? (stage - h_first)
-                                             : (stage - y_first);
-        const int row_base = block * MHA_FEATURE_HEAD;
-        const int first    = (block == 0);
-
-        /* The output projection reads the attention result, not the layer input. */
-        if (mode == ROWS_MHA_O && first) {
-            load_activation_tiles(g_attn_heads, 0, MHA_TILE_WORDS);
-        }
-        /* Between the halves: close the attention residual, then normalize for the MLP. */
-        if (mode == ROWS_MLP_H && first) {
-            residual_add(g_stream, g_stream_mid, feature_dim * MHA_BANK_ROW_WORDS,
-                         scales[SCALE_ATT_RESIDUAL_IDX], scales[SCALE_ATT_BRANCH_RATIO_IDX],
-                         g_stream_mid);
-            rmsnorm(reinterpret_cast<const T_RmsBankWord*>(g_stream_mid), tokens_dim, feature_dim,
-                    scales[SCALE_FF_RMSNORM_OUT_INV_IDX],
-                    reinterpret_cast<T_RmsBankWord*>(g_norm_input));
-            load_activation_tiles(g_norm_input, 0, MHA_TILE_WORDS);
-        }
-
-        /* This stage's weight; one branch each, all in this scope, so HLS multiplexes the AXI
-         * ports itself rather than needing a pointer selection in source. */
-        if (mode == ROWS_MHA_K) {
-            if (first) { load_weight_bases(wk_counts, SPMM_W_K); }
-            load_weight_slice(wk_bank, wk_counts, feature_dim, SPMM_W_K, row_base, MHA_FEATURE_HEAD);
-        } else if (mode == ROWS_MHA_Q) {
-            if (first) { load_weight_bases(wq_counts, SPMM_W_Q); }
-            load_weight_slice(wq_bank, wq_counts, feature_dim, SPMM_W_Q, row_base, MHA_FEATURE_HEAD);
-        } else if (mode == ROWS_MHA_V) {
-            if (first) { load_weight_bases(wv_counts, SPMM_W_V); }
-            load_weight_slice(wv_bank, wv_counts, feature_dim, SPMM_W_V, row_base, MHA_FEATURE_HEAD);
-        } else if (mode == ROWS_MHA_O) {
-            if (first) { load_weight_bases(wo_counts, SPMM_W_O); }
-            load_weight_slice(wo_bank, wo_counts, feature_dim, SPMM_W_O, row_base, MHA_FEATURE_HEAD);
-        } else if (mode == ROWS_MLP_H) {
-            if (first) { load_weight_bases(w1_counts, SPMM_W_MLP1); }
-            load_weight_slice(w1_bank, w1_counts, hidden_dim, SPMM_W_MLP1, row_base, MHA_FEATURE_HEAD);
-        } else {
-            if (first) { load_weight_bases(w2_counts, SPMM_W_MLP2); }
-            load_weight_slice(w2_bank, w2_counts, feature_dim, SPMM_W_MLP2, row_base, MHA_FEATURE_HEAD);
-        }
-
-        const T_Scale scale = (mode == ROWS_MHA_K) ? scales[SCALE_K_IDX]
-                            : (mode == ROWS_MHA_Q) ? scales[SCALE_Q_IDX]
-                            : (mode == ROWS_MHA_V) ? scales[SCALE_V_IDX]
-                            : (mode == ROWS_MHA_O) ? scales[SCALE_LINEAR_OUT_IDX]
-                            : (mode == ROWS_MLP_H) ? scales[SCALE_FC1_IDX]
-                                                   : scales[SCALE_FC2_IDX];
-
-        layer_rows(mode, row_base, MHA_FEATURE_HEAD, tokens_dim, scale);
-
-        /* V is the last of a head's three projections, so the head's attention runs here.  Called
-         * unconditionally with an enable: a call inside an `if` makes HLS specialise the loop body
-         * for that case, which duplicates layer_rows. */
-        head_core(mode == ROWS_MHA_V, head, tokens_dim, scales[SCALE_DIV_OUT_IDX],
-                  g_k_val, g_k_col, g_k_ptr,
-                  g_q_val, g_q_col, g_q_ptr,
-                  g_v_head, g_attn_heads);
-    }
-
-    residual_add(g_stream_mid, g_stream, feature_dim * MHA_BANK_ROW_WORDS,
-                 scales[SCALE_FF_RESIDUAL_IDX], scales[SCALE_FF_BRANCH_RATIO_IDX],
-                 g_stream);
     if (last_layer) {
         copy_activation_out(g_stream, output, feature_dim * MHA_BANK_ROW_WORDS);
     }

@@ -91,13 +91,30 @@ static inline T_MhaAcc tiled_lane_sum (int token) {
  * into the hidden region, which is what lets its second stage read it without a copy. */
 extern T_MhaBankWord g_act_tile[MHA_TILES][MHA_TILE_WORDS_MAX];
 
+/* The weight slice the loader hands to the engine: the packed entries, their per-(column block,
+ * row) nonzero counts, and the slot within its packed word that each block's first entry occupies.
+ * These three are the whole loader-to-engine interface, so they are arguments rather than file
+ * scope -- an array declared inside a DATAFLOW region is what HLS can turn into a ping-pong
+ * channel, which is what would let the loader fill one copy while the engine reads the other
+ * (docs/plans/06-load-compute-overlap.md).  Everything else stays private to one side: the DDR
+ * positions to the loader, the cursors and accumulators to the engine. */
+typedef T_MhaTileWord  T_MhaSliceBank  [MHA_TILES][MHA_TILE_BANK_WORDS];
+typedef T_MhaTileCount T_MhaSliceCount [MHA_TILES][MHA_FEATURE_HEAD];
+typedef int            T_MhaSliceCursor[MHA_TILES];
+
 void load_weight_bases (T_MhaCountWord* w_counts, int which);
 
 void load_weight_slice (T_MhaTileWord* w_bank, T_MhaCountWord* w_counts,
-                        int feature_dim, int which, int row_base, int rows);
+                        int feature_dim, int which, int row_base, int rows,
+                        T_MhaSliceBank   bank,
+                        T_MhaSliceCount  counts,
+                        T_MhaSliceCursor cursor0);
 
 void load_activation_tiles (T_MhaBankWord* packed_input, int base, int words);
 
-void tiled_rows_compute (int row_local, int tokens_dim, int act_base);
+void tiled_rows_compute (int row_local, int tokens_dim, int act_base,
+                         const T_MhaSliceBank   bank,
+                         const T_MhaSliceCount  counts,
+                         const T_MhaSliceCursor cursor0);
 
 #endif // SPMM_TILED_H
