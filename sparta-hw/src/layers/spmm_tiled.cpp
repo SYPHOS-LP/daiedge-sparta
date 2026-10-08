@@ -242,7 +242,7 @@ void load_activation_tiles (T_MhaBankWord* packed_input, int base, int words) {
 #pragma HLS ARRAY_PARTITION variable=g_act_tile complete dim=1
     /* A tile is MHA_TILE_WORDS_MAX x 64 b = one URAM, which also covers the 1792-word hidden
      * region the MLP's second stage reads. */
-    #pragma HLS BIND_STORAGE variable=g_act_tile type=ram_t2p impl=uram
+    #pragma HLS BIND_STORAGE variable=g_act_tile type=ram_t2p impl=uram latency=2
 
     ACTIVATION_TILE:
     for (int t = 0; t < MHA_TILES; t++) {
