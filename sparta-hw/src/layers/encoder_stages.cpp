@@ -324,8 +324,13 @@ static void stage_plan (int stage, int o_first, int h_first, int y_first,
  *
  * Reads DDR and the loader's own position state and nothing else, so it depends on nothing the
  * compute half produces.  That independence is what lets it run a stage ahead.
+ *
+ * `enable` is clear on the loop's last round, where the stage one ahead does not exist.  An enable
+ * rather than a call inside an `if`, because a conditional call makes HLS specialise the loop body
+ * for that case and duplicate what it contains.
  */
 static void stage_load (
+    int enable,
     int stage, int o_first, int h_first, int y_first,
     int feature_dim, int hidden_dim,
     T_MhaTileWord *wq_bank, T_MhaCountWord *wq_counts,
@@ -339,6 +344,8 @@ static void stage_load (
 #pragma HLS INLINE off
     #pragma HLS ALLOCATION instances=load_weight_slice limit=1 function
     #pragma HLS ALLOCATION instances=load_weight_bases limit=1 function
+
+    if (!enable) { return; }
 
     int mode, head, row_base, first;
     stage_plan(stage, o_first, h_first, y_first, mode, head, row_base, first);
@@ -474,34 +481,63 @@ static void stage_loop (
     const T_Scale *scales
 ) {
 #pragma HLS INLINE off
-    STAGE:
-    for (int stage = 0; stage < n_stages; stage++) {
-        #pragma HLS LOOP_TRIPCOUNT min=108 max=108
-        #pragma HLS DATAFLOW
-        /* The weight slice in flight, declared inside the region because that is what makes it a
-         * channel: one iteration's slice, which HLS gives two copies of so the loader can fill the
-         * next while the engine reads this one.  Declared outside the loop it is an ordinary shared
-         * memory instead, and HLS says so (214-113).
-         *
-         * A bank is 64-bit words, MHA_TILE_BANK_WORDS deep: one URAM each (72 b x 4096), where BRAM
-         * would need ~12 BRAM18 per bank for the same data (18 b per port, 1024 deep).  If
-         * MHA_TILES is ever raised the banks shrink and URAM becomes the wrong home for them -- see
-         * the 24-lane attempt in docs/plans/05-lane-balance.md, where they moved to BRAM and BRAM
-         * then saturated instead. */
-        T_MhaSliceBank   bank;
-        T_MhaSliceCount  counts;
-        T_MhaSliceCursor cursor0;
-        #pragma HLS BIND_STORAGE    variable=bank type=ram_t2p impl=uram
-        #pragma HLS ARRAY_PARTITION variable=bank    complete dim=1
-        #pragma HLS ARRAY_PARTITION variable=counts  complete dim=1
-        #pragma HLS ARRAY_PARTITION variable=cursor0 complete dim=1
+#ifndef __SYNTHESIS__
+    assert((n_stages % 2) == 0 && "the skewed stage loop steps by two");
+#endif
+    /* TWO slices, used alternately, and declared here rather than inside the loop body.
+     *
+     * The point of the skew is that a slice fetched in one round is computed in the NEXT, so the
+     * two halves of a round touch DIFFERENT slices and are independent -- which is the only way
+     * they can run at the same time.  Letting HLS manage a single slice as a channel cannot express
+     * that: a channel hands data from producer to consumer WITHIN a round, so the consumer always
+     * waits for the producer and the round costs load + compute.  That is what the first attempt
+     * did, and the board measured it: no gain and a small loss (plan 06).
+     *
+     * The loop therefore steps by two, so which slice each half uses is fixed at compile time.  A
+     * run-time choice would index a partitioned array with a run-time value, which silently undoes
+     * the partitioning.
+     *
+     * A bank is 64-bit words, MHA_TILE_BANK_WORDS deep: one URAM each (72 b x 4096), where BRAM
+     * would need ~12 BRAM18 per bank for the same data (18 b per port, 1024 deep). */
+    T_MhaSliceBank   bank_a,    bank_b;
+    T_MhaSliceCount  counts_a,  counts_b;
+    T_MhaSliceCursor cursor0_a, cursor0_b;
+    #pragma HLS BIND_STORAGE    variable=bank_a type=ram_t2p impl=uram
+    #pragma HLS BIND_STORAGE    variable=bank_b type=ram_t2p impl=uram
+    #pragma HLS ARRAY_PARTITION variable=bank_a    complete dim=1
+    #pragma HLS ARRAY_PARTITION variable=bank_b    complete dim=1
+    #pragma HLS ARRAY_PARTITION variable=counts_a  complete dim=1
+    #pragma HLS ARRAY_PARTITION variable=counts_b  complete dim=1
+    #pragma HLS ARRAY_PARTITION variable=cursor0_a complete dim=1
+    #pragma HLS ARRAY_PARTITION variable=cursor0_b complete dim=1
 
-        stage_load(stage, o_first, h_first, y_first, feature_dim, hidden_dim,
+    /* Prologue: the first slice, with nothing to compute alongside it. */
+    stage_load(1, 0, o_first, h_first, y_first, feature_dim, hidden_dim,
+               wq_bank, wq_counts, wk_bank, wk_counts, wv_bank, wv_counts,
+               wo_bank, wo_counts, w1_bank, w1_counts, w2_bank, w2_counts,
+               bank_a, counts_a, cursor0_a);
+
+    STAGE:
+    for (int stage = 0; stage < n_stages; stage += 2) {
+        #pragma HLS LOOP_TRIPCOUNT min=54 max=54
+        #pragma HLS LOOP_FLATTEN off
+
+        /* Fetch stage+1 into B while stage runs out of A, then the same with the slices swapped.
+         * Nothing in either pair depends on the other, which is what allows them to overlap. */
+        stage_load(1, stage + 1, o_first, h_first, y_first, feature_dim, hidden_dim,
                    wq_bank, wq_counts, wk_bank, wk_counts, wv_bank, wv_counts,
                    wo_bank, wo_counts, w1_bank, w1_counts, w2_bank, w2_counts,
-                   bank, counts, cursor0);
+                   bank_b, counts_b, cursor0_b);
         stage_compute(stage, n_stages, o_first, h_first, y_first, tokens_dim, feature_dim,
-                      scales, bank, counts, cursor0);
+                      scales, bank_a, counts_a, cursor0_a);
+
+        stage_load(stage + 2 < n_stages, stage + 2, o_first, h_first, y_first,
+                   feature_dim, hidden_dim,
+                   wq_bank, wq_counts, wk_bank, wk_counts, wv_bank, wv_counts,
+                   wo_bank, wo_counts, w1_bank, w1_counts, w2_bank, w2_counts,
+                   bank_a, counts_a, cursor0_a);
+        stage_compute(stage + 1, n_stages, o_first, h_first, y_first, tokens_dim, feature_dim,
+                      scales, bank_b, counts_b, cursor0_b);
     }
 }
 
