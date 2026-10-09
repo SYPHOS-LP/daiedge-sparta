@@ -33,6 +33,22 @@
 #include "csr_bounds.h"
 #include "encoder_scales.h"
 
+/* How V is laid out on chip: one 64-bit word per (token, group of MHA_BANK_PACK output features).
+ * So one read returns MHA_BANK_PACK of a token's values, and a token's MHA_FEATURE_HEAD values take
+ * MHA_V_GROUPS reads rather than MHA_FEATURE_HEAD reads.
+ *
+ * The reason for ordering it by token: the inner loop of K'.V takes one K' value and multiplies it
+ * by all MHA_FEATURE_HEAD output features of a single token.  The values one read should return are
+ * therefore consecutive output features at the same token.  When V was ordered by feature those
+ * values sat a row stride apart, so each had to be read separately, and V had to be spread over
+ * MHA_BANK_PACK memories to supply enough reads per cycle.  See
+ * docs/plans/09-attention-rework.md.
+ *
+ * Defined here rather than in mha_cfg.h because that file is generated from
+ * config/yml/mha.yaml. */
+#define MHA_V_GROUPS (MHA_FEATURE_HEAD / MHA_BANK_PACK)
+#define MHA_V_PACKED_WORDS (MHA_TOKEN_W_MAX * MHA_V_GROUPS)
+
 /**
  * @brief Linear (softmax-free) attention for one head.
  *
@@ -52,7 +68,7 @@
  * @param[in]  q_val       Q' values / columns / row pointers for this head (token-major).
  * @param[in]  q_col
  * @param[in]  q_ptr
- * @param[in]  v_head      This head's dense V (MHA_FEATURE_HEAD x N).
+ * @param[in]  v_packed    This head's dense V, token-major and packed.
  * @param[out] out_packed  Packed attention output, all heads.
  */
 void head_core (
@@ -66,7 +82,7 @@ void head_core (
     T_Activation   *q_val,
     T_MhaHeadIndex *q_col,
     int            *q_ptr,
-    T_Activation   *v_head,
+    T_MhaBankWord  *v_packed,
     T_MhaBankWord  *out_packed
 );
 

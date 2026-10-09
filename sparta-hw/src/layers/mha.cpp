@@ -29,12 +29,27 @@ static_assert(MHA_FEATURE_HEAD == 64,                  "code assumes d_head == 6
 
 // Per-head buffer sizes must match the head dimensions.
 static_assert(MHA_HEAD_NNZ_MAX   == MHA_FEATURE_HEAD * MHA_TOKEN_W_MAX, "head CSR capacity != 64*N");
-/* V is stored with a padded row stride rather than tokens_dim; the reasons are in mha.yaml, and
- * both properties it relies on are asserted here so a config edit cannot quietly undo them. */
-static_assert(MHA_SCR_V_HEAD_CNT == MHA_FEATURE_HEAD * MHA_V_ROW_STRIDE, "V head count != 64 * stride");
-static_assert(MHA_V_ROW_STRIDE >= MHA_TOKEN_W_MAX, "V row stride must cover every token");
-static_assert(MHA_V_ROW_STRIDE % 2 == 1,
-              "V row stride must be odd, or the MHA_MAC_UNROLL reads collide in the partitions");
+
+/* One lane's share of a K'.V row: the MHA_BANK_PACK output features that lane owns, packed into a
+ * single word.  At 32 bits an entry that is MHA_BANK_PACK * 32 = 256 bits wide, which block memory
+ * cannot supply in one cycle but a logic-cell memory can -- there is no width limit on those.  That
+ * is what lets all MHA_V_GROUPS lanes fetch their part of a row in the same cycle. */
+typedef ap_uint<MHA_BANK_PACK * T_MhaAcc::width> T_MhaKvWord;
+static_assert(MHA_FEATURE_HEAD % MHA_BANK_PACK == 0,
+              "the K'.V table is packed MHA_BANK_PACK output features per word");
+/* MHA_SCR_V_HEAD_CNT and MHA_V_ROW_STRIDE now size only the Q' reorder scratch, not V.
+ *
+ * They were V's: V used to be stored one byte per entry at out_feature * MHA_V_ROW_STRIDE + token,
+ * spread across MHA_BANK_PACK memories, and the stride had to be odd so that the MHA_MAC_UNROLL
+ * reads of consecutive output features fell in different memories.  V is now ordered by token and
+ * packed (MHA_V_GROUPS in mha.h), read as whole words, so neither the stride nor its oddness has
+ * any effect on V.  The Q' scratch is indexed with tokens_dim, so it needs only the capacity. */
+static_assert(MHA_SCR_V_HEAD_CNT >= MHA_FEATURE_HEAD * MHA_TOKEN_W_MAX,
+              "Q' reorder scratch is smaller than 64 x N");
+static_assert(MHA_V_PACKED_WORDS == MHA_TOKEN_W_MAX * MHA_V_GROUPS,
+              "packed V word count != N x (64 / MHA_BANK_PACK)");
+static_assert(MHA_FEATURE_HEAD % MHA_BANK_PACK == 0,
+              "packed V needs MHA_FEATURE_HEAD to divide into whole words");
 static_assert(MHA_SCR_A_CNT      == MHA_FEATURE_HEAD * MHA_FEATURE_HEAD, "A cnt != d_head^2");
 
 // The engine's MAC walk manually unrolls the packed lanes of a bank word.
@@ -69,7 +84,7 @@ typedef ap_uint<MHA_WIDE_BITS> T_MhaWideWord;
  * @param[in]  q_col_buf     On-chip Q' column slice buffer.
  * @param[in]  q_ptr         Q' head-major row pointers (absolute; rebased by q_slice_base).
  * @param[in]  q_slice_base  Absolute nnz offset of this head's Q' slice.
- * @param[in]  v_dense       Dense V.
+ * @param[in]  v_packed      Dense V, token-major and packed (see MHA_V_GROUPS in mha.h).
  * @param[out] out_packed    Packed output.
  */
 
@@ -86,7 +101,7 @@ void head_core (
     T_Activation   *q_val,
     T_MhaHeadIndex *q_col,
     int            *q_ptr,
-    T_Activation   *v_head,
+    T_MhaBankWord  *v_packed,
     T_MhaBankWord  *out_packed
 ) {
     if (!enable) {
@@ -99,10 +114,17 @@ void head_core (
     #pragma HLS ARRAY_PARTITION variable=head_output cyclic factor=MHA_MAC_UNROLL dim=1
     #pragma HLS BIND_STORAGE variable=head_output type=ram_1p impl=lutram
 
-    /* Per-head intermediate results for KxV and sum(K). */
-    T_MhaAcc key_value_matrix[MHA_FEATURE_HEAD * MHA_FEATURE_HEAD];
-    T_MhaAcc key_sums[MHA_FEATURE_HEAD];
-    #pragma HLS ARRAY_PARTITION variable=key_value_matrix cyclic factor=MHA_MAC_UNROLL dim=1
+    /* Per-head intermediate results for KxV and sum(K).
+     *
+     * The table is MHA_FEATURE_HEAD rows of MHA_FEATURE_HEAD accumulators, held as rows of
+     * MHA_V_GROUPS packed words: entry [row][lane] is at row * MHA_V_GROUPS + lane.  A cyclic split
+     * by MHA_V_GROUPS therefore gives each lane its own piece, 64 words of 256 bits, and the
+     * lutram binding keeps all of it out of block memory -- the dense 32-bit table cost 16 blocks,
+     * because two block ports carry about 18 bits each and this reads 2 048 bits per cycle. */
+    T_MhaKvWord key_value_matrix[MHA_FEATURE_HEAD * MHA_V_GROUPS];
+    T_MhaAcc    key_sums[MHA_FEATURE_HEAD];
+    #pragma HLS ARRAY_PARTITION variable=key_value_matrix cyclic factor=MHA_V_GROUPS dim=1
+    #pragma HLS BIND_STORAGE    variable=key_value_matrix type=ram_1p impl=lutram
     #pragma HLS ARRAY_PARTITION variable=key_sums         complete dim=1
 
     /* No clearing pass for key_value_matrix: every entry is written below, from a register
@@ -123,9 +145,9 @@ void head_core (
         /* One feature's row of the K.V matrix, held in registers while it is accumulated.  In the
          * matrix itself the accumulation was a read-modify-write of the same memory address on
          * successive nonzeros, so the loop could not run faster than a BRAM read plus an add plus a
-         * write -- II 3.  In registers each out_feature has its own accumulator and the unroll
-         * visits it once every MHA_FEATURE_HEAD / MHA_MAC_UNROLL iterations, which is slack enough
-         * for the multiply-add's latency. */
+         * write -- II 3.  Here `complete` makes each out_feature its own scalar in a flip-flop, so
+         * all MHA_FEATURE_HEAD of them are updated in the same cycle with no memory port to share
+         * and nothing to combine at the end. */
         T_MhaAcc row_acc[MHA_FEATURE_HEAD];
         #pragma HLS ARRAY_PARTITION variable=row_acc complete dim=1
         KEY_VALUE_ROW_CLEAR:
@@ -144,20 +166,49 @@ void head_core (
 
             KEY_VALUE_OUT_FEATURE:
             for (int out_feature = 0; out_feature < MHA_FEATURE_HEAD; out_feature++) {
-                #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_FEATURE_HEAD max=MHA_TC_FEATURE_HEAD
-                #pragma HLS PIPELINE II=1
-                #pragma HLS UNROLL factor=MHA_MAC_UNROLL
+                #pragma HLS UNROLL
 
-                /* Multiply-Accumulate K value with MHA_FEATURE_HEAD features of selected token. */
-                row_acc[out_feature] += key_val * v_head[out_feature * MHA_V_ROW_STRIDE + token];
+                /* Multiply-Accumulate K value with MHA_FEATURE_HEAD features of selected token.
+                 *
+                 * Unrolled completely, which makes this the attention's equivalent of the engine's
+                 * lanes: the MHA_FEATURE_HEAD copies of this body fall into MHA_V_GROUPS groups of
+                 * MHA_BANK_PACK, each group reading ONE word from its own slice of V.  So the whole
+                 * row of V for this token arrives in one cycle, MHA_FEATURE_HEAD multiplies happen,
+                 * and one K' value is retired per cycle.
+                 *
+                 * The lanes are over OUTPUT features, not over tokens.  Splitting the sparse list
+                 * by token instead would make each output row cost the busiest lane -- measured at
+                 * 1.64x imbalance, the same effect as docs/plans/05-lane-balance.md records for the
+                 * engine.  Here every lane sees the same K' value, so there is no imbalance and no
+                 * partial sums to combine: row_acc stays MHA_FEATURE_HEAD registers.
+                 *
+                 * V is read here rather than fetched into registers beforehand.  Fetching the words
+                 * in a loop of their own first cost 2 720 cycles per head: a short pipelined loop
+                 * nested inside this one pays its fill and drain on every K' value, and it also
+                 * stopped the reads overlapping the multiplies. */
+                const int lo = (out_feature % MHA_BANK_PACK) * MHA_ACT_ELEM_BITS;
+                const T_MhaBankWord v_word = v_packed[token * MHA_V_GROUPS
+                                                      + out_feature / MHA_BANK_PACK];
+                const T_Activation v_val = (T_Activation)
+                    (ap_int<MHA_ACT_ELEM_BITS>) v_word.range(lo + MHA_ACT_ELEM_BITS - 1, lo);
+                row_acc[out_feature] += key_val * v_val;
             }
         }
 
+        /* Pack the finished row into one word per lane.  Fully unrolled, so the whole row lands in
+         * one go and no lane waits for another. */
         KEY_VALUE_ROW_STORE:
-        for (int out_feature = 0; out_feature < MHA_FEATURE_HEAD; out_feature++) {
-            #pragma HLS PIPELINE II=1
-            #pragma HLS UNROLL factor=MHA_MAC_UNROLL
-            key_value_matrix[feature * MHA_FEATURE_HEAD + out_feature] = row_acc[out_feature];
+        for (int lane = 0; lane < MHA_V_GROUPS; lane++) {
+            #pragma HLS UNROLL
+            T_MhaKvWord word = 0;
+            KEY_VALUE_ROW_PACK:
+            for (int b = 0; b < MHA_BANK_PACK; b++) {
+                #pragma HLS UNROLL
+                const int lo = b * T_MhaAcc::width;
+                word.range(lo + T_MhaAcc::width - 1, lo) =
+                    (ap_uint<T_MhaAcc::width>) row_acc[lane * MHA_BANK_PACK + b];
+            }
+            key_value_matrix[feature * MHA_V_GROUPS + lane] = word;
         }
     }
 
@@ -187,12 +238,22 @@ void head_core (
 
             NUMERATOR_OUT_FEATURE:
             for (int out_feature = 0; out_feature < MHA_FEATURE_HEAD; out_feature++) {
-                #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_FEATURE_HEAD max=MHA_TC_FEATURE_HEAD
-                #pragma HLS PIPELINE II=1
-                #pragma HLS UNROLL factor=MHA_MAC_UNROLL
+                #pragma HLS UNROLL
 
-                numerator_row[out_feature] +=
-                    query_val * key_value_matrix[band_feature * MHA_FEATURE_HEAD + out_feature];
+                /* Unrolled completely, the same arrangement as KEY_VALUE_OUT_FEATURE above: the
+                 * MHA_FEATURE_HEAD copies fall into MHA_V_GROUPS lanes of MHA_BANK_PACK, each lane
+                 * reading ONE word from its own piece of the table.  So a whole table row arrives
+                 * in one cycle and one Q' value is retired per cycle.
+                 *
+                 * The lanes are over output features, not over the summed axis, so every lane sees
+                 * the same Q' value and keeps its own MHA_BANK_PACK totals in registers.  Nothing
+                 * has to be combined at the end and no lane can be the slow one. */
+                const int lo = (out_feature % MHA_BANK_PACK) * T_MhaAcc::width;
+                const T_MhaKvWord kv_word = key_value_matrix[band_feature * MHA_V_GROUPS
+                                                             + out_feature / MHA_BANK_PACK];
+                const T_MhaAcc kv_val = (T_MhaAcc)
+                    (ap_int<T_MhaAcc::width>) kv_word.range(lo + T_MhaAcc::width - 1, lo);
+                numerator_row[out_feature] += query_val * kv_val;
             }
         }
 

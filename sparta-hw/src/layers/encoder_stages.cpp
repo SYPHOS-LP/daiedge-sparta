@@ -39,7 +39,21 @@ enum LayerRowsMode {
  * sized for 100 % ReLU survival (overflow is impossible without relying on measured densities).
  * The attention result needs every feature, so it is kept for the whole layer.
  * ------------------------------------------------------------------------------------- */
-static T_Activation   g_v_head[MHA_SCR_V_HEAD_CNT];
+/* V for the head being computed, ordered by token and packed (see MHA_V_GROUPS in mha.h).  The
+ * attention step reads one token's MHA_FEATURE_HEAD values as MHA_V_GROUPS words rather than as
+ * MHA_FEATURE_HEAD separate bytes, so this array does not have to be spread over several memories.
+ *
+ * g_v_group is the buffer that reorders it, and it is NOT the same thing as the Q' scratch below.
+ * The engine produces V one feature row at a time: 50 token values of feature 0, then of feature 1,
+ * and so on.  The attention step needs the opposite slice -- at one token, all MHA_FEATURE_HEAD
+ * features -- and in the engine's order those values are one byte taken from each of
+ * MHA_FEATURE_HEAD different words.  That is why V used to be spread over MHA_BANK_PACK memories.
+ *
+ * So MHA_BANK_PACK consecutive feature rows are collected here, in the packed form REQUANT_ROW
+ * already produces, and written out as token-ordered words once the last row of a group is done.
+ * The buffer is MHA_BANK_PACK x MHA_BANK_ROW_WORDS words, 448 bytes. */
+static T_MhaBankWord g_v_packed[MHA_V_PACKED_WORDS];
+static T_MhaBankWord g_v_group[MHA_BANK_PACK][MHA_BANK_ROW_WORDS];
 static T_Activation   g_q_scratch[MHA_SCR_V_HEAD_CNT];
 static T_Activation   g_k_val[MHA_HEAD_NNZ_MAX];
 static T_MhaHeadIndex g_k_col[MHA_HEAD_NNZ_MAX];
@@ -199,7 +213,11 @@ static void layer_rows (
                                  p * MHA_ACT_ELEM_BITS) = (ap_uint<MHA_ACT_ELEM_BITS>) q;
             }
             /* The three packed destinations are written here, so those tails cost nothing more. */
-            if (mode == ROWS_MLP_H) {
+            if (mode == ROWS_MHA_V) {
+                /* Into the reorder buffer.  This is the same packed word the dense destinations
+                 * below are given, so reordering V costs no extra pass over the row. */
+                g_v_group[i % MHA_BANK_PACK][w] = quant_word;
+            } else if (mode == ROWS_MLP_H) {
                 g_act_tile[h_tile][MHA_H_TILE_BASE + (h_local + i) * MHA_BANK_ROW_WORDS + w] = relu_word;
             } else if (mode == ROWS_MHA_O) {
                 g_stream_mid[(row_base + i) * MHA_BANK_ROW_WORDS + w] = quant_word;
@@ -225,10 +243,10 @@ static void layer_rows (
                 }
             }
             g_k_ptr[i + 1] = nnz;
-        } else if (mode == ROWS_MHA_Q || mode == ROWS_MHA_V) {
-            /* Q' goes to the transpose scratch (ReLU'd) and V to this head's dense rows.  Both are
-             * read at arbitrary token positions later, so they stay byte-addressed and are split
-             * across MHA_BANK_PACK memories instead of packed. */
+        } else if (mode == ROWS_MHA_Q) {
+            /* Q' goes to the dense scratch, ReLU'd.  TAIL_Q below reads it at arbitrary token
+             * positions, so it is kept one byte per entry and split across MHA_BANK_PACK
+             * memories. */
             TAIL_BYTES:
             for (int w = 0; w < row_words; w++) {
                 #pragma HLS LOOP_TRIPCOUNT min=MHA_BANK_ROW_WORDS max=MHA_BANK_ROW_WORDS
@@ -238,13 +256,31 @@ static void layer_rows (
                     #pragma HLS UNROLL
                     const int j = w * MHA_BANK_PACK + p;
                     if (j < tokens_dim) {
-                        if (mode == ROWS_MHA_Q) {
-                            g_q_scratch[i * tokens_dim + j] = row_relu[j];
-                        } else {
-                            g_v_head[i * MHA_V_ROW_STRIDE + j] = row_q[j];
-                        }
+                        g_q_scratch[i * tokens_dim + j] = row_relu[j];
                     }
                 }
+            }
+        } else if (mode == ROWS_MHA_V && (i % MHA_BANK_PACK) == MHA_BANK_PACK - 1) {
+            /* Once a group of MHA_BANK_PACK feature rows is complete, write it out ordered by
+             * token: the word at (token, group) holds output features
+             * group*MHA_BANK_PACK .. group*MHA_BANK_PACK + MHA_BANK_PACK-1 of that token. */
+            const int group = i / MHA_BANK_PACK;
+            V_EMIT_TOKEN:
+            for (int j = 0; j < tokens_dim; j++) {
+                #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_TOKEN max=MHA_TC_TOKEN
+                #pragma HLS PIPELINE II=1
+                T_MhaBankWord word = 0;
+                V_EMIT_FEATURE:
+                for (int f = 0; f < MHA_BANK_PACK; f++) {
+                    #pragma HLS UNROLL
+                    const T_MhaBankWord src = g_v_group[f][j / MHA_BANK_PACK];
+                    const int           b   = j % MHA_BANK_PACK;
+                    word.range(f * MHA_ACT_ELEM_BITS + MHA_ACT_ELEM_BITS - 1,
+                               f * MHA_ACT_ELEM_BITS) =
+                        src.range(b * MHA_ACT_ELEM_BITS + MHA_ACT_ELEM_BITS - 1,
+                                  b * MHA_ACT_ELEM_BITS);
+                }
+                g_v_packed[j * MHA_V_GROUPS + group] = word;
             }
         }
     }
@@ -399,8 +435,12 @@ static void stage_compute (
     #pragma HLS ALLOCATION instances=rmsnorm               limit=1 function
     #pragma HLS ALLOCATION instances=residual_add          limit=1 function
 
-    #pragma HLS BIND_STORAGE    variable=g_v_head     type=ram_t2p impl=bram
-    #pragma HLS ARRAY_PARTITION variable=g_v_head cyclic factor=MHA_BANK_PACK dim=1
+    /* V's eight lanes.  The index is token * MHA_V_GROUPS + group, so a cyclic split by
+     * MHA_V_GROUPS puts each group in its own piece: piece g holds the MHA_BANK_PACK output
+     * features that lane g owns, for every token.  Each piece is then 3 200 bits, small enough for
+     * logic cells, so the eight reads per cycle cost no block memory. */
+    #pragma HLS BIND_STORAGE    variable=g_v_packed type=ram_1p impl=lutram
+    #pragma HLS ARRAY_PARTITION variable=g_v_packed cyclic factor=MHA_V_GROUPS dim=1
     #pragma HLS BIND_STORAGE    variable=g_q_scratch  type=ram_t2p impl=bram
     #pragma HLS ARRAY_PARTITION variable=g_q_scratch cyclic factor=MHA_BANK_PACK dim=1
     #pragma HLS BIND_STORAGE    variable=g_k_val      type=ram_t2p impl=bram
@@ -453,7 +493,7 @@ static void stage_compute (
     head_core(mode == ROWS_MHA_V, head, tokens_dim, scales[SCALE_DIV_OUT_IDX],
               g_k_val, g_k_col, g_k_ptr,
               g_q_val, g_q_col, g_q_ptr,
-              g_v_head, g_attn_heads);
+              g_v_packed, g_attn_heads);
 
     /* The feed-forward residual closes the layer. */
     if (stage == n_stages - 1) {
