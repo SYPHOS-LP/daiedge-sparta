@@ -407,10 +407,10 @@ static void stage_compute (
     #pragma HLS BIND_STORAGE    variable=g_k_col      type=ram_t2p impl=bram
     #pragma HLS BIND_STORAGE    variable=g_q_val      type=ram_t2p impl=bram
     #pragma HLS BIND_STORAGE    variable=g_q_col      type=ram_t2p impl=bram
-    #pragma HLS BIND_STORAGE    variable=g_attn_heads type=ram_t2p impl=uram latency=2
+    #pragma HLS BIND_STORAGE    variable=g_attn_heads type=ram_t2p impl=uram
     #pragma HLS ARRAY_PARTITION variable=g_attn_heads cyclic factor=MHA_BANK_CYCLIC dim=1
-    #pragma HLS BIND_STORAGE    variable=g_stream_mid type=ram_t2p impl=uram latency=2
-    #pragma HLS BIND_STORAGE    variable=g_norm_input type=ram_t2p impl=uram latency=2
+    #pragma HLS BIND_STORAGE    variable=g_stream_mid type=ram_t2p impl=uram
+    #pragma HLS BIND_STORAGE    variable=g_norm_input type=ram_t2p impl=uram
     #pragma HLS ARRAY_PARTITION variable=g_norm_input cyclic factor=MHA_BANK_CYCLIC dim=1
 
     int mode, head, row_base, first;
@@ -502,8 +502,8 @@ static void stage_loop (
     T_MhaSliceBank   bank_a,    bank_b;
     T_MhaSliceCount  counts_a,  counts_b;
     T_MhaSliceCursor cursor0_a, cursor0_b;
-    #pragma HLS BIND_STORAGE    variable=bank_a type=ram_t2p impl=uram latency=2
-    #pragma HLS BIND_STORAGE    variable=bank_b type=ram_t2p impl=uram latency=2
+    #pragma HLS BIND_STORAGE    variable=bank_a type=ram_t2p impl=uram
+    #pragma HLS BIND_STORAGE    variable=bank_b type=ram_t2p impl=uram
     #pragma HLS ARRAY_PARTITION variable=bank_a    complete dim=1
     #pragma HLS ARRAY_PARTITION variable=bank_b    complete dim=1
     #pragma HLS ARRAY_PARTITION variable=counts_a  complete dim=1
@@ -563,7 +563,7 @@ void encoder_layer_stages(
     assert(tokens_dim <= MHA_TOKEN_W_MAX && "tokens_dim exceeds MHA_TOKEN_W_MAX");
     assert(hidden_dim <= ENC_HIDDEN_W_MAX && "hidden_dim exceeds ENC_HIDDEN_W_MAX");
 #endif
-    #pragma HLS BIND_STORAGE   variable=g_stream    type=ram_t2p impl=uram latency=2
+    #pragma HLS BIND_STORAGE   variable=g_stream    type=ram_t2p impl=uram
 
     /* Stage layout: 3 per head for K/Q/V, then the output projection's row blocks, then the two
      * MLP linears' row blocks. */
