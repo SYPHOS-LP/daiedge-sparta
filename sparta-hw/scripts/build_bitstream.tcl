@@ -103,8 +103,45 @@ puts "CHECKPOINT: synthesis complete"
 # exactly what this step is for, and it routinely recovers 0.05-0.15 ns.
 #
 # Try this before changing the datapath for a violation this small.
+#
+# ---------------------------------------------------------------------------------------------
+# EDIT THIS LINE to try a different implementation strategy.
+#
+# "" (empty) keeps Vivado's default placement and routing effort, with only the post-route pass
+# below added.  That is what every build up to 2026-10-08 used.
+#
+# The reason to change it: at 250 MHz the critical path is the engine's weight bank reaching the
+# activation tile's address, and 62 % of its 4.774 ns is wire delay, not logic (URAM at X0, the
+# decode logic at X44).  Placement is therefore the lever, and these strategies are the cheap way
+# to pull it -- they need no source change and cost no cycles.
+#
+# Worth trying, roughly in this order:
+#   Performance_NetDelay_high          assume wires are slow while placing, so cells end up
+#                                      closer together.  Aimed straight at a wire-dominated path.
+#   Performance_NetDelay_low           the same idea, milder.
+#   Performance_ExplorePostRoutePhysOpt  search placements and routes much harder; also enables
+#                                      the post-route pass, so it overlaps what is set below.
+#   Performance_Explore                broad search, no post-route pass of its own.
+#   Performance_Retiming               lets the tool move registers across logic.
+#
+# Two things to know:
+#   - A named strategy REPLACES the per-step settings, so it is applied first and the post-route
+#     lines below are re-applied after it, on purpose.  Keep that order if you add anything.
+#   - Synthesis is reused when it is already complete (see above), so each attempt is only
+#     place-and-route, not a full rebuild.
+#   - Placement varies between runs.  A swing of ~0.13 ns on this path is normal, so do not
+#     conclude a strategy is better from a single build.
+# ---------------------------------------------------------------------------------------------
+set impl_strategy ""
+
 puts "\n=== implementation and bitstream (with post-route phys_opt) ==="
 reset_run impl_1
+if {$impl_strategy ne ""} {
+    puts "  implementation strategy: $impl_strategy"
+    set_property strategy $impl_strategy [get_runs impl_1]
+} else {
+    puts "  implementation strategy: Vivado defaults"
+}
 set_property STEPS.POST_ROUTE_PHYS_OPT_DESIGN.IS_ENABLED true [get_runs impl_1]
 set_property STEPS.POST_ROUTE_PHYS_OPT_DESIGN.ARGS.DIRECTIVE AggressiveExplore [get_runs impl_1]
 launch_runs impl_1 -to_step write_bitstream -jobs $jobs
