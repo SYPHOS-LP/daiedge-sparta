@@ -136,11 +136,15 @@ void head_core (
     }
 
     /* Calculate KxV and sum(K) */
+    /* Row f of K' occupies k_ptr[f] .. k_ptr[f+1], so one row's end is the next row's start.
+     * Carrying it across iterations costs one read per row instead of two, which lets the pointer
+     * array live in single-port logic-cell memory: with two reads per row a one-port memory had to
+     * serialise them and the loop paid an extra cycle per row. */
+    int nz_begin = k_ptr[0];
     KEY_VALUE_FEATURE:
     for (int feature = 0; feature < MHA_FEATURE_HEAD; feature++) {
         #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_FEATURE_HEAD max=MHA_TC_FEATURE_HEAD
-        int nz_begin = k_ptr[feature];
-        int nz_end   = k_ptr[feature + 1];
+        const int nz_end = k_ptr[feature + 1];
 
         /* One feature's row of the K.V matrix, held in registers while it is accumulated.  In the
          * matrix itself the accumulation was a read-modify-write of the same memory address on
@@ -210,9 +214,13 @@ void head_core (
             }
             key_value_matrix[feature * MHA_V_GROUPS + lane] = word;
         }
+
+        nz_begin = nz_end;
     }
 
     /* Calculate Qx(KxV) and Qxsum(K), then divide with each other. */
+    /* Same carry as KEY_VALUE_FEATURE above, for the same reason. */
+    int q_nz_begin = q_ptr[0];
     NUMERATOR_TOKEN:
     for (int token = 0; token <  tokens_dim; token++) {
         #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_TOKEN max=MHA_TC_TOKEN
@@ -225,11 +233,10 @@ void head_core (
         }
 
         /* Q' is token-major for this head and q_col holds the head-local feature (0..63). */
-        T_MhaAcc denominator = (T_MhaAcc) 0;
-        int      nz_begin    = q_ptr[token];
-        int      nz_end      = q_ptr[token + 1];
+        T_MhaAcc  denominator = (T_MhaAcc) 0;
+        const int nz_end      = q_ptr[token + 1];
         NUMERATOR_NONZERO:
-        for (int s = nz_begin; s < nz_end; s++) {
+        for (int s = q_nz_begin; s < nz_end; s++) {
             #pragma HLS LOOP_TRIPCOUNT min=MHA_TC_QP_NNZ max=MHA_TC_QP_NNZ
             int          band_feature = (int) q_col[s];   // head-local feature (0..63)
             T_Activation query_val    = q_val[s];
@@ -274,6 +281,8 @@ void head_core (
             #pragma HLS BIND_OP variable=scaled op=mul impl=dsp latency=2
             head_output[out_feature][token] = saturate_to_int8(scaled);
         }
+
+        q_nz_begin = nz_end;
     }
 
     /* Pack feature-major output and write back to URAM. */

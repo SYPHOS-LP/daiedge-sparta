@@ -447,6 +447,12 @@ static void stage_compute (
     #pragma HLS BIND_STORAGE    variable=g_k_col      type=ram_t2p impl=bram
     #pragma HLS BIND_STORAGE    variable=g_q_val      type=ram_t2p impl=bram
     #pragma HLS BIND_STORAGE    variable=g_q_col      type=ram_t2p impl=bram
+    /* No storage pragma for g_k_ptr / g_q_ptr on purpose.  csynth charges them 2 BRAM_18K each,
+     * but the implemented design puts them in 128 and 64 logic-cell memory slots and no block --
+     * measured on the v10 checkpoint.  Forcing `ram_1p impl=lutram` therefore moved the csynth
+     * NUMBER and nothing in hardware, while narrowing them to one port cost 114 cycles a head
+     * until KEY_VALUE_FEATURE stopped reading them twice.  Left on automatic, they get two ports
+     * for free. */
     #pragma HLS BIND_STORAGE    variable=g_attn_heads type=ram_t2p impl=uram
     #pragma HLS ARRAY_PARTITION variable=g_attn_heads cyclic factor=MHA_BANK_CYCLIC dim=1
     #pragma HLS BIND_STORAGE    variable=g_stream_mid type=ram_t2p impl=uram
@@ -546,8 +552,19 @@ static void stage_loop (
     #pragma HLS BIND_STORAGE    variable=bank_b type=ram_t2p impl=uram
     #pragma HLS ARRAY_PARTITION variable=bank_a    complete dim=1
     #pragma HLS ARRAY_PARTITION variable=bank_b    complete dim=1
+    /* counts is written MHA_COUNT_PACK entries at a time by SLICE_COUNT, at consecutive addresses
+     * of one column block.  Left to itself HLS split the word axis only four ways, so two of those
+     * eight writes shared a piece every cycle, which needs two write ports -- and a true dual port
+     * cannot be a logic-cell memory, so Vivado spent a block on each of the 48 pieces: 96 blocks
+     * across the two banks to hold 1.5 kB.  csynth reports those as free, which is how it went
+     * unnoticed.  Splitting the word axis MHA_COUNT_PACK ways instead gives each write its own
+     * piece, one write port each, and the whole thing fits in logic cells. */
     #pragma HLS ARRAY_PARTITION variable=counts_a  complete dim=1
     #pragma HLS ARRAY_PARTITION variable=counts_b  complete dim=1
+    #pragma HLS ARRAY_PARTITION variable=counts_a  cyclic factor=MHA_COUNT_PACK dim=2
+    #pragma HLS ARRAY_PARTITION variable=counts_b  cyclic factor=MHA_COUNT_PACK dim=2
+    #pragma HLS BIND_STORAGE    variable=counts_a  type=ram_1p impl=lutram
+    #pragma HLS BIND_STORAGE    variable=counts_b  type=ram_1p impl=lutram
     #pragma HLS ARRAY_PARTITION variable=cursor0_a complete dim=1
     #pragma HLS ARRAY_PARTITION variable=cursor0_b complete dim=1
 

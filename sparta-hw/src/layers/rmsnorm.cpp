@@ -32,7 +32,12 @@ void rmsnorm (
 
     T_RmsSq    sum_sq[RMS_BANK_PAD_TOK];
     T_RmsRsqrt inv_rms[RMS_BANK_PAD_TOK];
+    /* RMS_BANK_PACK pieces, each taking one read and one write per cycle, which a logic-cell
+     * memory supplies.  HLS binds this ram_t2p on its own and then Vivado has to spend a block per
+     * piece -- 16 RAMB36 for 392 bytes -- because a true dual port cannot be built from logic
+     * cells.  csynth reports it as costing no block memory at all. */
     #pragma HLS ARRAY_PARTITION variable=sum_sq  cyclic factor=RMS_BANK_PACK dim=1
+    #pragma HLS BIND_STORAGE    variable=sum_sq  type=ram_2p impl=lutram
     #pragma HLS ARRAY_PARTITION variable=inv_rms cyclic factor=RMS_BANK_PACK dim=1
 
     const T_RmsSq inv_feature_dim = (T_RmsSq) (1.0f / (float) feature_dim);

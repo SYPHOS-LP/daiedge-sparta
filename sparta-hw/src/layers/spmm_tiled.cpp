@@ -124,6 +124,7 @@ void load_weight_slice (T_MhaTileWord* w_bank, T_MhaCountWord* w_counts,
     /* The banks are declared by the caller (encoder_stages.cpp), which is also where their storage
      * is chosen; here they are just an output port per column block. */
     #pragma HLS ARRAY_PARTITION variable=counts  complete dim=1
+    #pragma HLS ARRAY_PARTITION variable=counts  cyclic factor=MHA_COUNT_PACK dim=2
     #pragma HLS ARRAY_PARTITION variable=cursor0 complete dim=1
     int slice_words[MHA_TILES], slice_word0[MHA_TILES];
     #pragma HLS ARRAY_PARTITION variable=slice_words complete dim=1
@@ -330,6 +331,7 @@ void tiled_rows_compute (
 #pragma HLS ARRAY_PARTITION variable=g_act_tile   complete dim=1
 #pragma HLS ARRAY_PARTITION variable=bank         complete dim=1
 #pragma HLS ARRAY_PARTITION variable=counts       complete dim=1
+#pragma HLS ARRAY_PARTITION variable=counts       cyclic factor=MHA_COUNT_PACK dim=2
 #pragma HLS ARRAY_PARTITION variable=cursor0      complete dim=1
 #pragma HLS ARRAY_PARTITION variable=g_bank_cursor complete dim=1
     /* Lane t only ever touches g_lane_partial[t], so the lanes' updates are independent. */

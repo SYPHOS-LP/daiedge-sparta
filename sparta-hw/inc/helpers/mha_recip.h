@@ -75,16 +75,15 @@ static inline T_MhaRecip mha_recip(T_MhaAcc denominator) {
     /* Raw non-negative integer bits (d > 1 here, so the sign bit is 0). */
     ap_uint<T_MhaAcc::width> raw = (ap_uint<T_MhaAcc::width>) denominator;
 
-    /* Leading-one position = exponent e (d = m * 2^e, T_MhaAcc has 0 frac bits). */
-    int lead_pos = 0;
-    LEADING_ONE:
-    for (int b = T_MhaAcc::width - 1; b >= 0; b--) {
-#pragma HLS PIPELINE
-        if (raw[b]) {
-            lead_pos = b;
-            break;
-        }
-    }
+    /* Leading-one position = exponent e (d = m * 2^e, T_MhaAcc has 0 frac bits).
+     *
+     * countLeadingZeros is a priority encoder: one block of logic, no loop.  This was written as a
+     * loop from the top bit downwards with a `break`, and a pipelined loop with an early exit
+     * cannot be flattened, so it cost 34 cycles -- 32 iterations plus fill.  At 50 tokens and 12
+     * heads that was 20 400 cycles per layer, and unlike the rest of the attention the cost did not
+     * depend on the data at all.  `raw` is greater than 1 here, so it is never all zeros and this
+     * gives the same position the loop did. */
+    const int lead_pos = T_MhaAcc::width - 1 - raw.countLeadingZeros();
 
     /* Mantissa address = the ADDR_BITS bits just below the leading one. */
     int shift = lead_pos - MHA_RECIP_LUT_ADDR_BITS;
