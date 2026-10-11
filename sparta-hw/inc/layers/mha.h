@@ -33,16 +33,15 @@
 #include "csr_bounds.h"
 #include "encoder_scales.h"
 
-/* How V is laid out on chip: one 64-bit word per (token, group of MHA_BANK_PACK output features).
- * So one read returns MHA_BANK_PACK of a token's values, and a token's MHA_FEATURE_HEAD values take
- * MHA_V_GROUPS reads rather than MHA_FEATURE_HEAD reads.
+/* How V is laid out on chip: one 64-bit word holds MHA_BANK_PACK output features of one token.  So
+ * one read returns MHA_BANK_PACK of a token's values, and a token's MHA_FEATURE_HEAD values take
+ * MHA_V_GROUPS reads.
  *
- * The reason for ordering it by token: the inner loop of K'.V takes one K' value and multiplies it
- * by all MHA_FEATURE_HEAD output features of a single token.  The values one read should return are
- * therefore consecutive output features at the same token.  When V was ordered by feature those
- * values sat a row stride apart, so each had to be read separately, and V had to be spread over
- * MHA_BANK_PACK memories to supply enough reads per cycle.  See
- * docs/plans/09-attention-rework.md.
+ * V is ordered by token because that is the slice the K'.V loop needs: it takes one K' value and
+ * multiplies it by all MHA_FEATURE_HEAD output features of a single token, so a read should return
+ * consecutive output features at the same token.  Ordered by feature instead, those values sit a
+ * row stride apart and each needs its own read, which forces V across MHA_BANK_PACK memories to
+ * supply enough reads a cycle (docs/plans/09-attention-rework.md).
  *
  * Defined here rather than in mha_cfg.h because that file is generated from
  * config/yml/mha.yaml. */
@@ -52,9 +51,12 @@
 /**
  * @brief Linear (softmax-free) attention for one head.
  *
- * A = K' . V^T over this head's features, then Z = Q' . A normalized by Q' . sum(K'), requantized
+ * A = K'^T . V over this head's features, then Z = Q' . A normalized by Q' . sum(K'), requantized
  * and written packed into the attention output at this head's feature rows.  Q' and K' arrive as
  * this head's CSR, V as its dense rows; all three are on-chip.
+ *
+ * Grouping the product this way makes A a d_head x d_head table, so there is no N x N score matrix
+ * and no softmax.
  *
  * @param[in]  enable      Zero returns immediately.  The caller passes a flag rather than guarding
  *                         the call, because a call inside an `if` makes HLS specialise the

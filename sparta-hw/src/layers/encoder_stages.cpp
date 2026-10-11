@@ -39,19 +39,16 @@ enum LayerRowsMode {
  * sized for 100 % ReLU survival (overflow is impossible without relying on measured densities).
  * The attention result needs every feature, so it is kept for the whole layer.
  * ------------------------------------------------------------------------------------- */
-/* V for the head being computed, ordered by token and packed (see MHA_V_GROUPS in mha.h).  The
- * attention step reads one token's MHA_FEATURE_HEAD values as MHA_V_GROUPS words rather than as
- * MHA_FEATURE_HEAD separate bytes, so this array does not have to be spread over several memories.
+/* V for the head being computed, token-major and packed: one word holds MHA_BANK_PACK output
+ * features of one token, laid out by MHA_V_GROUPS in mha.h.  The attention step wants a token's
+ * MHA_FEATURE_HEAD values together, so it reads them as MHA_V_GROUPS whole words.
  *
- * g_v_group is the buffer that reorders it, and it is NOT the same thing as the Q' scratch below.
- * The engine produces V one feature row at a time: 50 token values of feature 0, then of feature 1,
- * and so on.  The attention step needs the opposite slice -- at one token, all MHA_FEATURE_HEAD
- * features -- and in the engine's order those values are one byte taken from each of
- * MHA_FEATURE_HEAD different words.  That is why V used to be spread over MHA_BANK_PACK memories.
- *
- * So MHA_BANK_PACK consecutive feature rows are collected here, in the packed form REQUANT_ROW
- * already produces, and written out as token-ordered words once the last row of a group is done.
- * The buffer is MHA_BANK_PACK x MHA_BANK_ROW_WORDS words, 448 bytes. */
+ * g_v_group does the reordering, and it is a different thing from the Q' scratch below.  The engine
+ * produces V one feature row at a time -- every token of feature 0, then every token of feature 1 --
+ * which is the opposite slice from the one the attention needs.  So MHA_BANK_PACK consecutive
+ * feature rows are collected here in the packed form REQUANT_ROW already produces, and once the
+ * last row of a group arrives they are written out as token-major words.  The buffer holds
+ * MHA_BANK_PACK x MHA_BANK_ROW_WORDS words, 448 bytes. */
 static T_MhaBankWord g_v_packed[MHA_V_PACKED_WORDS];
 static T_MhaBankWord g_v_group[MHA_BANK_PACK][MHA_BANK_ROW_WORDS];
 static T_Activation   g_q_scratch[MHA_SCR_V_HEAD_CNT];
@@ -89,14 +86,13 @@ static T_MhaBankWord g_stream_mid[MHA_BANK_WORDS];
  * words per feature, MHA_BANK_PACK tokens in each, with the trailing slots of a feature's last word
  * zero.  So this is a flat copy, one word per cycle.
  *
- * It used to cross the port as individual int8 bytes, and that was expensive in a way csynth did not
- * show: the port is 64 bits wide, so seven eighths of every transfer was empty, and the byte
- * requests did not merge into bursts.  Measured on the board at ~8 cycles per byte against the one
- * the scheduler assumed -- 310 k cycles to read 38 400 bytes and 123 k to write them, where csynth
- * predicted 43 k for each.  As words it is 5 376 transfers instead of 38 400.
+ * Keep it packed.  Crossing the port a byte at a time leaves seven eighths of every 64-bit
+ * transfer empty and the byte requests do not merge into bursts: on the board that costs about 8
+ * cycles a byte, which is 310k cycles to read 38 400 bytes and 123k to write them, against csynth's
+ * estimate of 43k for each.  Packed, the same data is 5 376 transfers instead of 38 400.
  *
- * The host now does the packing, which is where it belongs: it is a numpy reshape there, and the
- * padding it has to add is the same padding the kernel was generating anyway.
+ * The host does the packing.  There it is a numpy reshape, and the padding it adds is the padding
+ * the kernel would otherwise generate itself.
  */
 static void copy_activation_in (const T_MhaBankWord *src, T_MhaBankWord *dst, int words) {
 #pragma HLS INLINE off
@@ -320,8 +316,8 @@ static void layer_rows (
  * three are why this is one loop of two calls rather than the readable single loop it replaces:
  *
  *  - ONE loop over every stage.  A DATAFLOW region cannot share hardware with anything outside it,
- *    so an engine inside a per-weight region is a SECOND engine; marking two MLP loops was measured
- *    at 3 copies of layer_rows and 2x the LUT.  One region means one loop.
+ *    so an engine inside a per-weight region is a SECOND engine: marking two MLP loops gives 3
+ *    copies of layer_rows and twice the LUT.  One region means one loop.
  *  - A body of nothing but calls.  Every per-stage choice -- which weight, which tail, which scale,
  *    which boundary work -- therefore moves inside the two halves, which derive it from `stage`.
  *  - The slice reaches the engine as arguments, not globals, so HLS can place the second copy that
@@ -435,10 +431,10 @@ static void stage_compute (
     #pragma HLS ALLOCATION instances=rmsnorm               limit=1 function
     #pragma HLS ALLOCATION instances=residual_add          limit=1 function
 
-    /* V's eight lanes.  The index is token * MHA_V_GROUPS + group, so a cyclic split by
-     * MHA_V_GROUPS puts each group in its own piece: piece g holds the MHA_BANK_PACK output
-     * features that lane g owns, for every token.  Each piece is then 3 200 bits, small enough for
-     * logic cells, so the eight reads per cycle cost no block memory. */
+    /* V's MHA_V_GROUPS lanes.  The index is token * MHA_V_GROUPS + group, so the cyclic split puts
+     * each group in its own piece: piece g holds, for every token, the MHA_BANK_PACK output
+     * features that lane g owns.  A piece is 3 200 bits, which fits in logic cells, so the
+     * MHA_V_GROUPS reads a cycle cost no block memory. */
     #pragma HLS BIND_STORAGE    variable=g_v_packed type=ram_1p impl=lutram
     #pragma HLS ARRAY_PARTITION variable=g_v_packed cyclic factor=MHA_V_GROUPS dim=1
     #pragma HLS BIND_STORAGE    variable=g_q_scratch  type=ram_t2p impl=bram
@@ -447,12 +443,10 @@ static void stage_compute (
     #pragma HLS BIND_STORAGE    variable=g_k_col      type=ram_t2p impl=bram
     #pragma HLS BIND_STORAGE    variable=g_q_val      type=ram_t2p impl=bram
     #pragma HLS BIND_STORAGE    variable=g_q_col      type=ram_t2p impl=bram
-    /* No storage pragma for g_k_ptr / g_q_ptr on purpose.  csynth charges them 2 BRAM_18K each,
-     * but the implemented design puts them in 128 and 64 logic-cell memory slots and no block --
-     * measured on the v10 checkpoint.  Forcing `ram_1p impl=lutram` therefore moved the csynth
-     * NUMBER and nothing in hardware, while narrowing them to one port cost 114 cycles a head
-     * until KEY_VALUE_FEATURE stopped reading them twice.  Left on automatic, they get two ports
-     * for free. */
+    /* g_k_ptr and g_q_ptr are left on automatic storage on purpose.  They are 65 and 51 entries of
+     * 32 bits, and the tool puts them in logic cells with two ports, which is what the walks in
+     * head_core want.  Note that csynth charges them 2 BRAM_18K each; that figure is wrong, and
+     * forcing a logic-cell binding only changes the report while narrowing them to one port. */
     #pragma HLS BIND_STORAGE    variable=g_attn_heads type=ram_t2p impl=uram
     #pragma HLS ARRAY_PARTITION variable=g_attn_heads cyclic factor=MHA_BANK_CYCLIC dim=1
     #pragma HLS BIND_STORAGE    variable=g_stream_mid type=ram_t2p impl=uram
@@ -530,34 +524,31 @@ static void stage_loop (
 #ifndef __SYNTHESIS__
     assert((n_stages % 2) == 0 && "the skewed stage loop steps by two");
 #endif
-    /* TWO slices, used alternately, and declared here rather than inside the loop body.
+    /* Two weight slices, used alternately, declared here rather than inside the loop body.
      *
-     * The point of the skew is that a slice fetched in one round is computed in the NEXT, so the
-     * two halves of a round touch DIFFERENT slices and are independent -- which is the only way
-     * they can run at the same time.  Letting HLS manage a single slice as a channel cannot express
-     * that: a channel hands data from producer to consumer WITHIN a round, so the consumer always
-     * waits for the producer and the round costs load + compute.  That is what the first attempt
-     * did, and the board measured it: no gain and a small loss (plan 06).
+     * The loop below fetches slice i+1 while it computes slice i.  The two halves of a round
+     * therefore touch different slices and do not depend on each other, which is what allows them
+     * to run at the same time; a round costs the longer of the two instead of their sum.
      *
-     * The loop therefore steps by two, so which slice each half uses is fixed at compile time.  A
-     * run-time choice would index a partitioned array with a run-time value, which silently undoes
-     * the partitioning.
+     * The loop steps by two so that which slice each half uses is decided at compile time.
+     * Choosing at run time would mean indexing a partitioned array with a run-time value, and that
+     * silently undoes the partitioning.
      *
-     * A lane's bank is 64-bit words, MHA_TILE_BANK_WORDS deep: 40 960 bits, which fits in TWO
-     * block memories and needs two -- a block holds 36 864 usable bits.  So 24 blocks a set, 48 for
-     * both, against the 12 large memories a set was costing before (14 % of each one's capacity).
+     * An HLS channel cannot express this.  A channel passes data from producer to consumer within
+     * one round, so the consumer always waits and the round costs load plus compute
+     * (docs/plans/06-load-compute-overlap.md).
      *
-     * `ram_s2p` is the binding that makes this work, and the reason is the port width.  A block in
-     * TRUE dual-port mode carries at most 36 bits per port, so a 64-bit word would have to be
-     * spread across two blocks side by side.  In SIMPLE dual-port mode -- one wide write port, one
-     * wide read port -- it carries 72 bits, and two blocks stacked give 1024 x 72.  Simple dual port
-     * is also what the access pattern actually is: BANK_LOAD writes one word a lane a cycle and the
-     * MAC loop reads one word a lane a cycle, never both to the same copy, because the skew means
-     * one bank is being filled while the other is being read.
+     * A lane's bank is MHA_TILE_BANK_WORDS words of 64 bits, so 40 960 bits.  A block memory holds
+     * 36 864, which is why each lane takes two: 24 blocks a set, 48 for both sets.
      *
-     * An earlier comment here claimed BRAM would need ~12 BRAM18 a bank at "18 b per port".  That
-     * applied the true-dual-port width limit to a memory that does not need true dual port.  See
-     * docs/plans/12-memory-allocation.md. */
+     * `ram_s2p` is what makes two enough, and the reason is port width.  In simple dual-port mode a
+     * block carries 72 bits on one write port and 72 on one read port, 512 words deep, so two
+     * stacked give 1024 x 72 and the 64-bit word fits whole.  In true dual-port mode each port
+     * carries only 36 bits and the word would have to be split across two blocks side by side.
+     *
+     * Simple dual port is also what the access pattern is.  BANK_LOAD writes one word a lane a
+     * cycle and the MAC loop reads one word a lane a cycle, and never to the same copy: the skew
+     * below means one bank is being filled while the other is being read. */
     T_MhaSliceBank   bank_a,    bank_b;
     T_MhaSliceCount  counts_a,  counts_b;
     T_MhaSliceCursor cursor0_a, cursor0_b;
@@ -565,13 +556,16 @@ static void stage_loop (
     #pragma HLS BIND_STORAGE    variable=bank_b type=ram_s2p impl=bram
     #pragma HLS ARRAY_PARTITION variable=bank_a    complete dim=1
     #pragma HLS ARRAY_PARTITION variable=bank_b    complete dim=1
-    /* counts is written MHA_COUNT_PACK entries at a time by SLICE_COUNT, at consecutive addresses
-     * of one column block.  Left to itself HLS split the word axis only four ways, so two of those
-     * eight writes shared a piece every cycle, which needs two write ports -- and a true dual port
-     * cannot be a logic-cell memory, so Vivado spent a block on each of the 48 pieces: 96 blocks
-     * across the two banks to hold 1.5 kB.  csynth reports those as free, which is how it went
-     * unnoticed.  Splitting the word axis MHA_COUNT_PACK ways instead gives each write its own
-     * piece, one write port each, and the whole thing fits in logic cells. */
+    /* SLICE_COUNT writes MHA_COUNT_PACK entries of counts every cycle, at consecutive addresses of
+     * one column block.  The word axis is split that same MHA_COUNT_PACK ways so each of those
+     * writes lands in a different piece and one write port a piece is enough, which is what lets
+     * the whole array sit in logic cells.
+     *
+     * Do not drop the dim=2 split.  With fewer pieces two writes share one, that piece then needs
+     * two write ports, and only a block memory has those -- which costs a block per piece, 96 of
+     * them across the two banks, to hold 1.5 kB.  csynth reports such arrays as using no block
+     * memory at all, so the cost does not show up until the design is implemented.  See
+     * docs/plans/12-memory-allocation.md. */
     #pragma HLS ARRAY_PARTITION variable=counts_a  complete dim=1
     #pragma HLS ARRAY_PARTITION variable=counts_b  complete dim=1
     #pragma HLS ARRAY_PARTITION variable=counts_a  cyclic factor=MHA_COUNT_PACK dim=2

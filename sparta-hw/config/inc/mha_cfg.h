@@ -47,7 +47,6 @@
 #define MHA_H_TILE_BASE MHA_TILE_WORDS   // first word of the H region inside a tile
 #define MHA_TILE_WORDS_MAX (MHA_TILE_WORDS + MHA_H_TILE_WORDS)   // tile depth covering both regions (2240, one URAM)
 #define MHA_SCR_A_CNT (MHA_FEATURE_HEAD * MHA_FEATURE_HEAD)   // per-head A = K'V^T (int32)
-#define MHA_TC_FEATURE 768   // feature rows (projections)
 #define MHA_TC_TOKEN 50   // tokens / dense width
 #define MHA_TC_FEATURE_HEAD 64   // per-head width
 #define MHA_TC_W_NNZ 77   // nonzeros per projection weight row (~10% of D)

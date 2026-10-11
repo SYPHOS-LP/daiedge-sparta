@@ -32,10 +32,13 @@ void rmsnorm (
 
     T_RmsSq    sum_sq[RMS_BANK_PAD_TOK];
     T_RmsRsqrt inv_rms[RMS_BANK_PAD_TOK];
-    /* RMS_BANK_PACK pieces, each taking one read and one write per cycle, which a logic-cell
-     * memory supplies.  HLS binds this ram_t2p on its own and then Vivado has to spend a block per
-     * piece -- 16 RAMB36 for 392 bytes -- because a true dual port cannot be built from logic
-     * cells.  csynth reports it as costing no block memory at all. */
+    /* sum_sq is split into RMS_BANK_PACK pieces, one a lane, and each piece takes one read and one
+     * write a cycle.  `ram_2p impl=lutram` is exactly that, so the array sits in logic cells.
+     *
+     * Keep the binding.  Without it the tool picks a true dual port, which cannot be built from
+     * logic cells, so Vivado spends a block memory on every piece -- 16 of them to hold 392 bytes.
+     * csynth reports such arrays as using no block memory, so that cost only appears once the
+     * design is implemented.  See docs/plans/12-memory-allocation.md. */
     #pragma HLS ARRAY_PARTITION variable=sum_sq  cyclic factor=RMS_BANK_PACK dim=1
     #pragma HLS BIND_STORAGE    variable=sum_sq  type=ram_2p impl=lutram
     #pragma HLS ARRAY_PARTITION variable=inv_rms cyclic factor=RMS_BANK_PACK dim=1
@@ -49,18 +52,19 @@ void rmsnorm (
         sum_sq[t] = (T_RmsSq) 0;
     }
 
-    /* Sum of squares of the raw codes, per token.  No dequantization: the input scale cancels
-     * between the sum of squares and its reciprocal square root. */
-    /* One flattened walk over (feature, word).  As two loops the outer one is not pipelined, so the
-     * inner pipeline's fill and drain were paid once per feature -- 12 cycles per feature where the
-     * work is RMS_BANK_ROW_WORDS.  HLS will not flatten them itself because both bounds are runtime
-     * values, so the word axis is walked over its compile-time bound and short rows are predicated
-     * out; that also makes the recurrence distance below a constant.
+    /* Sum of squares of the raw codes, one sum a token.  No dequantization: the input scale
+     * cancels between the sum of squares and its reciprocal square root.
      *
-     * The cost of that: the pass now takes time proportional to the CONFIGURED maximum token count
-     * rather than the runtime tokens_dim, so it is a win when the two agree (the kernel is built per
-     * configuration, and this one runs its full RMS_TOKEN_W_MAX) and a loss when a short sequence is
-     * run on a build sized for a long one.  The engine's MAC_STEP makes the same trade. */
+     * This is one flat walk over (feature, word) rather than two nested loops, so the pipeline
+     * fills once for the whole pass instead of once a feature.  HLS will not flatten the nested
+     * form itself, because both bounds are run-time values.
+     *
+     * The word axis runs to its compile-time bound RMS_BANK_ROW_WORDS and short rows are skipped by
+     * the `sw < row_words` test, which also keeps the recurrence distance below a constant.  So the
+     * pass costs the configured maximum token count rather than the run-time tokens_dim.  That is
+     * the right trade here because the kernel is built per configuration and runs its full
+     * RMS_TOKEN_W_MAX; a short sequence on a build sized for a long one would waste cycles.  The
+     * engine's MAC_STEP works the same way. */
     const int sum_steps = feature_dim * RMS_BANK_ROW_WORDS;
     int sf = 0, sw = 0;
 
@@ -68,8 +72,9 @@ void rmsnorm (
     for (int i = 0; i < sum_steps; i++) {
         #pragma HLS LOOP_TRIPCOUNT min=(RMS_FEATURE_W_MAX*RMS_BANK_ROW_WORDS) max=(RMS_FEATURE_W_MAX*RMS_BANK_ROW_WORDS)
         #pragma HLS PIPELINE II=1
-        /* Each lane p is its own partition, and within a lane successive iterations move to the next
-         * word, so one accumulator recurs only every RMS_BANK_ROW_WORDS iterations. */
+        /* Each lane p has its own piece of sum_sq, and successive iterations within a lane move to
+         * the next word, so the same accumulator is touched again only RMS_BANK_ROW_WORDS
+         * iterations later.  Saying so lets the loop run one word a cycle. */
         #pragma HLS DEPENDENCE variable=sum_sq type=inter direction=RAW distance=RMS_BANK_ROW_WORDS dependent=true
         if (sw < row_words) {
             const T_RmsBankWord word = packed_input[sf * RMS_BANK_ROW_WORDS + sw];

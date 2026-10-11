@@ -53,8 +53,6 @@ static int g_slice_entry[SPMM_N_WEIGHTS][MHA_TILES];
  * them (tiled_lane_sum). */
 T_MhaAcc g_lane_partial[MHA_TILES][MHA_TOKEN_W_MAX];
 
-/* Wide DDR views used to fill one packed bank word per read. */
-
 
 /**
  * @brief Unpack one weight entry from a bank word: {block-local column, POT value}.
@@ -188,14 +186,15 @@ void load_weight_slice (T_MhaTileWord* w_bank, T_MhaCountWord* w_counts,
 
     /* One read per bank word: compile_model.py emits the entries already packed.
      *
-     * One flattened walk over (column block, word) rather than a loop per block.  As two loops the
-     * outer one is not pipelined, so every block paid the DDR read latency again -- measured at 74
-     * cycles from this loop's own latency (trip + 74 at every trip count), so 12 x 74 = 888 cycles
-     * a stage, ~96 k a layer, for ~1 250 words of actual work.  Flattened, the reads issue back to
-     * back and the latencies overlap.  This is the same defect fixed in SLICE_COUNT above and in
-     * three other loops (see docs/plans/04-tiled-mlp.md); it survived longest here because
-     * BANK_WORD's trip count is a runtime value, so csynth reports no latency for it and it never
-     * appears in a loop table sorted by cost.
+     * This is one flat walk over (column block, word), not a loop per block, so the reads issue
+     * back to back and their DDR latencies overlap.  Keep it flat.  Nested, the outer loop is not
+     * pipelined, so every block waits out the DDR latency again -- 74 cycles a block, 888 a stage,
+     * about 96k a layer, to do roughly 1 250 words of work.  SLICE_COUNT above is flat for the same
+     * reason.
+     *
+     * This one is hard to spot in a report: BANK_WORD's trip count is a run-time value, so csynth
+     * shows no latency for it and it does not appear in a loop table sorted by cost
+     * (docs/plans/04-tiled-mlp.md).
      *
      * Prefix sums rather than running counters: a column block CAN have zero words (an empty row
      * block in that block), and a single increment cannot skip past one. */
@@ -334,19 +333,22 @@ void tiled_rows_compute (
 #pragma HLS ARRAY_PARTITION variable=counts       cyclic factor=MHA_COUNT_PACK dim=2
 #pragma HLS ARRAY_PARTITION variable=cursor0      complete dim=1
 #pragma HLS ARRAY_PARTITION variable=g_bank_cursor complete dim=1
-    /* Lane t only ever touches g_lane_partial[t], so the lanes' updates are independent. */
+    /* Lane t only ever touches g_lane_partial[t], so the lanes update independently. */
 #pragma HLS ARRAY_PARTITION variable=g_lane_partial complete dim=1
 #pragma HLS ARRAY_PARTITION variable=g_lane_partial cyclic factor=MHA_BANK_PACK dim=2
-    /* The walk below reads, adds and writes one accumulator per token lane every cycle.  Successive
-     * iterations move to the next activation word, so within a lane they touch a different address;
-     * the same address returns only MHA_BANK_ROW_WORDS iterations later.  Saying so lets the walk
-     * run one iteration per cycle -- without it HLS assumes consecutive iterations may collide and
-     * halves the rate, and the alternatives (all accumulators in registers, or two-port block
-     * memories) cost ~80k registers or 96 memory blocks respectively. */
+    /* The walk below reads, adds and writes one accumulator a token lane every cycle.  Successive
+     * iterations move to the next activation word, so within a lane they hit a different address
+     * and the same address comes back only MHA_BANK_ROW_WORDS iterations later.  Saying so lets the
+     * walk run one iteration a cycle; without it HLS assumes consecutive iterations may collide and
+     * halves the rate.
+     *
+     * The accumulators stay in this split memory rather than in registers or in block memory.  All
+     * of them in registers costs about 80k registers, and block memory costs 96 blocks; split this
+     * way each piece holds MHA_BANK_ROW_WORDS words and the tool puts it in logic cells. */
     #pragma HLS DEPENDENCE variable=g_lane_partial type=inter direction=RAW distance=MHA_BANK_ROW_WORDS dependent=true
 
-    // One output row per call.  Several rows in flight was measured slower and far larger (see
-    // docs/plans/05-lane-balance.md), so the row index and its bookkeeping are not carried here.
+    // One output row per call, so the row index and its bookkeeping are not carried here.  Several
+    // rows in flight is both slower and much larger (docs/plans/05-lane-balance.md).
     static_assert(MHA_ROWS_PER_STEP == 1, "the engine computes one output row per call");
 
     /* A slice sits in the banks from the word that contains its first entry, so the walk starts at
@@ -401,9 +403,10 @@ void tiled_rows_compute (
 
                 const T_MhaBankWord act = g_act_tile[t][act_base + (int) col * MHA_BANK_ROW_WORDS + w];
                 const int           tok = w * MHA_BANK_PACK;
-                /* One multiply-accumulate per token in the word: the activation word is the vector,
-                 * the weight the scalar applied to all of it.  Written out rather than looped: as a
-                 * loop with UNROLL the same eight operations cost ~4.8k LUT more. */
+                /* One multiply-accumulate per token in the word: the activation word is the
+                 * vector, the weight is the scalar applied to all of it.  Written out rather than
+                 * looped -- the same eight operations as an unrolled loop cost about 4.8k LUT
+                 * more. */
                 mac_pe(act, val, tok + 0, 0, tokens_dim, g_lane_partial[t]);
                 mac_pe(act, val, tok + 1, 1, tokens_dim, g_lane_partial[t]);
                 mac_pe(act, val, tok + 2, 2, tokens_dim, g_lane_partial[t]);

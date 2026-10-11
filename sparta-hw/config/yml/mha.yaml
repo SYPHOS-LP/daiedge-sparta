@@ -94,7 +94,6 @@ defines:
   - { name: MHA_SCR_A_CNT,      value: "(MHA_FEATURE_HEAD * MHA_FEATURE_HEAD)", comment: "per-head A = K'V^T (int32)" }
 
   # --- loop tripcounts: latency ESTIMATION only (90% weight + activation sparsity)
-  - { name: MHA_TC_FEATURE,      value: 768, comment: "feature rows (projections)" }
   - { name: MHA_TC_TOKEN,        value: 50, comment: "tokens / dense width" }
   - { name: MHA_TC_FEATURE_HEAD, value: 64,  comment: "per-head width" }
   - { name: MHA_TC_W_NNZ,        value: 77,  comment: "nonzeros per projection weight row (~10% of D)" }
