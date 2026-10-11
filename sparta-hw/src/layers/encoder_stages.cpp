@@ -543,13 +543,26 @@ static void stage_loop (
      * run-time choice would index a partitioned array with a run-time value, which silently undoes
      * the partitioning.
      *
-     * A bank is 64-bit words, MHA_TILE_BANK_WORDS deep: one URAM each (72 b x 4096), where BRAM
-     * would need ~12 BRAM18 per bank for the same data (18 b per port, 1024 deep). */
+     * A lane's bank is 64-bit words, MHA_TILE_BANK_WORDS deep: 40 960 bits, which fits in TWO
+     * block memories and needs two -- a block holds 36 864 usable bits.  So 24 blocks a set, 48 for
+     * both, against the 12 large memories a set was costing before (14 % of each one's capacity).
+     *
+     * `ram_s2p` is the binding that makes this work, and the reason is the port width.  A block in
+     * TRUE dual-port mode carries at most 36 bits per port, so a 64-bit word would have to be
+     * spread across two blocks side by side.  In SIMPLE dual-port mode -- one wide write port, one
+     * wide read port -- it carries 72 bits, and two blocks stacked give 1024 x 72.  Simple dual port
+     * is also what the access pattern actually is: BANK_LOAD writes one word a lane a cycle and the
+     * MAC loop reads one word a lane a cycle, never both to the same copy, because the skew means
+     * one bank is being filled while the other is being read.
+     *
+     * An earlier comment here claimed BRAM would need ~12 BRAM18 a bank at "18 b per port".  That
+     * applied the true-dual-port width limit to a memory that does not need true dual port.  See
+     * docs/plans/12-memory-allocation.md. */
     T_MhaSliceBank   bank_a,    bank_b;
     T_MhaSliceCount  counts_a,  counts_b;
     T_MhaSliceCursor cursor0_a, cursor0_b;
-    #pragma HLS BIND_STORAGE    variable=bank_a type=ram_t2p impl=uram
-    #pragma HLS BIND_STORAGE    variable=bank_b type=ram_t2p impl=uram
+    #pragma HLS BIND_STORAGE    variable=bank_a type=ram_s2p impl=bram
+    #pragma HLS BIND_STORAGE    variable=bank_b type=ram_s2p impl=bram
     #pragma HLS ARRAY_PARTITION variable=bank_a    complete dim=1
     #pragma HLS ARRAY_PARTITION variable=bank_b    complete dim=1
     /* counts is written MHA_COUNT_PACK entries at a time by SLICE_COUNT, at consecutive addresses
