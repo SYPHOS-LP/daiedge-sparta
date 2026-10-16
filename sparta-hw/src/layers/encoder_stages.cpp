@@ -165,8 +165,8 @@ static void layer_rows (
 
         tiled_rows_compute(i, tokens_dim, act_base, bank, counts, cursor0);
 
-        /* Requantize the accumulated row once, MHA_BANK_PACK values per cycle, into row_q; the
-         * tails then only move bytes.  The six tails are mutually exclusive, so giving each its own
+        /* Requantize the accumulated row once, MHA_BANK_PACK values per cycle; the tails then only
+         * move bytes.  The six tails are mutually exclusive, so giving each its own
          * requantize units built 27 multipliers where 8 suffice.  The MLP's hidden output is packed
          * here as well, since its destination takes MHA_BANK_PACK values per word anyway.
          *
@@ -175,9 +175,7 @@ static void layer_rows (
          * over feature_dim products and routinely exceed that range, so the cast wraps and a large
          * negative accumulator can come back positive.  The tails that apply a ReLU therefore keep
          * the decision on the accumulator, as they did before this pass was shared. */
-        T_Activation row_q[MHA_TOKEN_W_MAX];
         T_Activation row_relu[MHA_TOKEN_W_MAX];
-        #pragma HLS ARRAY_PARTITION variable=row_q    cyclic factor=MHA_BANK_PACK dim=1
         #pragma HLS ARRAY_PARTITION variable=row_relu cyclic factor=MHA_BANK_PACK dim=1
 
         REQUANT_ROW:
@@ -200,7 +198,6 @@ static void layer_rows (
                     const T_MhaAcc acc = tiled_lane_sum(j);
                     q = requant_to_int8(acc, scale);
                     relu = (acc > (T_MhaAcc) 0) ? q : (T_Activation) 0;
-                    row_q[j]    = q;
                     row_relu[j] = relu;
                 }
                 relu_word.range(p * MHA_ACT_ELEM_BITS + MHA_ACT_ELEM_BITS - 1,
