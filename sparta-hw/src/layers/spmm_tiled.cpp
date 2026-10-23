@@ -77,6 +77,16 @@ static inline void bank_entry(T_MhaTileWord word, int slot, T_MhaWVal &val, T_Mh
  */
 void load_weight_bases (T_MhaCountWord* w_counts, int which) {
 #pragma HLS INLINE off
+    /* The loader's DDR positions, one entry per (weight, column block).  SLICE_PLAN below reads and
+     * writes all MHA_TILES entries of one weight in the same cycle, so the column-block axis is
+     * split completely: a piece is then SPMM_N_WEIGHTS words and one read plus one write a cycle,
+     * which logic cells supply.  Unsplit it is a single array needing MHA_TILES reads and writes
+     * through two ports, which forces block memory and serialises SLICE_PLAN over several cycles. */
+    #pragma HLS ARRAY_PARTITION variable=g_block_word0 complete dim=2
+    #pragma HLS ARRAY_PARTITION variable=g_slice_entry complete dim=2
+    #pragma HLS BIND_STORAGE    variable=g_block_word0 type=ram_2p impl=lutram
+    #pragma HLS BIND_STORAGE    variable=g_slice_entry type=ram_2p impl=lutram
+
     /* The offsets are int32 in the first MHA_COUNT_HDR_WORDS transfers of the blob. */
     BASE_WORD:
     for (int w = 0; w < MHA_COUNT_HDR_WORDS; w++) {
@@ -119,6 +129,15 @@ void load_weight_slice (T_MhaTileWord* w_bank, T_MhaCountWord* w_counts,
                         T_MhaSliceCount  counts,
                         T_MhaSliceCursor cursor0) {
 #pragma HLS INLINE off
+    /* The loader's DDR positions, one entry per (weight, column block).  SLICE_PLAN below reads and
+     * writes all MHA_TILES entries of one weight in the same cycle, so the column-block axis is
+     * split completely: a piece is then SPMM_N_WEIGHTS words and one read plus one write a cycle,
+     * which logic cells supply.  Unsplit it is a single array needing MHA_TILES reads and writes
+     * through two ports, which forces block memory and serialises SLICE_PLAN over several cycles. */
+    #pragma HLS ARRAY_PARTITION variable=g_block_word0 complete dim=2
+    #pragma HLS ARRAY_PARTITION variable=g_slice_entry complete dim=2
+    #pragma HLS BIND_STORAGE    variable=g_block_word0 type=ram_2p impl=lutram
+    #pragma HLS BIND_STORAGE    variable=g_slice_entry type=ram_2p impl=lutram
     /* The banks are declared by the caller (encoder_stages.cpp), which is also where their storage
      * is chosen; here they are just an output port per column block. */
     #pragma HLS ARRAY_PARTITION variable=counts  complete dim=1

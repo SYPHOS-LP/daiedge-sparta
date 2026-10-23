@@ -428,12 +428,10 @@ static void stage_compute (
     #pragma HLS ALLOCATION instances=rmsnorm               limit=1 function
     #pragma HLS ALLOCATION instances=residual_add          limit=1 function
 
-    /* V's MHA_V_GROUPS lanes.  The index is token * MHA_V_GROUPS + group, so the cyclic split puts
-     * each group in its own piece: piece g holds, for every token, the MHA_BANK_PACK output
-     * features that lane g owns.  A piece is 3 200 bits, which fits in logic cells, so the
-     * MHA_V_GROUPS reads a cycle cost no block memory. */
     #pragma HLS BIND_STORAGE    variable=g_v_packed type=ram_1p impl=lutram
     #pragma HLS ARRAY_PARTITION variable=g_v_packed cyclic factor=MHA_V_GROUPS dim=1
+    #pragma HLS BIND_STORAGE    variable=g_v_group  type=ram_1p impl=lutram
+    #pragma HLS ARRAY_PARTITION variable=g_v_group  complete dim=1
     #pragma HLS BIND_STORAGE    variable=g_q_scratch  type=ram_t2p impl=bram
     #pragma HLS ARRAY_PARTITION variable=g_q_scratch cyclic factor=MHA_BANK_PACK dim=1
     #pragma HLS BIND_STORAGE    variable=g_k_val      type=ram_t2p impl=bram
