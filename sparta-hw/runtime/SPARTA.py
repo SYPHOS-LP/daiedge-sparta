@@ -57,21 +57,29 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from SPARTALoader import Loader
 
-# Encoder dims (config/inc/encoder_layer_cfg.h).  ENC_N=50 on the 32x32-patch
-# baseline: a 7x7 patch grid + 1 CLS token (was 197 on the 16x16-patch model).
-ENC_D = 768          # feature width           (ENC_D)
-ENC_N = 50           # tokens                  (ENC_MAX_BATCH)
-ACT_ELEMS = ENC_D * ENC_N   # the logical activation: D x N int8
-
+# Encoder dims.  These are a property of the BITSTREAM, not of the payload: the kernel's
+# activation ports and its on-chip buffers are sized at synthesis time.  50 tokens for the
+# 32x32-patch model, 197 for the 16x16-patch one.  Set with --features / --tokens.
+#
 # The kernel's activation ports carry PACKED 64-bit words, not bytes: ENC_PACK tokens per word,
 # ENC_ROW_WORDS words per feature, a feature's trailing slots zero.  The host packs because on the
 # port a byte at a time cost ~8 cycles each -- 310 k cycles to read one activation and 123 k to
 # write it, against the 43 k csynth predicted (the port is 64 bits wide, so seven eighths of each
 # transfer was empty and the byte requests did not merge into bursts).
-ENC_PACK      = 8
-ENC_ROW_WORDS = -(-ENC_N // ENC_PACK)          # 7 at N=50
-ACT_WORDS     = ENC_D * ENC_ROW_WORDS          # what the DMA buffer holds
-ACT_BYTES     = ACT_WORDS * ENC_PACK
+ENC_PACK = 8
+
+
+def set_enc_dims(features, tokens):
+    """Set the encoder geometry, and everything that follows from it."""
+    global ENC_D, ENC_N, ACT_ELEMS, ENC_ROW_WORDS, ACT_WORDS, ACT_BYTES
+    ENC_D, ENC_N = features, tokens
+    ACT_ELEMS     = ENC_D * ENC_N                  # the logical activation: D x N int8
+    ENC_ROW_WORDS = -(-ENC_N // ENC_PACK)          # 7 at N=50, 25 at N=197
+    ACT_WORDS     = ENC_D * ENC_ROW_WORDS          # what the DMA buffer holds
+    ACT_BYTES     = ACT_WORDS * ENC_PACK
+
+
+set_enc_dims(768, 50)
 
 
 def pack_rows(a):
@@ -822,6 +830,11 @@ def main():
     ap.add_argument("--n-layers", type=int, default=None,
                     help="run only the first N encoder layers; for TIMING only, the result is "
                          "partway through the encoder so the golden comparison will fail")
+    ap.add_argument("--features", type=int, default=ENC_D,
+                    help=f"encoder feature width the BITSTREAM was built for (default {ENC_D})")
+    ap.add_argument("--tokens", type=int, default=ENC_N,
+                    help=f"encoder token count the BITSTREAM was built for (default {ENC_N}); "
+                         f"50 for the 32x32-patch model, 197 for the 16x16-patch one")
     ap.add_argument("--clock-mhz", type=float, default=CLOCK_HZ / 1e6,
                     help="fabric clock, for reporting cycles (default %(default)s); the app's "
                          "device-tree overlay sets the real one")
@@ -829,6 +842,7 @@ def main():
                     help="HLS-generated xencoder_layer_top_hw.h to read the register "
                          "offsets from (default: the built-in REGMAP)")
     args = ap.parse_args()
+    set_enc_dims(args.features, args.tokens)
     regmap = load_regmap(args.hw_header) if args.hw_header else None
 
     if not args.bitstream and not args.no_download:

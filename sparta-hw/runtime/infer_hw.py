@@ -120,16 +120,25 @@ class EncoderBridge:
     """Captures the encoder's int8 input/output boundary from the SW model.
 
     A forward hook on encoder_layer_0.quant_input records exactly the int8
-    tensor the SW encoder would have consumed. Running the SW model forward
-    therefore produces both the reference prediction AND the FPGA's input, from
-    one pass.
+    tensor the SW encoder would have consumed.
+
+    With `stop_after_capture`, the hook raises `Abort` once it has that tensor, so the forward
+    stops at the embedding. The 12 SW encoder layers and the head are then never run, which is
+    most of the per-image CPU cost -- the difference between an accuracy pass over a few images
+    and one over a whole dataset. The reference prediction is given up in exchange, which is
+    what --no-reference asks for. Aborting from a hook is safe under no_grad: there is no
+    autograd graph left half-built.
     """
 
-    def __init__(self, model):
+    class Abort(Exception):
+        """Raised by the capture hook when the forward should stop at the embedding."""
+
+    def __init__(self, model, stop_after_capture=False):
         import torch
 
         self._torch = torch
         self.model = model
+        self._stop_after_capture = stop_after_capture
         self._enc_in_int8 = None
         self._enc_in_scale = None
         model.encoder.encoder_layer_0.quant_input.register_forward_hook(self._grab_in)
@@ -141,6 +150,8 @@ class EncoderBridge:
         # `out` is an IntQuantTensor of shape (1, N, D).
         self._enc_in_int8 = out.int().detach().to(self._torch.int32).numpy()[0]
         self._enc_in_scale = float(out.scale.flatten()[0])
+        if self._stop_after_capture:
+            raise self.Abort
 
     def encoder_input(self):
         """The int8 encoder input as feature-major (D, N), plus its scale."""
@@ -318,6 +329,14 @@ def main():
                     help=f"s_axi_control base address when attaching "
                          f"(default 0x{SPARTA.HwKernel.CONTROL_BASE:08x})")
     ap.add_argument("--images", type=int, default=10, help="how many images to run")
+    ap.add_argument("--features", type=int, default=SPARTA.ENC_D,
+                    help=f"encoder feature width the BITSTREAM was built for "
+                         f"(default {SPARTA.ENC_D})")
+    ap.add_argument("--tokens", type=int, default=SPARTA.ENC_N,
+                    help=f"encoder token count the BITSTREAM was built for "
+                         f"(default {SPARTA.ENC_N}); 50 for the 32x32-patch model, 197 for the "
+                         f"16x16-patch one.  Must also match the SW config's p_size, or the "
+                         f"captured encoder input will not fit the kernel's ports")
     ap.add_argument("--verbose", "-v", action="store_true",
                     help="Control verbosity.")
     ap.add_argument("--layers", type=int, default=None,
@@ -332,15 +351,18 @@ def main():
     ap.add_argument("--debug-dir", default="hw_dumps",
                     help="where --debug writes layer dumps (default: hw_dumps)")
     ap.add_argument("--no-reference", action="store_true",
-                    help="skip the SW reference prediction (still needs the SW "
-                         "forward pass to produce the encoder input, so this "
-                         "only suppresses the comparison)")
+                    help="skip the SW reference prediction.  The forward then stops at the "
+                         "embedding, so the 12 SW encoder layers and the head do not run -- "
+                         "about an order of magnitude less CPU per image, which is what makes "
+                         "a whole-dataset accuracy pass practical on the board.  Reports HW "
+                         "accuracy against the labels only")
     ap.add_argument("--timer-base", default=None,
                     help="base address of the diagnostic AXI timer, if present.")
     ap.add_argument("--hw-header", default=None,
                     help="HLS-generated xencoder_layer_top_hw.h to read the register "
                          "offsets from (default: SPARTA.REGMAP)")
     args = ap.parse_args()
+    SPARTA.set_enc_dims(args.features, args.tokens)
 
     if args.download and not args.bitstream:
         ap.error("--download needs --bitstream")
@@ -363,7 +385,7 @@ def main():
     step(f"building SW model + loading checkpoint {cfg['model']['path']}")
     model = build_sw_model(cfg, iq)
     step("SW model ready; hooking encoder boundary")
-    bridge = EncoderBridge(model)
+    bridge = EncoderBridge(model, stop_after_capture=args.no_reference)
     step(f"loading dataset from {cfg['dataset']['path']}")
     data, _ = iq.initialize_map_datasets(cfg)
     step(f"dataset ready ({len(data)} images)")
@@ -386,20 +408,25 @@ def main():
         print(f"debug: dumping layer outputs to {args.debug_dir}/")
 
     agree = correct_sw = correct_hw = 0
-    print("image | truth | SW pred | HW pred | agree")
-    print("------+-------+---------+---------+------")
+    print("image | truth | SW pred | HW pred | agree | HW acc so far")
+    print("------+-------+---------+---------+-------+--------------")
     try:
         for idx in range(args.images):
             step(f"image {idx}: SW forward pass")
             img, label = data[idx]
 
-            # One SW forward: gives the reference prediction, and fires the hook
-            # that captures the exact int8 tensor to hand the FPGA.
-            with torch.no_grad():
-                sw_logits = model(img.unsqueeze(0))
-            sw_lv = (sw_logits.value if isinstance(sw_logits, IntQuantTensor)
-                     else sw_logits)
-            sw_pred = int(sw_lv.argmax(-1))
+            # One SW forward. It fires the hook that captures the exact int8 tensor to hand
+            # the FPGA; without --no-reference it also runs to completion and yields the
+            # reference prediction, and with it the hook stops the forward at the embedding.
+            sw_pred = None
+            try:
+                with torch.no_grad():
+                    sw_logits = model(img.unsqueeze(0))
+                sw_lv = (sw_logits.value if isinstance(sw_logits, IntQuantTensor)
+                         else sw_logits)
+                sw_pred = int(sw_lv.argmax(-1))
+            except EncoderBridge.Abort:
+                pass
 
             enc_in, _in_scale = bridge.encoder_input()      # (D, N) int8
             if args.debug:
@@ -412,12 +439,16 @@ def main():
             hw_logits = run_head(model, enc_out, bridge.out_scale)
             hw_pred = int(np.argmax(hw_logits))
 
-            a = sw_pred == hw_pred
-            agree += a
-            correct_sw += (sw_pred == label)
             correct_hw += (hw_pred == label)
-            print(f"{idx:5d} | {label:5d} | {sw_pred:7d} | {hw_pred:7d} | "
-                  f"{'yes' if a else 'NO'}")
+            if sw_pred is None:
+                print(f"{idx:5d} | {label:5d} |       - | {hw_pred:7d} |     - "
+                      f"| {correct_hw}/{idx + 1}")
+            else:
+                a = sw_pred == hw_pred
+                agree += a
+                correct_sw += (sw_pred == label)
+                print(f"{idx:5d} | {label:5d} | {sw_pred:7d} | {hw_pred:7d} | "
+                      f"{'yes' if a else 'NO':4s} | {correct_hw}/{idx + 1}")
     finally:
         hw.close()
 
@@ -427,9 +458,14 @@ def main():
               f"are a partial encoder, not a prediction.  SW accuracy "
               f"{correct_sw}/{n} is still valid (full SW model).")
     else:
-        print(f"\nAgreement SW vs HW : {agree}/{n}")
-        print(f"Accuracy  SW       : {correct_sw}/{n}")
-        print(f"Accuracy  HW       : {correct_hw}/{n}", flush=True)
+        if args.no_reference:
+            print(f"\nAccuracy  HW       : {correct_hw}/{n} "
+                  f"({100.0 * correct_hw / n:.2f} %)", flush=True)
+        else:
+            print(f"\nAgreement SW vs HW : {agree}/{n}")
+            print(f"Accuracy  SW       : {correct_sw}/{n}")
+            print(f"Accuracy  HW       : {correct_hw}/{n} "
+                  f"({100.0 * correct_hw / n:.2f} %)", flush=True)
 
     # Per-layer MEAN latency in fabric clock cycles (mean over all images of that
     # layer's invocations).  Always printed when cycle data is available (needs a
