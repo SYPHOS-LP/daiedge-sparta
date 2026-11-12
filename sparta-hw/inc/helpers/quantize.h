@@ -21,17 +21,37 @@
 template <typename T_Scaled>
 static inline T_Activation saturate_to_int8(T_Scaled scaled) {
 #pragma HLS INLINE
-    T_Scaled rounded = scaled + (scaled >= (T_Scaled) 0 ? (T_Scaled) 0.5f : (T_Scaled) -0.5f);
-    int value = (int) rounded;
-
-    if (value >  127) {
-        value = 127;
+    /* Saturate BEFORE rounding, not after.
+     *
+     * The straightforward order -- add +/-0.5 across the whole value, truncate, then clamp -- puts
+     * an adder and a comparator at the FULL width of the incoming value.  For the requantize that
+     * value is a 32x32 fixed-point product, so the chain came to ~15 CARRY8 blocks and was this
+     * design's critical path: all four paths failing 200 MHz after place-and-route were this
+     * arithmetic (see docs/plans/00-open-issues.md).
+     *
+     * Saturating first is equivalent.  Round-half-away-from-zero then clamp to [-128, 127] yields
+     * 127 for every input >= 127.5 and -128 for every input <= -128.5, which the two comparisons
+     * below decide directly.  What remains is strictly inside (-128.5, 127.5), so nine integer bits
+     * hold it and the rounding adder runs at that width instead of the product's.
+     *
+     * Comparisons against a constant are also cheaper than an add: the carry chain only has to
+     * resolve a magnitude, not produce a sum.
+     *
+     * Every fractional bit is kept -- the rounding decision depends on all of them -- and no clamp
+     * is needed afterwards: an input below 127.5 cannot round above 127, and one above -128.5
+     * cannot round below -128 (truncation is toward zero). */
+    if (scaled >= (T_Scaled) 127.5f) {
+        return (T_Activation) 127;
     }
-    else if (value < -128) {
-        value = -128;
+    if (scaled <= (T_Scaled) -128.5f) {
+        return (T_Activation) -128;
     }
 
-    return (T_Activation) value;
+    typedef ap_fixed<T_Scaled::width - T_Scaled::iwidth + 9, 9> T_Narrow;
+    const T_Narrow narrow  = scaled;
+    const T_Narrow rounded = narrow + (narrow >= (T_Narrow) 0 ? (T_Narrow) 0.5f
+                                                              : (T_Narrow) -0.5f);
+    return (T_Activation) (int) rounded;
 }
 
 /**

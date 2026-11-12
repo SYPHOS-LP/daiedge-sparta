@@ -5,15 +5,15 @@
 // on real per-layer POT4 weights + a real SW-embedded image, in ONE csim process.
 // POT4 model = fused gammas (none read) + int8 weights + ap_fixed<32,16> scales.
 //
-//   model.bin       : per-layer CSR weights (int8 val, u16 col, i32 rowptr, i32 s_row)
-//                     + 15 ap_fixed scales.  NO gammas.  (scripts/compile_model.emit_model
-//                     pot=False fused=True)
+//   model.bin       : per layer, MHA weights as packed bank words + counts, MLP as CSR/CSC
+//                     + 15 ap_fixed scales.  NO gammas.  (scripts/compile_model.py
+//                     --scales fixed: pot=True, pot_scales=False, fused=True)
 //   model_index.bin : per-layer (nnz, n_rows) so we stream model.bin without JSON.
 //   inputs.bin      : per-image layer-0 input (D x N int8, feature-major) from SW embed.
 //   -> hw_out.bin   : per-image encoder output (D x N int8) after all 12 HW layers.
-//   -> hw_layers.bin: image-0 per-layer {hidden, output} boundaries for divergence localization.
+//   -> hw_layers.bin: image-0 per-layer outputs (12 x D x N) for divergence localization.
 //
-// File formats mirror the emit script scratchpad/emit_e2e_pot4.py.
+// E2E_IMAGES=<k> runs only the first k images (quick regression).
 // ============================================================================
 #include <cstdio>
 #include <cstdlib>
@@ -34,14 +34,19 @@ template <typename T> static void read_raw(FILE* f, T* d, size_t c, const char* 
 }
 static int32_t read_i32(FILE* f) { int32_t v; read_raw(f, &v, 1, "i32"); return v; }
 
+// The kernel reads weight values/columns in wide words and reads the last word whole, so
+// the buffers must be readable (zero-padded) up to a multiple of this many elements.
+static const int WIDE_READ_PAD = 32;
+
 struct WMeta { int nnz; int n_rows; };
 struct LayerMeta { WMeta w[6]; };   // w_q,w_k,w_v,out_proj,linear_1,linear_2
 
 struct LayerW {
-    std::vector<T_Activation> val[6];
-    std::vector<uint16_t>     col[6];
-    std::vector<int>          ptr[6];
-    std::vector<T_Scale>      scales;   // 15
+    // All six weights are pre-packed bank words ({column, value} per slot) plus the nonzero counts
+    // per (column block, row).
+    std::vector<T_MhaTileWord>  bank[6];
+    std::vector<T_MhaCountWord> counts[6];
+    std::vector<T_Scale>       scales;   // 15
 };
 
 int main(int argc, char** argv) {
@@ -52,10 +57,34 @@ int main(int argc, char** argv) {
     FILE* fi = std::fopen((g_dir + "model_index.bin").c_str(), "rb");
     if (!fi) die("cannot open model_index.bin");
     if ((uint32_t)read_i32(fi) != 0x45324D49u) die("bad model_index magic");
-    const int n_layers = read_i32(fi);
+    int n_layers = read_i32(fi);
+    /* E2E_LAYERS=<k> stops after k layers.  For co-simulation, where one layer is already over a
+     * million cycles of RTL and twelve are impractical; one covers every stage mode.  Safe to
+     * truncate here: model_index.bin is closed straight after, and model.bin is read sequentially
+     * and simply stops early. */
+    if (const char* e = std::getenv("E2E_LAYERS")) {
+        const int k = std::atoi(e);
+        if (k > 0 && k < n_layers) n_layers = k;
+    }
     const int D        = read_i32(fi);
     const int d_h      = read_i32(fi);
     (void)read_i32(fi);   // n_heads
+    {   /* Weight entry layout: 0 = power-of-two values (shift datapath), 1 = plain integers
+         * (DSP multiply).  compile_model.py --weights writes it; it must match this build. */
+        const int fmt = read_i32(fi);
+        if (fmt != MHA_ENTRY_FORMAT) {
+            std::fprintf(stderr, "model_index entry_format=%d but this kernel is built for %d "
+                                 "(POT_SHIFT_MAC %s); re-run compile_model.py --weights auto\n",
+                         fmt, MHA_ENTRY_FORMAT,
+#ifdef POT_SHIFT_MAC
+                         "set"
+#else
+                         "not set"
+#endif
+                         );
+            die("weight entry format mismatch");
+        }
+    }
     std::vector<LayerMeta> lm(n_layers);
     for (int L = 0; L < n_layers; L++)
         for (int w = 0; w < 6; w++) { lm[L].w[w].nnz = read_i32(fi); lm[L].w[w].n_rows = read_i32(fi); }
@@ -65,7 +94,12 @@ int main(int argc, char** argv) {
     FILE* fin = std::fopen((g_dir + "inputs.bin").c_str(), "rb");
     if (!fin) die("cannot open inputs.bin");
     if ((uint32_t)read_i32(fin) != 0x45324E49u) die("bad inputs magic");
-    const int n_images = read_i32(fin);
+    const int n_in_file = read_i32(fin);
+    int n_images = n_in_file;
+    if (const char* e = std::getenv("E2E_IMAGES")) {
+        const int k = std::atoi(e);
+        if (k > 0 && k < n_images) n_images = k;
+    }
     const int in_D = read_i32(fin);
     const int N    = read_i32(fin);
     if (in_D != D) die("inputs D != model D");
@@ -73,19 +107,42 @@ int main(int argc, char** argv) {
     if (N > ENC_TOKEN_W_MAX) die("N > ENC_TOKEN_W_MAX (raise ENC_TOKEN_W_MAX)");
     const int XY = D * N;
 
-    // ---- model.bin: per layer, 6 weights (val i8, col u16, ptr i32, s_row i32) + 15 scales ----
+    // ---- model.bin: per layer, 6 weights (bank u64, counts i32, s_row i32), then 15 scales ----
     FILE* fm = std::fopen((g_dir + "model.bin").c_str(), "rb");
     if (!fm) die("cannot open model.bin");
     std::vector<LayerW> LW(n_layers);
     for (int L = 0; L < n_layers; L++) {
         for (int w = 0; w < 6; w++) {
             const int nnz = lm[L].w[w].nnz, nr = lm[L].w[w].n_rows;
-            LW[L].val[w].resize(nnz); LW[L].col[w].resize(nnz); LW[L].ptr[w].resize(nr + 1);
-            { std::vector<int8_t> t(nnz); read_raw(fm, t.data(), nnz, "w.val");
-              for (int i = 0; i < nnz; i++) LW[L].val[w][i] = (T_Activation)t[i]; }
-            read_raw(fm, LW[L].col[w].data(), nnz, "w.col");
-            { std::vector<int32_t> t(nr + 1); read_raw(fm, t.data(), nr + 1, "w.ptr");
-              for (int i = 0; i <= nr; i++) LW[L].ptr[w][i] = (int)t[i]; }
+            if (nnz % MHA_TILE_PACK) die("weight nnz is not a multiple of MHA_TILE_PACK");
+            const int words = nnz / MHA_TILE_PACK;
+            /* Co-simulation copies exactly `depth` elements from each m_axi pointer, so a buffer
+             * shorter than its port's declared depth is read off the end -- a SIGSEGV in the
+             * instrumented testbench rather than a diagnostic.  Pad to the depth the pragma in
+             * encoder_layer.cpp declares.  Costs nothing worth measuring: ~59 MB across all twelve
+             * layers, and co-simulation runs one. */
+            if (words > MAX_NNZ) die("weight bank exceeds MAX_NNZ (raise it in csr_bounds.h)");
+            LW[L].bank[w].assign(words + MHA_TILE_PACK > MAX_NNZ ? words + MHA_TILE_PACK : MAX_NNZ,
+                                 (T_MhaTileWord) 0);
+            std::vector<uint64_t> t(words); read_raw(fm, t.data(), words, "w.bank");
+            for (int i = 0; i < words; i++) LW[L].bank[w][i] = (T_MhaTileWord) t[i];
+            /* The counts blob is bytes: MHA_TILES int32 block offsets padded to a whole transfer,
+             * then one byte per (column block, row) count.  Read it as transfers. */
+            const int count_bytes = MHA_COUNT_HDR_WORDS * MHA_COUNT_PACK
+                                  + (nr + 1) - MHA_TILES;   /* model_index counts the entries */
+            const int count_words = (count_bytes + MHA_COUNT_PACK - 1) / MHA_COUNT_PACK;
+            std::vector<uint8_t> cb(count_words * MHA_COUNT_PACK, 0);
+            read_raw(fm, cb.data(), count_bytes, "w.counts");
+            /* Same reason as the bank above; this is the one that actually crashed cosim, because
+             * the counts ports declare MHA_TILES*(MAX_ROWS+1) -- a count of the blob's BYTES used
+             * as a number of 64-bit transfers, so 8x what the blob needs. */
+            const int counts_depth = MHA_TILES * (MAX_ROWS + 1);
+            LW[L].counts[w].assign(count_words > counts_depth ? count_words : counts_depth,
+                                   (T_MhaCountWord) 0);
+            for (int i = 0; i < count_bytes; i++) {
+                LW[L].counts[w][i / MHA_COUNT_PACK].range((i % MHA_COUNT_PACK) * 8 + 7,
+                                                          (i % MHA_COUNT_PACK) * 8) = cb[i];
+            }
             (void)read_i32(fm);   // s_row (per-row scale, ignored; scalar scales used)
         }
         // 15 scales: int32 raw ap_fixed<32,16> bit pattern -> reinterpret
@@ -96,61 +153,78 @@ int main(int argc, char** argv) {
     }
     std::fclose(fm);
 
-    // widened column buffers (T_MhaIndex / T_MlpIndex)
-    std::vector<std::vector<T_MhaIndex>> mha_col(n_layers * 4);
-    std::vector<std::vector<T_MlpIndex>> mlp_col(n_layers * 2);
-    for (int L = 0; L < n_layers; L++) {
-        for (int w = 0; w < 4; w++) { auto& d = mha_col[L*4+w]; d.resize(LW[L].col[w].size());
-            for (size_t i = 0; i < d.size(); i++) d[i] = (T_MhaIndex)LW[L].col[w][i]; }
-        for (int w = 0; w < 2; w++) { auto& d = mlp_col[L*2+w]; d.resize(LW[L].col[4+w].size());
-            for (size_t i = 0; i < d.size(); i++) d[i] = (T_MlpIndex)LW[L].col[4+w][i]; }
-    }
-
     // ---- output file ----
     FILE* fo = std::fopen((g_dir + "hw_out.bin").c_str(), "wb");
     if (!fo) die("cannot open hw_out.bin");
     { int32_t hdr[4] = { (int32_t)0x45324F55, n_images, D, N }; std::fwrite(hdr, 4, 4, fo); }
 
-    std::vector<T_Activation> cur(XY), hidden(XY), nxt(XY);
+    /* The kernel's activation ports carry PACKED words now, not bytes: MHA_BANK_ROW_WORDS words
+     * per feature, MHA_BANK_PACK tokens each, a feature's trailing slots zero.  The host does the
+     * packing because on the port it was costing ~8 cycles per byte (see encoder_stages.cpp).
+     * These two helpers are what the Python host does with a numpy reshape. */
+    const int ROW_WORDS = MHA_BANK_ROW_WORDS, PACKED = D * ROW_WORDS;
+    std::vector<T_MhaBankWord> cur(PACKED), nxt(PACKED);
 
-    // DDR-resident activation scratch, reused across all layers/images.
-    // Q'/K': full grid D*N.  H: ONE region (d_h*N) exposed via two pointer pairs (h0/h1) so the
-    // two stage-3 W2 PEs read it on independent AXI bundles -> both alias the SAME buffer here.
-    std::vector<T_Activation>   qpv(MHA_MAX_QK_NNZ), kpv(MHA_MAX_QK_NNZ);
-    std::vector<T_MhaHeadIndex> qpc(MHA_MAX_QK_NNZ), kpc(MHA_MAX_QK_NNZ);
-    std::vector<int>            qpp(MHA_SCR_QP_PTR_CNT), kpp(MHA_SCR_KP_PTR_CNT);
-    std::printf("E2E TB: %d images, %d layers, D=%d N=%d d_h=%d\n", n_images, n_layers, D, N, d_h);
+    auto pack_rows = [&](const std::vector<int8_t>& flat, std::vector<T_MhaBankWord>& out) {
+        for (int f = 0; f < D; f++) {
+            for (int w = 0; w < ROW_WORDS; w++) {
+                T_MhaBankWord word = 0;
+                for (int p = 0; p < MHA_BANK_PACK; p++) {
+                    const int t = w * MHA_BANK_PACK + p;
+                    const int8_t v = (t < N) ? flat[f * N + t] : (int8_t) 0;
+                    word.range(p * 8 + 7, p * 8) = (ap_uint<8>) (uint8_t) v;
+                }
+                out[f * ROW_WORDS + w] = word;
+            }
+        }
+    };
+    auto unpack_rows = [&](const std::vector<T_MhaBankWord>& in, std::vector<int8_t>& flat) {
+        for (int f = 0; f < D; f++) {
+            for (int t = 0; t < N; t++) {
+                const T_MhaBankWord word = in[f * ROW_WORDS + t / MHA_BANK_PACK];
+                const int p = t % MHA_BANK_PACK;
+                flat[f * N + t] = (int8_t)(ap_int<8>)(ap_uint<8>) word.range(p * 8 + 7, p * 8);
+            }
+        }
+    };
+
+    std::printf("E2E TB: %d of %d images, %d layers, D=%d N=%d d_h=%d\n",
+                n_images, n_in_file, n_layers, D, N, d_h);
 
     for (int img = 0; img < n_images; img++) {
         { std::vector<int8_t> t(XY); read_raw(fin, t.data(), XY, "img input");
-          for (int i = 0; i < XY; i++) cur[i] = (T_Activation)t[i]; }
+          pack_rows(t, cur); }
 
+        /* The kernel keeps the activation on-chip between layers, so only the first layer reads it
+         * from memory and only the last writes it back.  Image 0 forces the write on every layer so
+         * that hw_layers.bin still holds each layer's output for the reference comparison; the other
+         * images run the production flags, which is what the board will do. */
         FILE* fdbg = (img == 0) ? std::fopen((g_dir + "hw_layers.bin").c_str(), "wb") : nullptr;
 
         for (int L = 0; L < n_layers; L++) {
             LayerW& w = LW[L];
             encoder_layer_top(
                 cur.data(), D, N, d_h,
-                w.val[0].data(), mha_col[L*4+0].data(), w.ptr[0].data(),   // w_q
-                w.val[1].data(), mha_col[L*4+1].data(), w.ptr[1].data(),   // w_k
-                w.val[2].data(), mha_col[L*4+2].data(), w.ptr[2].data(),   // w_v
-                w.val[3].data(), mha_col[L*4+3].data(), w.ptr[3].data(),   // out_proj
-                w.val[4].data(), mlp_col[L*2+0].data(), w.ptr[4].data(),   // linear_1
-                w.val[5].data(), mlp_col[L*2+1].data(), w.ptr[5].data(),   // linear_2
+                w.bank[0].data(), w.counts[0].data(),   // w_q
+                w.bank[1].data(), w.counts[1].data(),   // w_k
+                w.bank[2].data(), w.counts[2].data(),   // w_v
+                w.bank[3].data(), w.counts[3].data(),   // out_proj
+                w.bank[4].data(), w.counts[4].data(),   // linear_1
+                w.bank[5].data(), w.counts[5].data(),   // linear_2
                 w.scales.data(),
-                qpv.data(), qpc.data(),
-                kpv.data(), kpc.data(),
-                nxt.data());
+                nxt.data(),
+                (L == 0),                            /* first_layer: read the input from memory */
+                (fdbg != nullptr) || (L == n_layers - 1));   /* last_layer: write the result out */
             if (fdbg) {
                 std::vector<int8_t> ty(XY);
-                for (int i = 0; i < XY; i++) { ty[i] = (int8_t)nxt[i]; }
+                unpack_rows(nxt, ty);
                 std::fwrite(ty.data(), 1, XY, fdbg);
             }
             cur.swap(nxt);
         }
         if (fdbg) { std::fflush(fdbg); std::fclose(fdbg); }
 
-        { std::vector<int8_t> t(XY); for (int i = 0; i < XY; i++) t[i] = (int8_t)cur[i];
+        { std::vector<int8_t> t(XY); unpack_rows(cur, t);
           std::fwrite(t.data(), 1, XY, fo); std::fflush(fo); }
         std::fprintf(stderr, "  image %d/%d done\n", img, n_images); std::fflush(stderr);
     }

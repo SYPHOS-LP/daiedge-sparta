@@ -26,7 +26,7 @@ def parse_config(yaml_path):
         config = yaml.safe_load(f)
     return config
 
-def generate_hls_config(config, output_path):
+def generate_hls_config(config, output_path, package_format="xo"):
     """Generate HLS config file from configuration."""
     
     hls_cfg = config.get('hls', {})
@@ -92,16 +92,25 @@ def generate_hls_config(config, output_path):
         p(config_inc_dir / "rmsnorm_cfg.h"),
         p(helpers_inc_dir / "rmsnorm_rsqrt.h"),
     ]
+    # The tiled SpMM engine is shared by the layer's projections, so it is its own module.
+    spmm_files = [
+        p(layers_src_dir / "spmm_tiled.cpp"),
+        p(layers_inc_dir / "spmm_tiled.h"),
+    ]
     mha_files = [
         p(layers_src_dir / "mha.cpp"),
         p(layers_inc_dir / "mha.h"),
         p(helpers_inc_dir / "mha_recip.h"),
         p(config_inc_dir / "mha_cfg.h"),
     ]
-    mlp_files = [
-        p(layers_src_dir / "mlp.cpp"),
-        p(layers_inc_dir / "mlp.h"),
-        p(config_inc_dir / "mlp_cfg.h"),
+    # The layer's stage loop: the single call site for the engine and for every tail.
+    # encoder_stages.h also pulls in encoder_layer_cfg.h (for ENC_HIDDEN_W_MAX, the bound on the
+    # MLP's hidden width), but that header is already listed with the top-level files below.
+    # It used to list mlp_cfg.h here; the MLP has no config of its own since it moved onto the
+    # shared engine.
+    stages_files = [
+        p(layers_src_dir / "encoder_stages.cpp"),
+        p(layers_inc_dir / "encoder_stages.h"),
     ]
     residual_files = [
         p(layers_src_dir / "residual.cpp"),
@@ -114,20 +123,15 @@ def generate_hls_config(config, output_path):
     if project_name in ("encoder_layer", "encoder_e2e"):
         # encoder_e2e = the same encoder_layer sources, driven by the file-based e2e TB.
         tb_filename = ("encoder_e2e_tb.cpp" if project_name == "encoder_e2e"
-                       else "encoder_layer_tb.cpp")
+                       else "encoder_units_tb.cpp")
         src_files = [
             p(top_src_dir / "encoder_layer.cpp"),
             p(top_inc_dir / "encoder_layer.h"),
             p(config_inc_dir / "encoder_layer_cfg.h"),
-            p(top_src_dir / "encoder_mha_block.cpp"),
-            p(top_inc_dir / "encoder_mha_block.h"),
-            p(config_inc_dir / "encoder_mha_block_cfg.h"),
-            p(top_src_dir / "encoder_mlp_block.cpp"),
-            p(top_inc_dir / "encoder_mlp_block.h"),
-            p(config_inc_dir / "encoder_mlp_block_cfg.h"),
             *residual_files,
+            *spmm_files,
+            *stages_files,
             *mha_files,
-            *mlp_files,
             *rmsnorm_files,
         ]
     else:
@@ -172,8 +176,9 @@ part={target_device}
 # HLS flow target (vitis for unified flow, vivado for legacy)
 flow_target=vitis
 
-# Package output format (xo = Xilinx Object format)
-package.output.format=xo
+# Package output format.  xo feeds the Vitis link flow; ip_catalog emits the IP-XACT
+# that scripts/encoder_layer_kr260_bd.tcl needs to place the kernel in a block design.
+package.output.format={package_format}
 package.output.syn=false
 
 # Top-level function for synthesis
@@ -213,15 +218,19 @@ tb.cflags=-I{config_dir_str}{extra_includes}{defines_flags}
 def main():
     """Main entry point."""
     if len(sys.argv) < 3:
-        print("Usage: python3 gen_hls_config.py <input.yaml> <output_hls_config.cfg>")
+        print("Usage: python3 gen_hls_config.py <input.yaml> <output.cfg> [xo|ip_catalog]")
         sys.exit(1)
     
     yaml_path = sys.argv[1]
     config_path = sys.argv[2]
+    package_format = sys.argv[3] if len(sys.argv) > 3 else "xo"
+    if package_format not in ("xo", "ip_catalog"):
+        print(f"unknown package format {package_format!r}; use xo or ip_catalog")
+        sys.exit(1)
     
     try:
         config = parse_config(yaml_path)
-        generate_hls_config(config, config_path)
+        generate_hls_config(config, config_path, package_format)
         
         hls_cfg = config.get('hls', {})
         print(f"Generated {config_path}")

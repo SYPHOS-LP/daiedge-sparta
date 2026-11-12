@@ -16,7 +16,8 @@ import full_model_infer as F
 import toml
 
 CIFAR = ["airplane","automobile","bird","cat","deer","dog","frog","horse","ship","truck"]
-OUT = os.path.join(_HERE, "e2e")
+# Same E2E_OUT the emit step used, so this reads the payload it produced.
+OUT = os.environ.get("E2E_OUT", os.path.join(_HERE, "e2e"))
 
 
 def main():

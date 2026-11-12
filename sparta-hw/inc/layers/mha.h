@@ -33,37 +33,59 @@
 #include "csr_bounds.h"
 #include "encoder_scales.h"
 
-/**
- * @brief Linear multi-head attention (softmax-free).
+/* How V is laid out on chip: one 64-bit word holds MHA_BANK_PACK output features of one token.  So
+ * one read returns MHA_BANK_PACK of a token's values, and a token's MHA_FEATURE_HEAD values take
+ * MHA_V_GROUPS reads.
  *
- * @param[in]  input_packed  Packed input activations
- * @param[in]  tokens_dim    Number of tokens.
- * @param[in]  wq_values     Q projection weight values.
- * @param[in]  wq_col_idx    Q projection weight column indices.
- * @param[in]  wq_row_ptr    Q projection weight row pointer.
- * @param[in]  wk_values     K projection weight values.
- * @param[in]  wk_col_idx    K projection weight column indices.
- * @param[in]  wk_row_ptr    K projection weight row pointer.
- * @param[in]  wv_values     V projection weight values.
- * @param[in]  wv_col_idx    V projection weight column indices.
- * @param[in]  wv_row_ptr    V projection weight row pointer.
- * @param[in]  wo_values     Output projection weight values.
- * @param[in]  wo_col_idx    Output projection weight column indices.
- * @param[in]  wo_row_ptr    Output projection weight row pointer.
- * @param[in]  scales        Folded scales for requantization.
- * @param[out] output        Dense attention output.
+ * V is ordered by token because that is the slice the K'.V loop needs: it takes one K' value and
+ * multiplies it by all MHA_FEATURE_HEAD output features of a single token, so a read should return
+ * consecutive output features at the same token.  Ordered by feature instead, those values sit a
+ * row stride apart and each needs its own read, which forces V across MHA_BANK_PACK memories to
+ * supply enough reads a cycle (docs/plans/09-attention-rework.md).
+ *
+ * Defined here rather than in mha_cfg.h because that file is generated from
+ * config/yml/mha.yaml. */
+#define MHA_V_GROUPS (MHA_FEATURE_HEAD / MHA_BANK_PACK)
+#define MHA_V_PACKED_WORDS (MHA_TOKEN_W_MAX * MHA_V_GROUPS)
+
+/**
+ * @brief Linear (softmax-free) attention for one head.
+ *
+ * A = K'^T . V over this head's features, then Z = Q' . A normalized by Q' . sum(K'), requantized
+ * and written packed into the attention output at this head's feature rows.  Q' and K' arrive as
+ * this head's CSR, V as its dense rows; all three are on-chip.
+ *
+ * Grouping the product this way makes A a d_head x d_head table, so there is no N x N score matrix
+ * and no softmax.
+ *
+ * @param[in]  enable      Zero returns immediately.  The caller passes a flag rather than guarding
+ *                         the call, because a call inside an `if` makes HLS specialise the
+ *                         enclosing loop body for that case and duplicate its other functions.
+ * @param[in]  head        Head index, which selects the output's feature rows.
+ * @param[in]  tokens_dim  Number of tokens.
+ * @param[in]  quant_scale Folded requantization scale of the attention output.
+ * @param[in]  k_val       K' values / columns / row pointers for this head (feature-major).
+ * @param[in]  k_col
+ * @param[in]  k_ptr
+ * @param[in]  q_val       Q' values / columns / row pointers for this head (token-major).
+ * @param[in]  q_col
+ * @param[in]  q_ptr
+ * @param[in]  v_packed    This head's dense V, token-major and packed.
+ * @param[out] out_packed  Packed attention output, all heads.
  */
-void mha(
-    T_MhaBankWord *input_packed,
-    int            tokens_dim,
-    T_Activation *wq_values, T_MhaIndex *wq_col_idx, int *wq_row_ptr,
-    T_Activation *wk_values, T_MhaIndex *wk_col_idx, int *wk_row_ptr,
-    T_Activation *wv_values, T_MhaIndex *wv_col_idx, int *wv_row_ptr,
-    T_Activation *wo_values, T_MhaIndex *wo_col_idx, int *wo_row_ptr,
-    const T_Scale *scales,
-    T_Activation *q_val, T_MhaHeadIndex *q_col,
-    T_Activation *k_val, T_MhaHeadIndex *k_col,
-    T_Activation  *output
+void head_core (
+    int             enable,
+    int             head,
+    int             tokens_dim,
+    T_Scale         quant_scale,
+    T_Activation   *k_val,
+    T_MhaHeadIndex *k_col,
+    int            *k_ptr,
+    T_Activation   *q_val,
+    T_MhaHeadIndex *q_col,
+    int            *q_ptr,
+    T_MhaBankWord  *v_packed,
+    T_MhaBankWord  *out_packed
 );
 
 #endif // MHA_H

@@ -2,10 +2,8 @@
 # Encoder Build System (Vitis HLS)
 #
 # Live projects (each is a workspace/<PROJECT>/ with its own hls_config.cfg):
-#   rmsnorm            - RMSNorm layer
-#   encoder_mlp_block  - Y = X + MLP(RMSNorm(X))       (pre-norm residual)
-#   encoder_mha_block  - Y = z + MHA(RMSNorm(z))       (pre-norm residual)
-#   encoder_layer      - Y = MLP-block(MHA-block(X))   (full pre-norm layer)
+#   encoder_layer      - Y = MLP-block(MHA-block(X)), synthetic-weight self-checking TB
+#   encoder_e2e        - same kernel, real compiled model (sim/e2e), checked by sim/
 #
 # Targets:
 #   make config   - Generate the project's HLS config (.cfg)
@@ -14,15 +12,22 @@
 #   make full     - config -> sim -> synth
 #   make clean    - Remove the workspace + generated configs
 #
+# Native regression (g++ against the Vitis HLS headers; no license or device needed):
+#   make native-units         - edge cases the golden data cannot reach
+#   make native-e2e IMAGES=2  - real-model TB on the first IMAGES images in $(E2E_DIR)
+#   make golden-check         - $(E2E_DIR) outputs vs $(GOLDEN_DIR), bit-exact
+#   make ip                   - package as IP-XACT into ip/ for the block design
+#   make regress IMAGES=2     - all three
+#
 # Usage:
 #   make sim  PROJECT=encoder_layer
-#   make synth PROJECT=encoder_mha_block
+#   make synth PROJECT=encoder_e2e
 #   make sim-encoder-layer            (shorthand)
 # ============================================================================
 
 .PHONY: config sim synth full clean help all \
-        $(foreach p,rmsnorm encoder-mlp-block encoder-mha-block encoder-layer,\
-                 config-$(p) sim-$(p) synth-$(p) full-$(p))
+        native-units native-e2e golden-check regress ip cosim \
+        $(foreach p,encoder-layer encoder-e2e,config-$(p) sim-$(p) synth-$(p) full-$(p))
 
 # ============================================================================
 # Configuration
@@ -43,11 +48,18 @@ HLS_CONFIG  := $(PROJECT_DIR)/hls_config.cfg
 # (encoder_types.yaml -> encoder_types.h is the one naming exception).
 CFG_YML_DIR    := config/yml
 CFG_INC_DIR    := config/inc
-CFG_COMPONENTS := rmsnorm mlp mha encoder_mha_block encoder_mlp_block encoder_layer
+CFG_COMPONENTS := rmsnorm mha encoder_layer
 CFG_HEADERS    := $(addprefix $(CFG_INC_DIR)/,$(addsuffix _cfg.h,$(CFG_COMPONENTS))) \
                    $(CFG_INC_DIR)/encoder_types.h
 
+# Vitis tool launchers (.bat wrappers on Windows).
+ifeq ($(OS),Windows_NT)
 VITIS_RUN := vitis-run.bat
+VPP       := v++.bat
+else
+VITIS_RUN := vitis-run
+VPP       := v++
+endif
 
 all: help
 
@@ -81,12 +93,104 @@ sim: config
 # ============================================================================
 synth: config
 	@echo "Running HLS synthesis: $(PROJECT)"
-	v++.bat -c --mode hls --config $(HLS_CONFIG) --work_dir $(PROJECT_DIR)
+	$(VPP) -c --mode hls --config $(HLS_CONFIG) --work_dir $(PROJECT_DIR)
+
+# ============================================================================
+# Cosim: run the synthesised RTL against the C testbench and compare
+#
+# The only check short of hardware that executes the pragmas.  The native build and csim both
+# ignore them, so neither can see a DATAFLOW handoff that hands the engine the wrong weight-bank
+# copy -- see docs/plans/06-load-compute-overlap.md.
+#
+# One layer of one image by default: that is already ~1.2 M cycles of RTL and still covers every
+# stage mode (K/Q/V, the output projection, both MLP linears) and many swaps of the bank copies.
+# Needs `make synth PROJECT=encoder_e2e` first, in the same work_dir.
+# ============================================================================
+COSIM_IMAGES ?= 1
+COSIM_LAYERS ?= 1
+
+cosim: config
+	@echo "Running C/RTL co-simulation: $(PROJECT) ($(COSIM_IMAGES) image(s), $(COSIM_LAYERS) layer(s))"
+	E2E_DIR=$(E2E_DIR)/ E2E_IMAGES=$(COSIM_IMAGES) E2E_LAYERS=$(COSIM_LAYERS) \
+	  $(VITIS_RUN) --mode hls --cosim --config $(HLS_CONFIG) --work_dir $(PROJECT_DIR)
+
+# ============================================================================
+# IP: package the kernel as IP-XACT for the block design
+#
+# `synth` packages an .xo for the Vitis link flow.  The board build does not use
+# that flow: scripts/encoder_layer_kr260_bd.tcl places the kernel in a Vivado
+# block design and needs IP-XACT instead, so this runs the same synthesis with
+# package.output.format=ip_catalog and copies the result to ip/encoder_layer,
+# where the BD script looks for it.
+#
+# The register map changes whenever a kernel argument is added or removed, so
+# after this, re-read the offsets from
+#   $(IP_DIR)/../hls/impl/misc/drivers/encoder_layer_top_v1_0/src/xencoder_layer_top_hw.h
+# and pass it to the host as --hw-header rather than trusting SPARTA.REGMAP.
+# ============================================================================
+# The config lives beside the normal one: gen_hls_config.py derives the project
+# name from its PARENT DIRECTORY, so it has to stay in $(PROJECT_DIR).  Only the
+# work_dir is separate, to keep the .xo build's reports intact.
+IP_PROJECT_DIR := $(PROJECT_DIR)_ip
+IP_HLS_CONFIG  := $(PROJECT_DIR)/hls_config_ip.cfg
+IP_DIR         := ip/$(PROJECT)
+
+ip: config
+	@echo "Packaging $(PROJECT) as IP-XACT for the block design..."
+	@mkdir -p $(IP_PROJECT_DIR)
+	@$(PYTHON) $(GEN_HLS_CONFIG) $(BUILD_CONFIG) $(IP_HLS_CONFIG) ip_catalog
+	$(VPP) -c --mode hls --config $(IP_HLS_CONFIG) --work_dir $(IP_PROJECT_DIR)
+	@echo "Running the packaging step (v++ -c synthesises only)..."
+	$(VITIS_RUN) --mode hls --package --config $(IP_HLS_CONFIG) --work_dir $(IP_PROJECT_DIR)
+	@rm -rf $(IP_DIR)
+	@mkdir -p $(dir $(IP_DIR))
+	@src=$$(find $(IP_PROJECT_DIR) -name component.xml -printf '%h\n' | head -1); \
+	 if [ -z "$$src" ]; then \
+	   echo "ERROR: no component.xml under $(IP_PROJECT_DIR); packaging did not produce IP-XACT"; \
+	   exit 1; \
+	 fi; \
+	 cp -r "$$src" $(IP_DIR); \
+	 echo "IP-XACT in $(IP_DIR) (from $$src)"
+	@echo "Next: vivado -mode batch -source scripts/encoder_layer_kr260_bd.tcl -tclargs <mhz>"
 
 # ============================================================================
 # Full flow: config -> sim -> synth
 # ============================================================================
 full: sim synth
+
+# ============================================================================
+# Native regression: the kernel sources built with g++ and the Vitis HLS headers.
+# Every kernel change must keep golden-check bit-exact (see docs/plans/).
+# ============================================================================
+VITIS_INCLUDE ?= $(firstword $(wildcard $(XILINX_HLS)/include $(XILINX_VITIS)/include /opt/Xilinx/*/Vitis/include))
+E2E_DIR       ?= $(CURDIR)/sim/e2e
+# The reference outputs. They are not always inside E2E_DIR: a payload emitted for a different
+# engine configuration is still checked against the ORIGINAL design's golden, which is the
+# point of the check -- the kernel must stay bit-exact across those changes.
+GOLDEN_DIR    ?= $(E2E_DIR)/golden
+IMAGES        ?= 2
+NATIVE_DIR    := $(WORKSPACE_DIR)/native
+BUILD_DEFINES := $(shell $(PYTHON) -c "import yaml; print(' '.join('-D' + d for d in (yaml.safe_load(open('$(BUILD_CONFIG)')).get('defines') or [])))")
+NATIVE_CXXFLAGS ?= -std=c++17 -O2 -w
+NATIVE_INCLUDES := -I$(VITIS_INCLUDE) -Iconfig -I$(CFG_INC_DIR) -Iinc/layers -Iinc/helpers -Iinc/top -Itb
+KERNEL_SRCS     := $(wildcard src/top/*.cpp src/layers/*.cpp)
+KERNEL_HDRS     := $(wildcard inc/*/*.h) $(CFG_HEADERS)
+
+$(NATIVE_DIR)/%: tb/%.cpp $(KERNEL_SRCS) $(KERNEL_HDRS) $(wildcard tb/*.h) $(BUILD_CONFIG)
+	@test -f "$(VITIS_INCLUDE)/ap_int.h" || { echo "ap_int.h not found; set VITIS_INCLUDE=<Vitis>/include"; exit 1; }
+	@mkdir -p $(NATIVE_DIR)
+	g++ $(NATIVE_CXXFLAGS) $(BUILD_DEFINES) $(NATIVE_INCLUDES) $(KERNEL_SRCS) $< -o $@ -lpthread
+
+native-units: $(NATIVE_DIR)/encoder_units_tb
+	$<
+
+native-e2e: $(NATIVE_DIR)/encoder_e2e_tb
+	E2E_DIR=$(E2E_DIR)/ E2E_IMAGES=$(IMAGES) $<
+
+golden-check:
+	$(PYTHON) sim/perm_e2e.py compare --dir $(E2E_DIR) --golden $(GOLDEN_DIR)
+
+regress: native-units native-e2e golden-check
 
 # ============================================================================
 # Per-project shorthands (make sim-encoder-layer, etc.)
@@ -99,6 +203,7 @@ full-encoder-layer:        ; @$(MAKE) full   PROJECT=encoder_layer
 config-encoder-e2e:        ; @$(MAKE) config PROJECT=encoder_e2e
 sim-encoder-e2e:           ; @$(MAKE) sim    PROJECT=encoder_e2e
 synth-encoder-e2e:         ; @$(MAKE) synth  PROJECT=encoder_e2e
+full-encoder-e2e:          ; @$(MAKE) full   PROJECT=encoder_e2e
 
 # ============================================================================
 # Clean
@@ -122,6 +227,15 @@ help:
 	@echo "  make synth  PROJECT=<p>   - run HLS synthesis"
 	@echo "  make full   PROJECT=<p>   - config -> sim -> synth"
 	@echo "  make clean                - remove workspace + generated configs"
+	@echo ""
+	@echo "Native regression (no Vitis license/device needed):"
+	@echo "  make native-units         - edge cases the golden data cannot reach"
+	@echo "  make native-e2e IMAGES=2  - real-model TB on the first IMAGES images (E2E_DIR=$(E2E_DIR))"
+	@echo "  make golden-check         - outputs vs GOLDEN_DIR, bit-exact (default E2E_DIR/golden)"
+	@echo ""
+	@echo "Board build:"
+	@echo "  make ip                   - package as IP-XACT into ip/ (the block design needs this)"
+	@echo "  make regress IMAGES=2     - all three"
 	@echo ""
 	@echo "Shorthands: make sim-encoder-layer, make synth-encoder-layer, ..."
 	@echo "encoder_e2e needs sim/e2e artifacts + E2E_DIR set - see sim/README.md"

@@ -29,18 +29,22 @@
  *
  * Normalizes each token independently over its @p feature_dim features.
  *
- * @param input                  Input activations, in feature-major layout.
+ * Both operands hold RMS_BANK_PACK tokens of one feature per word, features in order: one read
+ * covers RMS_BANK_PACK tokens, so the pass over the data costs
+ * feature_dim * ceil(tokens_dim / RMS_BANK_PACK) reads rather than one per element.
+ *
+ * @param packed_input           Input activations, packed, feature-major.
  * @param tokens_dim             Number of tokens to normalize.
  * @param feature_dim            Features per token.
  * @param inverse_output_scale   Inverse output quantization scale (power-of-two shift).
- * @param packed_output          Output activations packed into the URAM bank.
+ * @param packed_output          Output activations, same packing as the input.
  */
 void rmsnorm(
-    const T_Activation* input,
-    int                 tokens_dim,
-    int                 feature_dim,
-    T_Scale             inverse_output_scale,
-    T_RmsBankWord*      packed_output
+    const T_RmsBankWord* packed_input,
+    int                  tokens_dim,
+    int                  feature_dim,
+    T_Scale              inverse_output_scale,
+    T_RmsBankWord*       packed_output
 );
 
 #endif // RMSNORM_H

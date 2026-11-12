@@ -12,5 +12,6 @@
 // ---- Defines --------------------------------------------------------------
 #define ENC_FEATURE_W_MAX 768   // maximum feature width (rows, feature-major layout)
 #define ENC_TOKEN_W_MAX 50   // maximum token width (columns)
+#define ENC_HIDDEN_W_MAX 3072   // MLP hidden width (d_h); the MLP has no config of its own, it runs on the shared engine
 
 #endif // ENCODER_LAYER_CFG_H

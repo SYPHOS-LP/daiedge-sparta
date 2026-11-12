@@ -18,10 +18,10 @@ defines:
   - { name: RMS_FEATURE_W_MAX, value: 768, comment: "maximum feature width (rows, feature-major layout)" }
   - { name: RMS_TOKEN_W_MAX,   value: 50,  comment: "maximum token width (columns)" }
   # --- optional packed URAM output (encoder path; matches MHA/MLP bank layout) ---
-  - { name: RMS_BANK_PACK,      value: 8, comment: "int8 lanes per packed URAM word (= MHA/MLP_BANK_PACK)" }
+  - { name: RMS_BANK_PACK,      value: 8, comment: "tokens per packed word; must match MHA_BANK_PACK" }
   - { name: RMS_BANK_WORD_BITS, value: "(RMS_BANK_PACK * 8)", comment: "64-bit packed word" }
-  - { name: RMS_BANK_PAD_TOK,   value: "(((RMS_TOKEN_W_MAX + RMS_BANK_PACK - 1) / RMS_BANK_PACK) * RMS_BANK_PACK)", comment: "tokens padded to multiple of PACK (197->200)" }
-  - { name: RMS_BANK_ROW_WORDS, value: "(RMS_BANK_PAD_TOK / RMS_BANK_PACK)", comment: "packed words per feature row (25)" }
+  - { name: RMS_BANK_PAD_TOK,   value: "(((RMS_TOKEN_W_MAX + RMS_BANK_PACK - 1) / RMS_BANK_PACK) * RMS_BANK_PACK)", comment: "tokens padded to multiple of PACK (50->56)" }
+  - { name: RMS_BANK_ROW_WORDS, value: "(RMS_BANK_PAD_TOK / RMS_BANK_PACK)", comment: "packed words per feature row (7)" }
   - { name: RMS_EPS, value: 1e-6f, comment: "epsilon added to mean-square before rsqrt" }
   # rsqrt LUT variant selector constants + the active choice
   - { name: RMS_RSQRT_UNIFORM, value: 1 }

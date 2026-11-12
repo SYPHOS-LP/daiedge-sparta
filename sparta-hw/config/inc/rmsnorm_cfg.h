@@ -12,10 +12,10 @@
 // ---- Defines --------------------------------------------------------------
 #define RMS_FEATURE_W_MAX 768   // maximum feature width (rows, feature-major layout)
 #define RMS_TOKEN_W_MAX 50   // maximum token width (columns)
-#define RMS_BANK_PACK 8   // int8 lanes per packed URAM word (= MHA/MLP_BANK_PACK)
+#define RMS_BANK_PACK 8   // tokens per packed word; must match MHA_BANK_PACK
 #define RMS_BANK_WORD_BITS (RMS_BANK_PACK * 8)   // 64-bit packed word
-#define RMS_BANK_PAD_TOK (((RMS_TOKEN_W_MAX + RMS_BANK_PACK - 1) / RMS_BANK_PACK) * RMS_BANK_PACK)   // tokens padded to multiple of PACK (197->200)
-#define RMS_BANK_ROW_WORDS (RMS_BANK_PAD_TOK / RMS_BANK_PACK)   // packed words per feature row (25)
+#define RMS_BANK_PAD_TOK (((RMS_TOKEN_W_MAX + RMS_BANK_PACK - 1) / RMS_BANK_PACK) * RMS_BANK_PACK)   // tokens padded to multiple of PACK (50->56)
+#define RMS_BANK_ROW_WORDS (RMS_BANK_PAD_TOK / RMS_BANK_PACK)   // packed words per feature row (7)
 #define RMS_EPS 1e-6f   // epsilon added to mean-square before rsqrt
 #define RMS_RSQRT_UNIFORM 1
 #define RMS_RSQRT_LOG 2

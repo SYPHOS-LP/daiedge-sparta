@@ -120,16 +120,25 @@ class EncoderBridge:
     """Captures the encoder's int8 input/output boundary from the SW model.
 
     A forward hook on encoder_layer_0.quant_input records exactly the int8
-    tensor the SW encoder would have consumed. Running the SW model forward
-    therefore produces both the reference prediction AND the FPGA's input, from
-    one pass.
+    tensor the SW encoder would have consumed.
+
+    With `stop_after_capture`, the hook raises `Abort` once it has that tensor, so the forward
+    stops at the embedding. The 12 SW encoder layers and the head are then never run, which is
+    most of the per-image CPU cost -- the difference between an accuracy pass over a few images
+    and one over a whole dataset. The reference prediction is given up in exchange, which is
+    what --no-reference asks for. Aborting from a hook is safe under no_grad: there is no
+    autograd graph left half-built.
     """
 
-    def __init__(self, model):
+    class Abort(Exception):
+        """Raised by the capture hook when the forward should stop at the embedding."""
+
+    def __init__(self, model, stop_after_capture=False):
         import torch
 
         self._torch = torch
         self.model = model
+        self._stop_after_capture = stop_after_capture
         self._enc_in_int8 = None
         self._enc_in_scale = None
         model.encoder.encoder_layer_0.quant_input.register_forward_hook(self._grab_in)
@@ -141,6 +150,8 @@ class EncoderBridge:
         # `out` is an IntQuantTensor of shape (1, N, D).
         self._enc_in_int8 = out.int().detach().to(self._torch.int32).numpy()[0]
         self._enc_in_scale = float(out.scale.flatten()[0])
+        if self._stop_after_capture:
+            raise self.Abort
 
     def encoder_input(self):
         """The int8 encoder input as feature-major (D, N), plus its scale."""
@@ -169,10 +180,9 @@ def run_head(model, enc_out_int8, out_scale):
 class HwEncoder:
     """Runs the 12 encoder layers on the FPGA, holding device state open.
 
-    The kernel handle and the activation/scratch buffers are set up once, so
-    per-image cost is only the weight staging plus the 12 kernel invocations.
-    Weight buffers are freed per layer because all 12 layers' weights do not
-    fit in DDR simultaneously.
+    The kernel handle, the activation buffers and every layer's weights
+    (~26 MB for the 12-layer model) are staged into DDR once, so per-image cost
+    is only the activation I/O plus the 12 kernel invocations.
 
     By default this ATTACHES to a PL programmed elsewhere (xmutil) rather than
     programming it -- see HwKernel.
@@ -180,7 +190,7 @@ class HwEncoder:
 
     def __init__(self, model_dir, bitstream=None, instance=None, download=False,
                  base_addr=None, debug_dir=None, verbose=False, dbg_nnz=False,
-                 timer_base=None):
+                 timer_base=None, hw_header=None):
         from pynq import allocate
         from SPARTALoader import Loader
 
@@ -195,9 +205,10 @@ class HwEncoder:
             os.makedirs(debug_dir, exist_ok=True)
         # HwKernel is the hardware seam: attaches to (or programs) the PL and
         # owns the AXI-Lite control registers.
+        regmap = SPARTA.load_regmap(hw_header) if hw_header else None
         self.kernel = SPARTA.HwKernel(bitstream, instance=instance,
                                       download=download, base_addr=base_addr,
-                                      timer_base=timer_base)
+                                      timer_base=timer_base, regmap=regmap)
         self.overlay = self.kernel.overlay      # None on the attach path
         if verbose:
             print(f"  control base {self.kernel._base_addr_str()}, "
@@ -211,19 +222,19 @@ class HwEncoder:
             print(f" {len(self.layers)} layers", flush=True)
             print("  allocating DDR buffers...", end="", flush=True)
 
-        n = SPARTA.ACT_ELEMS
-        self.a = allocate(shape=(n,), dtype=np.int8)
-        self.b = allocate(shape=(n,), dtype=np.int8)
-        q = SPARTA.MHA_MAX_QK_NNZ
-        self.scratch = {
-            "q_val": allocate(shape=(q,), dtype=np.int8),
-            "q_col": allocate(shape=(q,), dtype=np.uint8),
-            "k_val": allocate(shape=(q,), dtype=np.int8),
-            "k_col": allocate(shape=(q,), dtype=np.uint8),
-        }
+        n = SPARTA.ACT_WORDS
+        self.a = allocate(shape=(n,), dtype=np.uint64)
+        self.b = allocate(shape=(n,), dtype=np.uint64)
         if verbose:
-            mb = (3 * n + 4 * q) / (1024 * 1024)
-            print(f" {mb:.1f} MB (act 3x{n}, scratch 4x{q})", flush=True)
+            mb = (3 * n) / (1024 * 1024)
+            print(f" {mb:.1f} MB (act 3x{n})", flush=True)
+            print("  staging all layers' weights...", end="", flush=True)
+        t0 = time.monotonic()
+        self.staged = SPARTA.stage_model(allocate, self.mp)
+        self.d_h = {L: self.mp.layer(L).weights["linear_1"].shape[0] for L in self.layers}
+        if verbose:
+            mb = sum(b.nbytes for bufs in self.staged.values() for b in bufs.values()) / (1024 * 1024)
+            print(f" {mb:.1f} MB in {time.monotonic() - t0:.1f}s", flush=True)
 
     def __call__(self, enc_in, n_layers=None, debug_tag=None):
         """enc_in : (D, N) int8 feature-major  ->  (D, N) int8 feature-major.
@@ -245,22 +256,20 @@ class HwEncoder:
 
         layers = self.layers if n_layers is None else self.layers[:n_layers]
 
-        self.a[:] = flat
+        self.a[:] = SPARTA.pack_rows(enc_in)
         self.a.sync_to_device()
         x_buf, y_buf = self.a, self.b
 
+        # The activation stays on-chip between layers, so only the first layer reads it from DDR
+        # and only the last writes it back -- unless a debug dump needs every layer's output.
+        dump_every = debug_tag is not None and self.debug_dir is not None
         for L in layers:
-            layer = self.mp.layer(L)
-            d_h = layer.weights["linear_1"].shape[0]
+            args = SPARTA._build_args(x_buf, y_buf, self.staged[L],
+                                      SPARTA.ENC_N, SPARTA.ENC_D, self.d_h[L],
+                                      first_layer=(L == layers[0]),
+                                      last_layer=(L == layers[-1]) or dump_every)
             if self.verbose:
-                print(f"  L{L:02d}: staging weights...", end="", flush=True)
-            t0 = time.monotonic()
-            lb = SPARTA._stage_layer(self._allocate, layer)
-            t_stage = time.monotonic() - t0
-            args = SPARTA._build_args(x_buf, y_buf, lb, self.scratch,
-                                      SPARTA.ENC_N, SPARTA.ENC_D, d_h)
-            if self.verbose:
-                print(f" {t_stage:.1f}s; invoking kernel...", end="", flush=True)
+                print(f"  L{L:02d}: invoking kernel...", end="", flush=True)
 
             try:
                 t_run = self.kernel.invoke(args)
@@ -281,24 +290,21 @@ class HwEncoder:
             y_buf.sync_from_device()
             if debug_tag is not None and self.debug_dir is not None:
                 self._dump(debug_tag, L, y_buf)
-            for buf in lb.values():
-                buf.freebuffer()
             x_buf, y_buf = y_buf, x_buf
 
         x_buf.sync_from_device()
-        out = np.array(x_buf[:SPARTA.ACT_ELEMS], dtype=np.int8)
-        return out.reshape(SPARTA.ENC_D, SPARTA.ENC_N)
+        return SPARTA.unpack_rows(np.array(x_buf[:SPARTA.ACT_WORDS], dtype=np.uint64))
 
     def _dump(self, tag, layer_idx, buf):
         """Write one layer's output, feature-major (D, N), as .npy."""
-        arr = np.array(buf[:SPARTA.ACT_ELEMS], dtype=np.int8).reshape(
-            SPARTA.ENC_D, SPARTA.ENC_N)
+        arr = SPARTA.unpack_rows(np.array(buf[:SPARTA.ACT_WORDS], dtype=np.uint64))
         path = os.path.join(self.debug_dir, f"{tag}_L{layer_idx:02d}.npy")
         np.save(path, arr)
 
     def close(self):
         self.kernel.close()
-        for b in (self.a, self.b, *self.scratch.values()):
+        SPARTA.free_staged(self.staged)
+        for b in (self.a, self.b):
             b.freebuffer()
 
 
@@ -323,6 +329,14 @@ def main():
                     help=f"s_axi_control base address when attaching "
                          f"(default 0x{SPARTA.HwKernel.CONTROL_BASE:08x})")
     ap.add_argument("--images", type=int, default=10, help="how many images to run")
+    ap.add_argument("--features", type=int, default=SPARTA.ENC_D,
+                    help=f"encoder feature width the BITSTREAM was built for "
+                         f"(default {SPARTA.ENC_D})")
+    ap.add_argument("--tokens", type=int, default=SPARTA.ENC_N,
+                    help=f"encoder token count the BITSTREAM was built for "
+                         f"(default {SPARTA.ENC_N}); 50 for the 32x32-patch model, 197 for the "
+                         f"16x16-patch one.  Must also match the SW config's p_size, or the "
+                         f"captured encoder input will not fit the kernel's ports")
     ap.add_argument("--verbose", "-v", action="store_true",
                     help="Control verbosity.")
     ap.add_argument("--layers", type=int, default=None,
@@ -337,12 +351,18 @@ def main():
     ap.add_argument("--debug-dir", default="hw_dumps",
                     help="where --debug writes layer dumps (default: hw_dumps)")
     ap.add_argument("--no-reference", action="store_true",
-                    help="skip the SW reference prediction (still needs the SW "
-                         "forward pass to produce the encoder input, so this "
-                         "only suppresses the comparison)")
+                    help="skip the SW reference prediction.  The forward then stops at the "
+                         "embedding, so the 12 SW encoder layers and the head do not run -- "
+                         "about an order of magnitude less CPU per image, which is what makes "
+                         "a whole-dataset accuracy pass practical on the board.  Reports HW "
+                         "accuracy against the labels only")
     ap.add_argument("--timer-base", default=None,
                     help="base address of the diagnostic AXI timer, if present.")
+    ap.add_argument("--hw-header", default=None,
+                    help="HLS-generated xencoder_layer_top_hw.h to read the register "
+                         "offsets from (default: SPARTA.REGMAP)")
     args = ap.parse_args()
+    SPARTA.set_enc_dims(args.features, args.tokens)
 
     if args.download and not args.bitstream:
         ap.error("--download needs --bitstream")
@@ -365,7 +385,7 @@ def main():
     step(f"building SW model + loading checkpoint {cfg['model']['path']}")
     model = build_sw_model(cfg, iq)
     step("SW model ready; hooking encoder boundary")
-    bridge = EncoderBridge(model)
+    bridge = EncoderBridge(model, stop_after_capture=args.no_reference)
     step(f"loading dataset from {cfg['dataset']['path']}")
     data, _ = iq.initialize_map_datasets(cfg)
     step(f"dataset ready ({len(data)} images)")
@@ -376,7 +396,8 @@ def main():
                    base_addr=int(args.base_addr, 0) if args.base_addr else None,
                    debug_dir=args.debug_dir if args.debug else None,
                    verbose=args.verbose,
-                   timer_base=int(args.timer_base, 0) if args.timer_base else None)
+                   timer_base=int(args.timer_base, 0) if args.timer_base else None,
+                   hw_header=args.hw_header)
     step("FPGA ready")
 
     if args.layers is not None:
@@ -387,20 +408,25 @@ def main():
         print(f"debug: dumping layer outputs to {args.debug_dir}/")
 
     agree = correct_sw = correct_hw = 0
-    print("image | truth | SW pred | HW pred | agree")
-    print("------+-------+---------+---------+------")
+    print("image | truth | SW pred | HW pred | agree | HW acc so far")
+    print("------+-------+---------+---------+-------+--------------")
     try:
         for idx in range(args.images):
             step(f"image {idx}: SW forward pass")
             img, label = data[idx]
 
-            # One SW forward: gives the reference prediction, and fires the hook
-            # that captures the exact int8 tensor to hand the FPGA.
-            with torch.no_grad():
-                sw_logits = model(img.unsqueeze(0))
-            sw_lv = (sw_logits.value if isinstance(sw_logits, IntQuantTensor)
-                     else sw_logits)
-            sw_pred = int(sw_lv.argmax(-1))
+            # One SW forward. It fires the hook that captures the exact int8 tensor to hand
+            # the FPGA; without --no-reference it also runs to completion and yields the
+            # reference prediction, and with it the hook stops the forward at the embedding.
+            sw_pred = None
+            try:
+                with torch.no_grad():
+                    sw_logits = model(img.unsqueeze(0))
+                sw_lv = (sw_logits.value if isinstance(sw_logits, IntQuantTensor)
+                         else sw_logits)
+                sw_pred = int(sw_lv.argmax(-1))
+            except EncoderBridge.Abort:
+                pass
 
             enc_in, _in_scale = bridge.encoder_input()      # (D, N) int8
             if args.debug:
@@ -413,12 +439,16 @@ def main():
             hw_logits = run_head(model, enc_out, bridge.out_scale)
             hw_pred = int(np.argmax(hw_logits))
 
-            a = sw_pred == hw_pred
-            agree += a
-            correct_sw += (sw_pred == label)
             correct_hw += (hw_pred == label)
-            print(f"{idx:5d} | {label:5d} | {sw_pred:7d} | {hw_pred:7d} | "
-                  f"{'yes' if a else 'NO'}")
+            if sw_pred is None:
+                print(f"{idx:5d} | {label:5d} |       - | {hw_pred:7d} |     - "
+                      f"| {correct_hw}/{idx + 1}")
+            else:
+                a = sw_pred == hw_pred
+                agree += a
+                correct_sw += (sw_pred == label)
+                print(f"{idx:5d} | {label:5d} | {sw_pred:7d} | {hw_pred:7d} | "
+                      f"{'yes' if a else 'NO':4s} | {correct_hw}/{idx + 1}")
     finally:
         hw.close()
 
@@ -428,9 +458,14 @@ def main():
               f"are a partial encoder, not a prediction.  SW accuracy "
               f"{correct_sw}/{n} is still valid (full SW model).")
     else:
-        print(f"\nAgreement SW vs HW : {agree}/{n}")
-        print(f"Accuracy  SW       : {correct_sw}/{n}")
-        print(f"Accuracy  HW       : {correct_hw}/{n}", flush=True)
+        if args.no_reference:
+            print(f"\nAccuracy  HW       : {correct_hw}/{n} "
+                  f"({100.0 * correct_hw / n:.2f} %)", flush=True)
+        else:
+            print(f"\nAgreement SW vs HW : {agree}/{n}")
+            print(f"Accuracy  SW       : {correct_sw}/{n}")
+            print(f"Accuracy  HW       : {correct_hw}/{n} "
+                  f"({100.0 * correct_hw / n:.2f} %)", flush=True)
 
     # Per-layer MEAN latency in fabric clock cycles (mean over all images of that
     # layer's invocations).  Always printed when cycle data is available (needs a

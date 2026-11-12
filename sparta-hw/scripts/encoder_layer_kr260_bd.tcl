@@ -13,10 +13,12 @@
 #     the HLS flow with package.output.format=ip_catalog
 #
 # Usage
-#   vivado -mode batch -source scripts/encoder_layer_kr260_bd.tcl -tclargs <mhz> <dbg>
+#   vivado -mode batch -source scripts/encoder_layer_kr260_bd.tcl -tclargs <mhz> <dbg> [proj_dir]
 #     arg 1: PL0 fabric clock in MHz (default 125)
 #     arg 2: dbg (0/1, default 0) -- when 1, use ip/encoder_layer_dbg + add the
 #            per-layer axi_timer.
+#     arg 3: Vivado project root (default: $SPARTA_VIVADO_DIR, else <repo>/workspace/vivado).
+#            Keep it short on Windows (long paths break Vivado), e.g. C:/vp.
 #
 # Vivado returns exit code 0 even when a sourced script errors, so check the log
 # for the final CHECKPOINT line rather than the exit status.  This script writes
@@ -37,7 +39,13 @@ set pl0_mhz [expr {$argc >= 1 ? [lindex $argv 0] : 125}]
 set dbg [expr {$argc >= 2 ? [lindex $argv 1] : 0}]
 
 set repo_root  [file normalize [file dirname [info script]]/..]
-set proj_dir   "C:/vp"
+if {$argc >= 3} {
+    set proj_dir [lindex $argv 2]
+} elseif {[info exists ::env(SPARTA_VIVADO_DIR)]} {
+    set proj_dir $::env(SPARTA_VIVADO_DIR)
+} else {
+    set proj_dir "$repo_root/workspace/vivado"
+}
 set proj_name  [expr {$dbg ? "enc_kr260_${pl0_mhz}mhz_dbg" : "enc_kr260_${pl0_mhz}mhz"}]
 set bd_name    "enc_system"
 set cell_name  "enc_top_0"
@@ -114,16 +122,21 @@ if {$dbg} {
         [get_bd_intf_pins axi_timer_0/S_AXI]
 }
 
-# ---- Data path: 11 m_axi masters -> 5 PS slave ports ------------------------
+# ---- Data path: 6 m_axi masters -> 5 PS slave ports -------------------------
 # Each entry is:  <PS port> {<primary master> {<additional masters>}}
-# Bundles are grouped to spread traffic: small load-once buffers together,
-# weights split across ports, and the Q'/K' scratch alongside the weight
-# stream that produces it.
+# Bundles are grouped to spread traffic: small load-once buffers together and
+# weights split across ports.  The bundle list must match the kernel's
+# `bundle=` pragmas exactly -- get_bd_intf_pins errors on a name that does not
+# exist, so a stale entry here fails the build rather than being skipped.
+#
+# Was 7: w2i_mem carried W2's row indices when the MLP had its own CSR datapath.
+# The MLP now runs on the shared tiled engine and its weights arrive as packed
+# banks on w2_mem, so that bundle is gone.
 set groups {
     S_AXI_HPC0_FPD {sc_mem      {in_mem}}
     S_AXI_HPC1_FPD {y_mem       {}}
-    S_AXI_HP0_FPD  {w_mha_mem   {qv_mem qc_mem}}
-    S_AXI_HP1_FPD  {w1_mem      {kv_mem kc_mem}}
+    S_AXI_HP0_FPD  {w_mha_mem   {}}
+    S_AXI_HP1_FPD  {w1_mem      {}}
     S_AXI_HP2_FPD  {w2_mem      {}}
 }
 
@@ -221,7 +234,10 @@ puts "CHECKPOINT: all bundles wired, validated OK"
 # hardware. This walks forward from every kernel master through the
 # interconnect chain and requires it to terminate at a PS pin.
 puts "\n=== Verifying every bundle reaches a physical PS port ==="
-set all_bundles {sc_mem in_mem w_mha_mem w1_mem w2_mem h_mem y_mem qv_mem qc_mem kv_mem kc_mem}
+set all_bundles {}
+foreach {port_suffix spec} $groups {
+    lappend all_bundles [lindex $spec 0] {*}[lindex $spec 1]
+}
 set bad {}
 foreach b $all_bundles {
     set kernel_pin [get_bd_intf_pins -quiet $cell_name/m_axi_$b]

@@ -73,9 +73,9 @@
 #ifndef ENCODER_LAYER_H
 #define ENCODER_LAYER_H
 
-#include "encoder_mha_block.h"
-#include "encoder_mlp_block.h"
 #include "encoder_layer_cfg.h"
+#include "encoder_stages.h"
+#include "csr_bounds.h"   // MAX_NNZ / MAX_ROWS, the m_axi port depths
 #include "encoder_scales.h"    // EncoderScaleLUTIndex (the scales[] array layout)
 
 /**
@@ -94,45 +94,51 @@
  * @param[in] feature_dim      Feature width D (= ENC_FEATURE_W_MAX).
  * @param[in] tokens_dim       Number of tokens N (columns).
  * @param[in] intermediate_dim MLP inner width (rows of fc1, cols of fc2).
+ *
+ * The four MHA weights are emitted tiled: one array of packed entries (a value and its
+ * block-local column per slot, column blocks in order) plus the nonzeros per (column block, row).
+ * The two MLP weights are still CSR / CSC triples.
+ * @param[in] wq_bank          Q projection weight entries.
+ * @param[in] wq_counts        Q projection weight counts.
+ * @param[in] wk_bank          K projection weight entries.
+ * @param[in] wk_counts        K projection weight counts.
+ * @param[in] wv_bank          V projection weight entries.
+ * @param[in] wv_counts        V projection weight counts.
+ * @param[in] wo_bank          Output projection weight entries.
+ * @param[in] wo_counts        Output projection weight counts.
+ * @param[in] w1_bank          MLP fc1 weight entries.
+ * @param[in] w1_counts        MLP fc1 weight counts.
+ * @param[in] w2_bank          MLP fc2 weight entries.
+ * @param[in] w2_counts        MLP fc2 weight counts.
  * 
- * @param[in] wq_values        CSR values for MHA Q projection weight.
- * @param[in] wq_col_idx       CSR column indices for MHA Q projection weight.
- * @param[in] wq_row_ptr       CSR row pointers for MHA Q projection weight.
- * @param[in] wk_values        CSR values for MHA K projection weight.
- * @param[in] wk_col_idx       CSR column indices for MHA K projection weight.
- * @param[in] wk_row_ptr       CSR row pointers for MHA K projection weight.
- * @param[in] wv_values        CSR values for MHA V projection weight. 
- * @param[in] wv_col_idx       CSR column indices for MHA V projection weight.
- * @param[in] wv_row_ptr       CSR row pointers for MHA V projection weight.
- * @param[in] wo_values        CSR values for MHA output projection weight.
- * @param[in] wo_col_idx       CSR column indices for MHA output projection weight.
- * @param[in] wo_row_ptr       CSR row pointers for MHA output projection weight.
  * 
- * @param[in] w1_values        CSR values for MLP FC1 weight.
- * @param[in] w1_col_idx       CSR column indices for MLP FC1 weight.
- * @param[in] w1_row_ptr       CSR row pointers for MLP FC1 weight
- * @param[in] w2_values        CSR values for MLP FC2 weight.
- * @param[in] w2_col_idx       CSR column indices for MLP FC2 weight.
- * @param[in] w2_row_ptr       CSR row pointers for MLP FC2 weight.
 
  * @param[in] scales           Per-layer folded scales.
- * @param[out] output          Layer output, D x N feature-major int8 (DDR).
+ * @param[out] output          Layer output, D x N feature-major int8 (DDR), written only when
+ *                             last_layer is set.
+ * @param[in] first_layer      Non-zero to read the input from DDR; otherwise the activation the
+ *                             previous layer left on-chip is used.
+ * @param[in] last_layer       Non-zero to write the result to DDR; otherwise it stays on-chip.
+ *
+ * Buffer contract: the weight value and column-index buffers are burst-read in wide words
+ * (up to 256 bits) and the final word is read whole, so each buffer must be readable
+ * (zero-padded) up to the next multiple of 32 elements.
  */
 void encoder_layer_top(
-    const T_Activation *input,
+    const T_MhaBankWord *input,
     int                 feature_dim,
     int                 tokens_dim,
     int                 intermediate_dim,
-    T_Activation *wq_values, T_MhaIndex *wq_col_idx, int *wq_row_ptr,
-    T_Activation *wk_values, T_MhaIndex *wk_col_idx, int *wk_row_ptr,
-    T_Activation *wv_values, T_MhaIndex *wv_col_idx, int *wv_row_ptr,
-    T_Activation *wo_values, T_MhaIndex *wo_col_idx, int *wo_row_ptr,
-    T_Activation *w1_values, T_MlpIndex *w1_col_idx, int *w1_row_ptr,
-    T_Activation *w2_values, T_MlpIndex *w2_col_idx, int *w2_row_ptr,
+    T_MhaTileWord *wq_bank, T_MhaCountWord *wq_counts,
+    T_MhaTileWord *wk_bank, T_MhaCountWord *wk_counts,
+    T_MhaTileWord *wv_bank, T_MhaCountWord *wv_counts,
+    T_MhaTileWord *wo_bank, T_MhaCountWord *wo_counts,
+    T_MhaTileWord *w1_bank, T_MhaCountWord *w1_counts,
+    T_MhaTileWord *w2_bank, T_MhaCountWord *w2_counts,
     const T_Scale *scales,
-    T_Activation *q_val, T_MhaHeadIndex *q_col,
-    T_Activation *k_val, T_MhaHeadIndex *k_col,
-    T_Activation  *output
+    T_MhaBankWord *output,
+    int            first_layer,
+    int            last_layer
 );
 
 #endif // ENCODER_LAYER_H

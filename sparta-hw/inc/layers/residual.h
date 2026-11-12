@@ -12,24 +12,25 @@
 #define RESIDUAL_H
 
 #include "encoder_types.h"
+#include "mha_cfg.h"   // MHA_BANK_PACK / T_MhaBankWord (the shared packed-word form)
 
 /**
  * @brief Scaled residual addition
  *
- * @param[in]  residual_input  Residual activations.
- * @param[in]  branch_input    Branch activations.
- * @param[in]  n_elem          Number of elements.
+ * @param[in]  residual_input   Packed operand, MHA_BANK_PACK tokens per word.
+ * @param[in]  branch_input   Packed operand, MHA_BANK_PACK tokens per word.
+ * @param[in]  n_words         Number of packed words (MHA_BANK_PACK tokens each).
  * @param[in]  residual_scale  Folded scale for the residual input.
  * @param[in]  branch_scale    Folded scale for the branch input.
  * @param[out] residual_output Output activations.
  */
 void residual_add(
-    const T_Activation* residual_input,
-    const T_Activation* branch_input,
-    int                 n_elem,
-    T_Scale             residual_scale,
-    T_Scale             branch_scale,
-    T_Activation*       residual_output
+    const T_MhaBankWord* residual_input,
+    const T_MhaBankWord* branch_input,
+    int                  n_words,
+    T_Scale              residual_scale,
+    T_Scale              branch_scale,
+    T_MhaBankWord*       residual_output
 );
 
 #endif // RESIDUAL_H
