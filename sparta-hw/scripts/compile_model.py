@@ -88,9 +88,128 @@ import os
 import re
 import struct
 import sys
+import numpy as np
+
 from dataclasses import dataclass, field
 
-import numpy as np
+
+def parse_args():
+    """
+    Parse arguments for executing `compile_model.py` as a script.
+    """
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+
+    parser.add_argument(
+        "-i",
+        "--input",
+        required=True,
+        help="Path to the model weights encoded as the `quant_values.txt`",
+    )
+
+    parser.add_argument(
+        "--out",
+        default="out/model",
+        help="Output directory to hold `model.bin` and `manifest.json` (default out/model)",
+    )
+
+    parser.add_argument(
+        "--layers",
+        default="all",
+        help="'all' or comma list of encoder layer indices to emit (default all)",
+    )
+
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="cross-check CSR reconstruction + gamma round-trip during emit",
+    )
+
+    parser.add_argument(
+        "--summary",
+        action="store_true",
+        help="Inspect only: print a structural summary + layer-0 scale table",
+    )
+
+    parser.add_argument(
+        "--module",
+        default=None,
+        help="Inspect only: print one module's parsed contents",
+    )
+
+    parser.add_argument(
+        "--scales",
+        choices=["auto", "fixed", "shift"],
+        default="auto",
+        help="scale blob format: 'fixed' = ap_fixed<32,16> (the shipping kernel), "
+        "'shift' = int8 POT shifts, 'auto' = shift for POT models, else fixed",
+    )
+
+    parser.add_argument(
+        "--model-index",
+        action="store_true",
+        help="also write model_index.bin (for tb/encoder_e2e_tb.cpp)",
+    )
+
+    parser.add_argument(
+        "--permute",
+        choices=["none", "random", "balanced"],
+        default="none",
+        help="emit the model in a permuted feature basis (saves permutations.npz): "
+        "'balanced' evens out the per-column-block load for the tiled engine, "
+        "'random' is the bit-exactness test",
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="seed for --permute random",
+    )
+
+    parser.add_argument(
+        "--mha-tiles",
+        type=int,
+        default=0,
+        help="emit the MHA projection weights as this many per-column-block CSRs "
+        "(0 = one row-major CSR, the original layout)",
+    )
+
+    parser.add_argument(
+        "--weights",
+        choices=["auto", "pot", "int"],
+        default="auto",
+        help="weight values in the tiled payload: 'pot' = {sign, exponent} for the "
+        "shift datapath, 'int' = plain integers for the DSP-multiply datapath, "
+        "'auto' = follow POT_SHIFT_MAC in config/build_config.yaml (the same "
+        "switch the kernel is built with)",
+    )
+
+    parser.add_argument(
+        "--build-config",
+        default="config/build_config.yaml",
+        help="--weights auto reads the kernel's defines from here",
+    )
+
+    parser.add_argument(
+        "--mlp-tiles",
+        type=int,
+        default=0,
+        help="emit the MLP weights as this many per-column-block CSRs; linear_1 splits "
+        "its D input features, linear_2 its d_h hidden features "
+        "(0 = row-major CSR for linear_1 and column-major CSC for linear_2)",
+    )
+
+    parser.add_argument(
+        "--w1-group-cap",
+        type=int,
+        default=572,
+        help="--permute: max nonzeros per group of 4 W1 rows; mirrors "
+        "MLP_W1_GROUP_NNZ_MAX in src/layers/mlp.cpp (0 = no limit)",
+    )
+
+    return parser.parse_args()
 
 
 # ----------------------------------------------------------------------------
@@ -99,13 +218,14 @@ import numpy as np
 @dataclass
 class LinearLayer:
     """A QuantLinear block: dense int4 weight + per-row weight scale + input scale."""
+
     name: str
-    shape: tuple = None                     # (out, in)
+    shape: tuple = None  # (out, in)
     weight_bits: int = 0
     weight_signed: bool = True
-    weight_scale: np.ndarray = None         # PER-ROW, len = out
-    weight_int: np.ndarray = None           # dense int, [out, in] (int4 range, still dense)
-    input_scale: float = None               # per-tensor activation-into-this-layer scale
+    weight_scale: np.ndarray = None  # PER-ROW, len = out
+    weight_int: np.ndarray = None  # dense int, [out, in] (int4 range, still dense)
+    input_scale: float = None  # per-tensor activation-into-this-layer scale
     input_bits: int = 0
     # bias.* are read but intentionally NOT stored (unused in the network).
 
@@ -113,17 +233,19 @@ class LinearLayer:
 @dataclass
 class NormModule:
     """An RMSNorm block: int8 gamma + gamma scale + output activation scale."""
+
     name: str
-    gamma_int: np.ndarray = None            # int, len D
+    gamma_int: np.ndarray = None  # int, len D
     gamma_scale: float = None
     gamma_bits: int = 0
-    output_scale: float = None              # RMSNorm output act scale (sZ / sX1)
+    output_scale: float = None  # RMSNorm output act scale (sZ / sX1)
     output_bits: int = 0
 
 
 @dataclass
 class DyadicModule:
     """A residual (dyadic) adder block: branch/out scales + m/e dyadic fold."""
+
     name: str
     branch_a_scale: float = None
     branch_b_scale: float = None
@@ -138,6 +260,7 @@ class DyadicModule:
 @dataclass
 class ActQuant:
     """A standalone activation quantizer block: a single per-tensor scale."""
+
     name: str
     scale: float = None
     bits: int = 0
@@ -147,11 +270,12 @@ class ActQuant:
 @dataclass
 class QuantModel:
     """The whole parsed file, keyed by full module name."""
-    linears: dict = field(default_factory=dict)   # name -> LinearLayer
-    norms: dict = field(default_factory=dict)      # name -> NormModule
-    dyadics: dict = field(default_factory=dict)    # name -> DyadicModule
-    acts: dict = field(default_factory=dict)       # name -> ActQuant
-    meta: dict = field(default_factory=dict)       # header comments
+
+    linears: dict = field(default_factory=dict)  # name -> LinearLayer
+    norms: dict = field(default_factory=dict)  # name -> NormModule
+    dyadics: dict = field(default_factory=dict)  # name -> DyadicModule
+    acts: dict = field(default_factory=dict)  # name -> ActQuant
+    meta: dict = field(default_factory=dict)  # header comments
 
     # -- convenience scale accessors (the "list indexed by known activation") ----
     def act_scale(self, name):
@@ -169,7 +293,9 @@ class QuantModel:
     def layers(self):
         """Sorted list of encoder layer indices present in the file."""
         ids = set()
-        for n in list(self.linears) + list(self.norms) + list(self.dyadics) + list(self.acts):
+        for n in (
+            list(self.linears) + list(self.norms) + list(self.dyadics) + list(self.acts)
+        ):
             m = re.search(r"encoder\.encoder_layer_(\d+)\.", n)
             if m:
                 ids.add(int(m.group(1)))
@@ -201,7 +327,7 @@ def compile_model(path):
     # When a label announces a following multi-row int matrix (weight.int header),
     # we collect the next `pending_rows` data lines into `pending_target`.
     pending_rows = 0
-    pending_target = None       # list to append np rows into
+    pending_target = None  # list to append np rows into
     pending_shape = None
 
     def flush_matrix():
@@ -268,7 +394,7 @@ def compile_model(path):
                 elif key == "weight.bit_width":
                     obj.weight_bits = int(val)
                 elif key == "weight.signed":
-                    obj.weight_signed = (val == "True")
+                    obj.weight_signed = val == "True"
                 elif key == "weight.scale":
                     obj.weight_scale = np.array(_floats(val), dtype=np.float64)
                 elif key == "weight.int":
@@ -298,8 +424,10 @@ def compile_model(path):
 
             elif kind == "DYADIC":
                 dd = {
-                    "branch_a.scale": "branch_a_scale", "branch_b.scale": "branch_b_scale",
-                    "out.scale": "out_scale", "scale_out": "scale_out",
+                    "branch_a.scale": "branch_a_scale",
+                    "branch_b.scale": "branch_b_scale",
+                    "out.scale": "out_scale",
+                    "scale_out": "scale_out",
                 }
                 if key in dd:
                     setattr(obj, dd[key], float(val))
@@ -312,7 +440,7 @@ def compile_model(path):
                 elif key == "act.bit_width":
                     obj.bits = int(val)
                 elif key == "act.signed":
-                    obj.signed = (val == "True")
+                    obj.signed = val == "True"
 
     return model
 
@@ -341,8 +469,8 @@ def compile_model(path):
 # and `weight.scale` length in --summary tell you which regime a file is in.)
 # ----------------------------------------------------------------------------
 # Fixed-point encodings (match the HLS types).
-SCALE_FRAC = 16   # ap_fixed<32,16> requant scales (T_MhaQuant/T_MlpQuant/T_Scale)
-GAMMA_BITS = 8    # T_RmsGamma = ap_int<8> (int8 code; gamma_scale folded into inv_out)
+SCALE_FRAC = 16  # ap_fixed<32,16> requant scales (T_MhaQuant/T_MlpQuant/T_Scale)
+GAMMA_BITS = 8  # T_RmsGamma = ap_int<8> (int8 code; gamma_scale folded into inv_out)
 
 # The six weights: tag -> module suffix.  Per-row fold s_in/s_out resolved per layer.
 WEIGHTS = ["w_q", "w_k", "w_v", "out_proj", "linear_1", "linear_2"]
@@ -359,8 +487,12 @@ TILE_PACK = 4
 # counts are one byte each, so one transfer carries this many of them.
 COUNT_WORD_BYTES = 8
 WMODULE = {
-    "w_q": "mha.w_q", "w_k": "mha.w_k", "w_v": "mha.w_v",
-    "out_proj": "mha.out_proj", "linear_1": "mlp.linear_1", "linear_2": "mlp.linear_2",
+    "w_q": "mha.w_q",
+    "w_k": "mha.w_k",
+    "w_v": "mha.w_v",
+    "out_proj": "mha.out_proj",
+    "linear_1": "mlp.linear_1",
+    "linear_2": "mlp.linear_2",
 }
 
 
@@ -368,9 +500,15 @@ class BlobWriter:
     """Appends arrays to ONE open binary file, returning a manifest descriptor
     {offset, bytes, count, dtype} for each blob so the runtime host can seek to it.
     Offsets are absolute byte positions in the single output file."""
+
     # numpy dtype -> stable string the host/manifest agree on.
-    _DT = {"int8": "int8", "uint8": "uint8", "uint16": "uint16",
-           "int16": "int16", "int32": "int32"}
+    _DT = {
+        "int8": "int8",
+        "uint8": "uint8",
+        "uint16": "uint16",
+        "int16": "int16",
+        "int32": "int32",
+    }
 
     def __init__(self, fh):
         self.fh = fh
@@ -384,8 +522,12 @@ class BlobWriter:
         self.offset += len(raw)
         # normalize dtype label (strip endianness prefix; the file is little-endian).
         name = np.dtype(arr.dtype).name
-        return {"offset": off, "bytes": len(raw), "count": int(arr.size),
-                "dtype": self._DT.get(name, name)}
+        return {
+            "offset": off,
+            "bytes": len(raw),
+            "count": int(arr.size),
+            "dtype": self._DT.get(name, name),
+        }
 
 
 def fx(scale_vec, frac=SCALE_FRAC):
@@ -425,14 +567,16 @@ def pot_weight_signexp(vals_int, allow_zero=False):
     memory word; they are encoded as byte 0 and never read back (a row's span comes from the
     per-row counts, which exclude padding)."""
     v = np.asarray(vals_int, dtype=np.int64)
-    padding = (v == 0)
+    padding = v == 0
     if padding.any() and not allow_zero:
-        raise ValueError("pot_weight_signexp got a zero (CSR should only hold nonzeros)")
-    exp = _log2_exact(np.where(padding, 1, v))   # padding slots stand in as 2^0
+        raise ValueError(
+            "pot_weight_signexp got a zero (CSR should only hold nonzeros)"
+        )
+    exp = _log2_exact(np.where(padding, 1, v))  # padding slots stand in as 2^0
     if np.any((exp < 0) | (exp > 7)):
         raise ValueError(f"weight exponent out of 0..7: {exp.min()}..{exp.max()}")
     sign = (v < 0).astype(np.int64)
-    encoded = ((sign << 7) | exp).astype("<u1")   # uint8: bit7=sign, bits0..6=exponent
+    encoded = ((sign << 7) | exp).astype("<u1")  # uint8: bit7=sign, bits0..6=exponent
     encoded[padding] = 0
     return encoded
 
@@ -468,7 +612,7 @@ def dense_to_csc(wint):
     vals, rowidx = [], []
     colptr = np.zeros(cols + 1, dtype=np.int64)
     for c in range(cols):
-        nz = np.nonzero(wint[:, c])[0]           # ROW indices with a nonzero in column c
+        nz = np.nonzero(wint[:, c])[0]  # ROW indices with a nonzero in column c
         rowidx.append(nz.astype(np.uint16))
         vals.append(wint[nz, c].astype(np.int64))
         colptr[c + 1] = colptr[c] + nz.size
@@ -525,14 +669,16 @@ def pack_tiled_bank(vals, indices, pot, pack=TILE_PACK, entry_bits=16):
         raise ValueError(f"block-local column out of 0..255: {c.min()}..{c.max()}")
 
     if pot:
-        code    = pot_weight_signexp(v, allow_zero=True).astype(np.int64)
-        code    = ((code >> 7) << 3) | (code & 0x7)   # {sign bit7, exp bits0..6} -> {sign bit3, exp bits0..2}
+        code = pot_weight_signexp(v, allow_zero=True).astype(np.int64)
+        code = ((code >> 7) << 3) | (
+            code & 0x7
+        )  # {sign bit7, exp bits0..6} -> {sign bit3, exp bits0..2}
         col_lsb = 4
     else:
         # these weights reach +/-64, so the plain-integer field is 8 bits, not 4
         if v.size and (v.min() < -128 or v.max() > 127):
             raise ValueError(f"weight out of int8 range: {v.min()}..{v.max()}")
-        code    = v & 0xFF
+        code = v & 0xFF
         col_lsb = 8
 
     entry = (code | (c << col_lsb)).astype(np.uint64)
@@ -586,16 +732,20 @@ def dense_to_tiled_csr(wint, n_tiles, pad_to=1):
 
     data, indices, indptr = [], [], []
     for t in range(n_tiles):
-        block = wint[:, t * width:(t + 1) * width]
-        row, col = np.nonzero(block)            # row-major order == CSR order
+        block = wint[:, t * width : (t + 1) * width]
+        row, col = np.nonzero(block)  # row-major order == CSR order
         pad = -row.size % pad_to
         data.append(np.concatenate([block[row, col], np.zeros(pad, block.dtype)]))
         indices.append(np.concatenate([col, np.zeros(pad, col.dtype)]))
-        indptr.append(np.concatenate(([0], np.cumsum(np.bincount(row, minlength=rows)))))
+        indptr.append(
+            np.concatenate(([0], np.cumsum(np.bincount(row, minlength=rows))))
+        )
 
-    return (np.concatenate(data).astype(np.int64),
-            np.concatenate(indices).astype("<u2"),
-            np.stack(indptr).astype("<i4"))
+    return (
+        np.concatenate(data).astype(np.int64),
+        np.concatenate(indices).astype("<u2"),
+        np.stack(indptr).astype("<i4"),
+    )
 
 
 def _act_signed_scale(model, name):
@@ -609,7 +759,8 @@ def _act_signed_scale(model, name):
     signed act's txt scale already matches runtime; only the 12 unsigned quant_out were 2x off.
 
     NOTE: in the current `1ee51p3s` model EVERY act is signed (quant_out was made signed in the
-    SW fix), so the 2x branch is inert here.  It is kept for older/unsigned-quant_out exports."""
+    SW fix), so the 2x branch is inert here.  It is kept for older/unsigned-quant_out exports.
+    """
     a = model.acts[name]
     return a.scale * 2.0 if not a.signed else a.scale
 
@@ -622,15 +773,20 @@ def per_row_fold(model, layer, tag):
     model it returns len==out_rows and scalar_scales' .mean() is NOT valid — see the LATENT
     RISK block at the top of stage 2."""
     P = f"encoder.encoder_layer_{layer}."
-    sW = model.linears[P + WMODULE[tag]].weight_scale   # per-row (scalar for a per-tensor model)
+    sW = model.linears[
+        P + WMODULE[tag]
+    ].weight_scale  # per-row (scalar for a per-tensor model)
     NO = lambda n: model.norms[P + n].output_scale
     A = lambda n: _act_signed_scale(model, P + n)
     LI = lambda n: model.linears[P + n].input_scale
     dy = lambda n: model.dyadics[P + n]
     sZ, sX1 = NO("ln_mha"), NO("ln_mlp")
-    if tag == "w_q":      s_in, s_out = sZ,            A("mha.quant_q")
-    elif tag == "w_k":    s_in, s_out = sZ,            A("mha.quant_k")
-    elif tag == "w_v":    s_in, s_out = sZ,            A("mha.quant_v")
+    if tag == "w_q":
+        s_in, s_out = sZ, A("mha.quant_q")
+    elif tag == "w_k":
+        s_in, s_out = sZ, A("mha.quant_k")
+    elif tag == "w_v":
+        s_in, s_out = sZ, A("mha.quant_v")
     # out_proj / linear_2 requant to the residual BRANCH grid (branch_b_scale), NOT the
     # coarser residual OUTPUT grid (out_scale).  The residual's branch ratio is already
     # branch_b/out (see SCALE_*_BRANCH_RATIO in scalar_scales), so the branch must arrive
@@ -639,9 +795,12 @@ def per_row_fold(model, layer, tag):
     # the 12 layers into wrong classifications (HW twin 1/8 -> 24/24 vs the SW model once
     # fixed).  The finer grid can overflow int8 on <0.01% outlier elements; the projection's
     # saturate handles those (SW likewise clamps only the residual sum).
-    elif tag == "out_proj": s_in, s_out = A("mha.quant_out"), dy("res1").branch_b_scale
-    elif tag == "linear_1": s_in, s_out = sX1,         LI("mlp.linear_2")
-    elif tag == "linear_2": s_in, s_out = LI("mlp.linear_2"), dy("res2").branch_b_scale
+    elif tag == "out_proj":
+        s_in, s_out = A("mha.quant_out"), dy("res1").branch_b_scale
+    elif tag == "linear_1":
+        s_in, s_out = sX1, LI("mlp.linear_2")
+    elif tag == "linear_2":
+        s_in, s_out = LI("mlp.linear_2"), dy("res2").branch_b_scale
     return sW * s_in / s_out
 
 
@@ -657,9 +816,9 @@ def scalar_scales(model, layer):
     # so there is NO gamma to fold. The RMSNorm output requant is just 1/OUT_SCALE.
     g_mha = model.norms[P + "ln_mha"].gamma_scale
     g_mlp = model.norms[P + "ln_mlp"].gamma_scale
-    gamma_fused = (g_mha is None)
+    gamma_fused = g_mha is None
     if gamma_fused:
-        g_mha = g_mlp = 1.0        # no gamma factor; RMSNORM_OUT_INV = 1/OUT_SCALE
+        g_mha = g_mlp = 1.0  # no gamma factor; RMSNORM_OUT_INV = 1/OUT_SCALE
     sV, sZhat = A("mha.quant_v"), A("mha.quant_out")
     sH = LI("mlp.linear_2")
     # Residual-add fold ratios.  The HW residual_add has NO per-branch align step, so each
@@ -671,29 +830,41 @@ def scalar_scales(model, layer):
     #     align_a rescales (e.g. L2 res1) -> corrupts everything downstream.
     #   - BRANCH (sM): the MHA/MLP output, at the dyadic branch_b scale.
     r1, r2 = dy("res1"), dy("res2")
-    sX_mha, sOUT_mha, sM_mha = A("quant_input"), r1.out_scale, r1.branch_b_scale   # MHA block residual
-    sX_mlp, sOUT_mlp, sM_mlp = r1.out_scale,      r2.out_scale, r2.branch_b_scale   # MLP block residual
+    sX_mha, sOUT_mha, sM_mha = (
+        A("quant_input"),
+        r1.out_scale,
+        r1.branch_b_scale,
+    )  # MHA block residual
+    sX_mlp, sOUT_mlp, sM_mlp = (
+        r1.out_scale,
+        r2.out_scale,
+        r2.branch_b_scale,
+    )  # MLP block residual
     # SCALE_*_IDX order (see encoder_layer.h):
     return [
         # The shipping kernel uses THESE SCALAR per-projection slots (one scale per projection,
         # applied to every output row) — NOT the per-row s_*_row blobs, which are emitted but
         # dead.  .mean() is EXACT for a per-tensor model (all rows equal); for a per-channel
         # model it is WRONG.  See the LATENT RISK block at the top of stage 2.
-        float(per_row_fold(model, layer, "w_q").mean()),      # SCALE_Q_IDX
-        float(per_row_fold(model, layer, "w_k").mean()),      # SCALE_K_IDX
-        float(per_row_fold(model, layer, "w_v").mean()),      # SCALE_V_IDX
-        float(per_row_fold(model, layer, "out_proj").mean()), # SCALE_LINEAR_OUT_IDX
-        sV / sZhat,                                           # SCALE_DIV_OUT_IDX
-        sZ,                                                   # SCALE_ATT_RMSNORM_IN_IDX
-        g_mha / sZ,                                           # SCALE_ATT_RMSNORM_OUT_INV_IDX (gamma_scale folded)
-        sX_mha / sOUT_mha,                                    # SCALE_ATT_RESIDUAL_IDX
-        sM_mha / sOUT_mha,                                    # SCALE_ATT_BRANCH_RATIO_IDX
-        float(per_row_fold(model, layer, "linear_1").mean()), # SCALE_FC1_IDX  (.mean(): see risk note above)
-        float(per_row_fold(model, layer, "linear_2").mean()), # SCALE_FC2_IDX  (.mean(): see risk note above)
-        sX1,                                                 # SCALE_FF_RMSNORM_IN_IDX
-        g_mlp / sX1,                                          # SCALE_FF_RMSNORM_OUT_INV_IDX (gamma_scale folded)
-        sX_mlp / sOUT_mlp,                                    # SCALE_FF_RESIDUAL_IDX
-        sM_mlp / sOUT_mlp,                                    # SCALE_FF_BRANCH_RATIO_IDX
+        float(per_row_fold(model, layer, "w_q").mean()),  # SCALE_Q_IDX
+        float(per_row_fold(model, layer, "w_k").mean()),  # SCALE_K_IDX
+        float(per_row_fold(model, layer, "w_v").mean()),  # SCALE_V_IDX
+        float(per_row_fold(model, layer, "out_proj").mean()),  # SCALE_LINEAR_OUT_IDX
+        sV / sZhat,  # SCALE_DIV_OUT_IDX
+        sZ,  # SCALE_ATT_RMSNORM_IN_IDX
+        g_mha / sZ,  # SCALE_ATT_RMSNORM_OUT_INV_IDX (gamma_scale folded)
+        sX_mha / sOUT_mha,  # SCALE_ATT_RESIDUAL_IDX
+        sM_mha / sOUT_mha,  # SCALE_ATT_BRANCH_RATIO_IDX
+        float(
+            per_row_fold(model, layer, "linear_1").mean()
+        ),  # SCALE_FC1_IDX  (.mean(): see risk note above)
+        float(
+            per_row_fold(model, layer, "linear_2").mean()
+        ),  # SCALE_FC2_IDX  (.mean(): see risk note above)
+        sX1,  # SCALE_FF_RMSNORM_IN_IDX
+        g_mlp / sX1,  # SCALE_FF_RMSNORM_OUT_INV_IDX (gamma_scale folded)
+        sX_mlp / sOUT_mlp,  # SCALE_FF_RESIDUAL_IDX
+        sM_mlp / sOUT_mlp,  # SCALE_FF_BRANCH_RATIO_IDX
     ]
 
 
@@ -704,16 +875,27 @@ def emit_gamma(model, layer, ln, bw, verify):
     # existing inv_out multiply.  This halves gamma's DDR footprint (1 B/elem) and
     # keeps the model's true precision (no re-gridding to a wider fixed-point grid).
     n = model.norms[f"encoder.encoder_layer_{layer}.{ln}"]
-    q = np.clip(n.gamma_int, -128, 127).astype("<i1")         # int8 code
+    q = np.clip(n.gamma_int, -128, 127).astype("<i1")  # int8 code
     entry = bw.put(q)
-    entry["abs_max"] = float(np.abs(n.gamma_int.astype(np.float64) * n.gamma_scale).max())
+    entry["abs_max"] = float(
+        np.abs(n.gamma_int.astype(np.float64) * n.gamma_scale).max()
+    )
     if verify:
-        entry["saturated"] = bool((np.abs(n.gamma_int) > 127).any())   # int8 range guard
+        entry["saturated"] = bool((np.abs(n.gamma_int) > 127).any())  # int8 range guard
     return entry
 
 
-def emit_layer(model, layer, bw, verify, pot=False, fused=None, pot_scales=None, tiles=None,
-               pot_weights=None):
+def emit_layer(
+    model,
+    layer,
+    bw,
+    verify,
+    pot=False,
+    fused=None,
+    pot_scales=None,
+    tiles=None,
+    pot_weights=None,
+):
     """Append one layer's blobs to the single-file writer `bw`; return its manifest.
 
     pot=True (POT4 model): WEIGHTS are emitted as one sign+exponent byte per nonzero
@@ -734,8 +916,14 @@ def emit_layer(model, layer, bw, verify, pot=False, fused=None, pot_scales=None,
         pot_weights = pot
     P = f"encoder.encoder_layer_{layer}."
     ld = {"weights": {}, "scale_rows": {}, "gammas": {}}
-    fold_names = {"w_q": "s_q_row", "w_k": "s_k_row", "w_v": "s_v_row",
-                  "out_proj": "s_o_row", "linear_1": "s1_row", "linear_2": "s2_row"}
+    fold_names = {
+        "w_q": "s_q_row",
+        "w_k": "s_k_row",
+        "w_v": "s_v_row",
+        "out_proj": "s_o_row",
+        "linear_1": "s1_row",
+        "linear_2": "s2_row",
+    }
     for tag in WEIGHTS:
         wi = model.linears[P + WMODULE[tag]].weight_int.astype(np.int64)
         # linear_2 (W2) is emitted COLUMN-major (CSC) for the H-driven stage-2 datapath
@@ -745,19 +933,24 @@ def emit_layer(model, layer, bw, verify, pot=False, fused=None, pot_scales=None,
         # column-major CSR.  All other weights stay row-major CSR.
         n_tiles = (tiles or {}).get(tag, 0)
         tiled = n_tiles > 0
-        csc = (tag == "linear_2" and not tiled)
+        csc = tag == "linear_2" and not tiled
         if tiled:
             # One CSR per column block.  The "rowptr" slot carries each block's per-row nonzero
             # counts (block-major), which is what the kernel needs to advance one cursor per block.
             vals, idx, indptr = dense_to_tiled_csr(wi, n_tiles, pad_to=TILE_PACK)
             ptr = np.diff(indptr, axis=1).astype("<i4").ravel()
         elif csc:
-            vals, idx, ptr = dense_to_csc(wi)   # idx = row index, ptr = column pointer
+            vals, idx, ptr = dense_to_csc(wi)  # idx = row index, ptr = column pointer
         else:
-            vals, idx, ptr = dense_to_csr(wi)   # idx = col index, ptr = row pointer
-        ent = {"shape": list(wi.shape), "nnz": int(vals.size),
-               "max_row_nnz": int(ptr.max() if tiled else np.diff(ptr.astype(np.int64)).max()),
-               "layout": "tiled_bank" if tiled else ("csc" if csc else "csr")}
+            vals, idx, ptr = dense_to_csr(wi)  # idx = col index, ptr = row pointer
+        ent = {
+            "shape": list(wi.shape),
+            "nnz": int(vals.size),
+            "max_row_nnz": int(
+                ptr.max() if tiled else np.diff(ptr.astype(np.int64)).max()
+            ),
+            "layout": "tiled_bank" if tiled else ("csc" if csc else "csr"),
+        }
         if tiled:
             # Values and columns in one pre-packed array; "counts" holds the per-(block, row)
             # nonzero counts the kernel walks the rows with.
@@ -769,25 +962,29 @@ def emit_layer(model, layer, bw, verify, pot=False, fused=None, pot_scales=None,
             # COUNT_WORD_BYTES at a time, so a row block's counts cost n_tiles * rows / 16 reads
             # instead of one per count.
             block_words = np.cumsum(
-                np.concatenate(([0], (indptr[:, -1] + TILE_PACK - 1) // TILE_PACK)))[:n_tiles]
+                np.concatenate(([0], (indptr[:, -1] + TILE_PACK - 1) // TILE_PACK))
+            )[:n_tiles]
             if ptr.max() > 255:
                 raise ValueError(f"nonzero count {ptr.max()} does not fit a byte")
             header = block_words.astype("<i4").tobytes()
             header += b"\x00" * (-len(header) % COUNT_WORD_BYTES)
             body = ptr.astype("<u1").tobytes()
             body += b"\x00" * (-len(body) % COUNT_WORD_BYTES)
-            ent["bank"]   = bw.put(pack_tiled_bank(vals, idx, pot_weights))
+            ent["bank"] = bw.put(pack_tiled_bank(vals, idx, pot_weights))
             ent["counts"] = bw.put(np.frombuffer(header + body, dtype="<u1"))
             ent["block_words"] = [int(v) for v in block_words]
             ent["counts_header_bytes"] = len(header)
         else:
-            ent["values"] = (bw.put(pot_weight_signexp(vals)) if pot_weights
-                             else bw.put(vals.astype(np.int8)))
-            ent["col"]    = bw.put(idx)
+            ent["values"] = (
+                bw.put(pot_weight_signexp(vals))
+                if pot_weights
+                else bw.put(vals.astype(np.int8))
+            )
+            ent["col"] = bw.put(idx)
             ent["rowptr"] = bw.put(ptr)
         if tiled:
             ent["n_tiles"] = n_tiles
-            ent["tile_nnz"] = [int(n) for n in indptr[:, -1]]   # nonzeros per block
+            ent["tile_nnz"] = [int(n) for n in indptr[:, -1]]  # nonzeros per block
         if verify:
             recon = np.zeros_like(wi)
             if tiled:
@@ -795,9 +992,11 @@ def emit_layer(model, layer, bw, verify, pot=False, fused=None, pot_scales=None,
                 for t in range(n_tiles):
                     for r in range(wi.shape[0]):
                         n = int(ptr[t * wi.shape[0] + r])
-                        recon[r, idx[pos:pos + n].astype(np.int64) + t * width] = vals[pos:pos + n]
+                        recon[r, idx[pos : pos + n].astype(np.int64) + t * width] = (
+                            vals[pos : pos + n]
+                        )
                         pos += n
-                    pos += -pos % TILE_PACK          # skip this block's padding
+                    pos += -pos % TILE_PACK  # skip this block's padding
             elif csc:
                 for c in range(wi.shape[1]):
                     s, e = int(ptr[c]), int(ptr[c + 1])
@@ -833,12 +1032,22 @@ def _is_pot_model(model):
     """POT4 model = gammas fused away (gamma_int None) AND scale type po2. Auto-detected."""
     scale_ty = model.meta.get("scale type", "")
     any_norm = next(iter(model.norms.values()), None)
-    gamma_fused = (any_norm is not None and any_norm.gamma_int is None)
+    gamma_fused = any_norm is not None and any_norm.gamma_int is None
     return gamma_fused and ("weight=po2" in scale_ty)
 
 
-def emit_model(model, layers, out_dir, verify=False, pot=None, fused=None, pot_scales=None,
-               perms=None, tiles=None, pot_weights=None):
+def emit_model(
+    model,
+    layers,
+    out_dir,
+    verify=False,
+    pot=None,
+    fused=None,
+    pot_scales=None,
+    perms=None,
+    tiles=None,
+    pot_weights=None,
+):
     """Emit ONE concatenated model.bin (all layers, all blobs) + manifest.json.
 
     perms: the permutations already applied to `model` (apply_permutations), if any. They are
@@ -869,22 +1078,35 @@ def emit_model(model, layers, out_dir, verify=False, pot=None, fused=None, pot_s
         "bin": "model.bin",
         "endian": "little",
         "format": "pot" if pot_weights else "int",
-        "w_bits": 4, "scale_frac": SCALE_FRAC, "gamma_bits": GAMMA_BITS,
-        "note_format": ("POT: weight blob = uint8 (bit7=sign, bits0..6=log2|w|); scale "
-                        "blobs = int8 shift s (real=2^s); NO gammas (fused into linears)."
-                        if pot else
-                        "int: weight blob = int8; scale blobs = ap_fixed<32,16> int32; "
-                        "int8 gammas per block."),
+        "w_bits": 4,
+        "scale_frac": SCALE_FRAC,
+        "gamma_bits": GAMMA_BITS,
+        "note_format": (
+            "POT: weight blob = uint8 (bit7=sign, bits0..6=log2|w|); scale "
+            "blobs = int8 shift s (real=2^s); NO gammas (fused into linears)."
+            if pot
+            else "int: weight blob = int8; scale blobs = ap_fixed<32,16> int32; "
+            "int8 gammas per block."
+        ),
         "note_offsets": "each blob descriptor {offset,bytes,count,dtype} is an absolute "
-                        "position into model.bin.",
+        "position into model.bin.",
         "note_bias": "biases ignored (unused).",
         "layers": {},
     }
     with open(bin_path, "wb") as fh:
         bw = BlobWriter(fh)
         for layer in layers:
-            ld = emit_layer(model, layer, bw, verify, pot=pot, fused=fused, pot_scales=pot_scales,
-                            tiles=tiles, pot_weights=pot_weights)
+            ld = emit_layer(
+                model,
+                layer,
+                bw,
+                verify,
+                pot=pot,
+                fused=fused,
+                pot_scales=pot_scales,
+                tiles=tiles,
+                pot_weights=pot_weights,
+            )
             manifest["layers"][str(layer)] = ld
             w = ld["weights"]
             vtxt = ""
@@ -892,8 +1114,10 @@ def emit_model(model, layers, out_dir, verify=False, pot=None, fused=None, pot_s
                 allok = all(w[t].get("csr_exact") for t in w)
                 vtxt = f"  csr_exact={allok}"
             gtxt = "no gammas (fused)" if fused else "2 gammas"
-            print(f"  L{layer:02d}: 6 weights (maxrow "
-                  f"{max(w[t]['max_row_nnz'] for t in w)}) + 6 scale_rows + scales + {gtxt}{vtxt}")
+            print(
+                f"  L{layer:02d}: 6 weights (maxrow "
+                f"{max(w[t]['max_row_nnz'] for t in w)}) + 6 scale_rows + scales + {gtxt}{vtxt}"
+            )
         total = bw.offset
     manifest["total_bytes"] = total
     manifest["format_detected"] = "pot" if pot else "int"
@@ -902,7 +1126,7 @@ def emit_model(model, layers, out_dir, verify=False, pot=None, fused=None, pot_s
         manifest["permutation"] = {
             "file": PERM_FILE,
             "convention": "perm[old] = new; X_perm = X[inverse(pi)] at the encoder input, "
-                          "Y = Y_perm[pi] at the encoder output",
+            "Y = Y_perm[pi] at the encoder output",
         }
     with open(os.path.join(out_dir, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
@@ -910,7 +1134,7 @@ def emit_model(model, layers, out_dir, verify=False, pot=None, fused=None, pot_s
     return manifest
 
 
-MODEL_INDEX_MAGIC = 0x45324D49   # 'IM2E', checked by tb/encoder_e2e_tb.cpp
+MODEL_INDEX_MAGIC = 0x45324D49  # 'IM2E', checked by tb/encoder_e2e_tb.cpp
 
 
 def emit_model_index(manifest, out_dir, n_heads=12, entry_format=0):
@@ -1038,19 +1262,31 @@ def balanced_permutations(model, n_tiles, n_heads=12):
     layers = model.layers()
     nnz_cols = lambda lin: (lin.weight_int != 0).sum(0) / (lin.weight_int != 0).sum()
     nnz_rows = lambda lin: (lin.weight_int != 0).sum(1) / (lin.weight_int != 0).sum()
-    lin = lambda layer, tag: model.linears[f"encoder.encoder_layer_{layer}." + WMODULE[tag]]
+    lin = lambda layer, tag: model.linears[
+        f"encoder.encoder_layer_{layer}." + WMODULE[tag]
+    ]
 
-    stream = sum(nnz_cols(lin(L, t)) for L in layers for t in ("w_q", "w_k", "w_v", "linear_1"))
+    stream = sum(
+        nnz_cols(lin(L, t)) for L in layers for t in ("w_q", "w_k", "w_v", "linear_1")
+    )
     stream += sum(nnz_rows(lin(L, t)) for L in layers for t in ("out_proj", "linear_2"))
     pi = balanced_order(stream, n_tiles)
 
     d_head = lin(layers[0], "w_q").shape[1] // n_heads
     identity_band = np.tile(np.arange(d_head), (n_heads, 1))
-    sigma = [balanced_order(nnz_rows(lin(L, "linear_1")) + nnz_cols(lin(L, "linear_2")), n_tiles)
-             for L in layers]
-    return {"layers": np.asarray(layers), "pi": pi, "sigma": np.stack(sigma),
-            "rho": np.stack([identity_band] * len(layers)),
-            "nu": np.stack([identity_band] * len(layers))}
+    sigma = [
+        balanced_order(
+            nnz_rows(lin(L, "linear_1")) + nnz_cols(lin(L, "linear_2")), n_tiles
+        )
+        for L in layers
+    ]
+    return {
+        "layers": np.asarray(layers),
+        "pi": pi,
+        "sigma": np.stack(sigma),
+        "rho": np.stack([identity_band] * len(layers)),
+        "nu": np.stack([identity_band] * len(layers)),
+    }
 
 
 def _fit_group_cap(row_nnz, perm, group, cap, rng):
@@ -1060,15 +1296,17 @@ def _fit_group_cap(row_nnz, perm, group, cap, rng):
     The kernel's MLP stage 1 bursts W1 `group` rows at a time into a fixed-size buffer
     (MLP_W1_GROUP_NNZ_MAX / MLP_ROW_PARALLEL in src/layers/mlp.cpp); an arbitrary hidden
     order can overflow it."""
-    order = _inverse(perm)                          # order[new] = old
+    order = _inverse(perm)  # order[new] = old
     n_groups = len(order) // group
     for _ in range(100 * len(order)):
-        loads = row_nnz[order[:n_groups * group]].reshape(n_groups, group).sum(1)
+        loads = row_nnz[order[: n_groups * group]].reshape(n_groups, group).sum(1)
         heavy = int(loads.argmax())
         if loads[heavy] <= cap:
             return _inverse(order)
         light = int(loads.argmin())
-        h = heavy * group + int(row_nnz[order[heavy * group:(heavy + 1) * group]].argmax())
+        h = heavy * group + int(
+            row_nnz[order[heavy * group : (heavy + 1) * group]].argmax()
+        )
         l = light * group + int(rng.integers(group))
         order[h], order[l] = order[l], order[h]
     raise ValueError(f"could not fit W1 groups of {group} rows under {cap} nonzeros")
@@ -1090,7 +1328,9 @@ def random_permutations(model, seed, n_heads=12, w1_group_cap=None, w1_group=4):
     for layer in layers:
         s = rng.permutation(d_hidden)
         if w1_group_cap is not None:
-            w1 = model.linears[f"encoder.encoder_layer_{layer}." + WMODULE["linear_1"]].weight_int
+            w1 = model.linears[
+                f"encoder.encoder_layer_{layer}." + WMODULE["linear_1"]
+            ].weight_int
             s = _fit_group_cap((w1 != 0).sum(1), s, w1_group, w1_group_cap, rng)
         sigma.append(s)
     return {
@@ -1107,22 +1347,34 @@ def apply_permutations(model, perms):
     pi = perms["pi"]
     for i, layer in enumerate(perms["layers"]):
         P = f"encoder.encoder_layer_{int(layer)}."
-        rho, nu, sigma = _band_perm(perms["rho"][i]), _band_perm(perms["nu"][i]), perms["sigma"][i]
-        row_col = {"w_q": (rho, pi), "w_k": (rho, pi), "w_v": (nu, pi),
-                   "out_proj": (pi, nu), "linear_1": (sigma, pi), "linear_2": (pi, sigma)}
+        rho, nu, sigma = (
+            _band_perm(perms["rho"][i]),
+            _band_perm(perms["nu"][i]),
+            perms["sigma"][i],
+        )
+        row_col = {
+            "w_q": (rho, pi),
+            "w_k": (rho, pi),
+            "w_v": (nu, pi),
+            "out_proj": (pi, nu),
+            "linear_1": (sigma, pi),
+            "linear_2": (pi, sigma),
+        }
         for tag, (row_perm, col_perm) in row_col.items():
             lin = model.linears[P + WMODULE[tag]]
             inv_row = _inverse(row_perm)
             # W_new[row_perm[r], col_perm[c]] = W[r, c]
             lin.weight_int = lin.weight_int[np.ix_(inv_row, _inverse(col_perm))]
-            if lin.weight_scale is not None and lin.weight_scale.size > 1:   # per-row scales
+            if (
+                lin.weight_scale is not None and lin.weight_scale.size > 1
+            ):  # per-row scales
                 lin.weight_scale = lin.weight_scale[inv_row]
 
 
 # ----------------------------------------------------------------------------
 # CLI
 # ----------------------------------------------------------------------------
-def _summary(model):
+def inspect_summary(model):
     print(f"linears : {len(model.linears)}")
     print(f"norms   : {len(model.norms)}")
     print(f"dyadics : {len(model.dyadics)}")
@@ -1141,121 +1393,129 @@ def _summary(model):
         if nm.startswith(L0):
             lin = model.linears[nm]
             ws = lin.weight_scale
-            print(f"  LIN  {nm:52s} in={lin.input_scale:.9f} "
-                  f"wscale[{len(ws)}] range[{ws.min():.5f},{ws.max():.5f}] "
-                  f"wint{lin.weight_int.shape} nz={int((lin.weight_int != 0).sum())}")
+            print(
+                f"  LIN  {nm:52s} in={lin.input_scale:.9f} "
+                f"wscale[{len(ws)}] range[{ws.min():.5f},{ws.max():.5f}] "
+                f"wint{lin.weight_int.shape} nz={int((lin.weight_int != 0).sum())}"
+            )
 
 
-def _module(model, nm):
-    if nm in model.linears:
-        lin = model.linears[nm]
-        print(f"LINEAR {nm}: shape={lin.shape} wbits={lin.weight_bits}")
-        print(f"  weight.int {lin.weight_int.shape} dtype={lin.weight_int.dtype} "
-              f"range[{lin.weight_int.min()},{lin.weight_int.max()}] "
-              f"nz={int((lin.weight_int != 0).sum())}")
-        print(f"  weight.scale PER-ROW len={len(lin.weight_scale)} "
-              f"range[{lin.weight_scale.min():.6f},{lin.weight_scale.max():.6f}]")
+def inspect_module(model, module) -> None:
+    """
+    Inspect a specific model's module.
+
+    Parameters
+    ----------
+    model :
+
+    nm : str
+        The module's name to inspect.
+    """
+    if module in model.linears:
+
+        lin = model.linears[module]
+        print(f"LINEAR {module}: shape={lin.shape} wbits={lin.weight_bits}")
+        print(
+            f"  weight.int {lin.weight_int.shape} dtype={lin.weight_int.dtype} "
+            f"range[{lin.weight_int.min()},{lin.weight_int.max()}] "
+            f"nz={int((lin.weight_int != 0).sum())}"
+        )
+        print(
+            f"  weight.scale PER-ROW len={len(lin.weight_scale)} "
+            f"range[{lin.weight_scale.min():.6f},{lin.weight_scale.max():.6f}]"
+        )
         print(f"  input.scale={lin.input_scale}")
-    elif nm in model.norms:
-        n = model.norms[nm]
-        print(f"NORM {nm}: gamma_int len={len(n.gamma_int)} "
-              f"scale={n.gamma_scale} output.scale={n.output_scale}")
-    elif nm in model.dyadics:
-        print(f"DYADIC {nm}: {model.dyadics[nm]}")
-    elif nm in model.acts:
-        print(f"ACT {nm}: scale={model.acts[nm].scale}")
+
+    elif module in model.norms:
+        n = model.norms[module]
+        print(
+            f"NORM {module}: gamma_int len={len(n.gamma_int)} "
+            f"scale={n.gamma_scale} output.scale={n.output_scale}"
+        )
+    elif module in model.dyadics:
+        print(f"DYADIC {module}: {model.dyadics[module]}")
+    elif module in model.acts:
+        print(f"ACT {module}: scale={model.acts[module].scale}")
     else:
-        raise SystemExit(f"module not found: {nm}")
+        raise SystemExit(f"module not found: {module}")
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("-i", "--input", required=True, help="path to quant_values.txt")
-    ap.add_argument("--out", default="out/model",
-                    help="output directory for model.bin + manifest.json (default out/model)")
-    ap.add_argument("--layers", default="all",
-                    help="'all' or comma list of encoder layer indices to emit (default all)")
-    ap.add_argument("--verify", action="store_true",
-                    help="cross-check CSR reconstruction + gamma round-trip during emit")
-    ap.add_argument("--summary", action="store_true",
-                    help="inspect only: print a structural summary + layer-0 scale table")
-    ap.add_argument("--module", default=None,
-                    help="inspect only: print one module's parsed contents")
-    ap.add_argument("--scales", choices=["auto", "fixed", "shift"], default="auto",
-                    help="scale blob format: 'fixed' = ap_fixed<32,16> (the shipping kernel), "
-                         "'shift' = int8 POT shifts, 'auto' = shift for POT models, else fixed")
-    ap.add_argument("--model-index", action="store_true",
-                    help="also write model_index.bin (for tb/encoder_e2e_tb.cpp)")
-    ap.add_argument("--permute", choices=["none", "random", "balanced"], default="none",
-                    help="emit the model in a permuted feature basis (saves permutations.npz): "
-                         "'balanced' evens out the per-column-block load for the tiled engine, "
-                         "'random' is the bit-exactness test")
-    ap.add_argument("--seed", type=int, default=0, help="seed for --permute random")
-    ap.add_argument("--mha-tiles", type=int, default=0,
-                    help="emit the MHA projection weights as this many per-column-block CSRs "
-                         "(0 = one row-major CSR, the original layout)")
-    ap.add_argument("--weights", choices=["auto", "pot", "int"], default="auto",
-                    help="weight values in the tiled payload: 'pot' = {sign, exponent} for the "
-                         "shift datapath, 'int' = plain integers for the DSP-multiply datapath, "
-                         "'auto' = follow POT_SHIFT_MAC in config/build_config.yaml (the same "
-                         "switch the kernel is built with)")
-    ap.add_argument("--build-config", default="config/build_config.yaml",
-                    help="--weights auto reads the kernel's defines from here")
-    ap.add_argument("--mlp-tiles", type=int, default=0,
-                    help="emit the MLP weights as this many per-column-block CSRs; linear_1 splits "
-                         "its D input features, linear_2 its d_h hidden features "
-                         "(0 = row-major CSR for linear_1 and column-major CSC for linear_2)")
-    ap.add_argument("--w1-group-cap", type=int, default=572,
-                    help="--permute: max nonzeros per group of 4 W1 rows; mirrors "
-                         "MLP_W1_GROUP_NNZ_MAX in src/layers/mlp.cpp (0 = no limit)")
-    args = ap.parse_args()
+    """
+    Main function for executing `compile_model.py` script.
+    """
+    args = parse_args()
 
     print(f"Reading {args.input} ...", file=sys.stderr)
     model = compile_model(args.input)
     model.meta["source"] = os.path.basename(args.input)
 
-    # inspection modes short-circuit the emit.
+    # Inspection-only modes.
     if args.module:
-        _module(model, args.module)
+        inspect_module(model, args.module)
         return
     if args.summary:
-        _summary(model)
+        inspect_summary(model)
         return
 
     all_layers = model.layers()
-    layers = (all_layers if args.layers == "all"
-              else [int(x) for x in args.layers.split(",") if x.strip()])
+    layers = (
+        all_layers
+        if args.layers == "all"
+        else [int(x) for x in args.layers.split(",") if x.strip()]
+    )
     perms = None
     if args.permute == "random":
-        perms = random_permutations(model, args.seed, w1_group_cap=args.w1_group_cap or None)
+        perms = random_permutations(
+            model, args.seed, w1_group_cap=args.w1_group_cap or None
+        )
     elif args.permute == "balanced":
         perms = balanced_permutations(model, args.mha_tiles or 12)
         if args.w1_group_cap:
             rng = np.random.default_rng(args.seed)
             for i, layer in enumerate(perms["layers"]):
-                w1 = model.linears[f"encoder.encoder_layer_{int(layer)}." + WMODULE["linear_1"]]
-                perms["sigma"][i] = _fit_group_cap((w1.weight_int != 0).sum(1), perms["sigma"][i],
-                                                   4, args.w1_group_cap, rng)
+                w1 = model.linears[
+                    f"encoder.encoder_layer_{int(layer)}." + WMODULE["linear_1"]
+                ]
+                perms["sigma"][i] = _fit_group_cap(
+                    (w1.weight_int != 0).sum(1),
+                    perms["sigma"][i],
+                    4,
+                    args.w1_group_cap,
+                    rng,
+                )
     if perms is not None:
         apply_permutations(model, perms)
     if args.weights == "auto":
         try:
             import yaml
+
             defines = yaml.safe_load(open(args.build_config)).get("defines") or []
         except Exception as exc:
-            raise SystemExit(f"--weights auto could not read {args.build_config}: {exc}")
+            raise SystemExit(
+                f"--weights auto could not read {args.build_config}: {exc}"
+            )
         pot_weights = "POT_SHIFT_MAC" in defines
-        print(f"--weights auto: {'pot' if pot_weights else 'int'} "
-              f"(POT_SHIFT_MAC {'set' if pot_weights else 'not set'} in {args.build_config})",
-              file=sys.stderr)
+        print(
+            f"--weights auto: {'pot' if pot_weights else 'int'} "
+            f"(POT_SHIFT_MAC {'set' if pot_weights else 'not set'} in {args.build_config})",
+            file=sys.stderr,
+        )
     else:
-        pot_weights = (args.weights == "pot")
+        pot_weights = args.weights == "pot"
     pot_scales = {"auto": None, "fixed": False, "shift": True}[args.scales]
     tiles = {t: args.mha_tiles for t in MHA_TILED_WEIGHTS if args.mha_tiles > 0}
     tiles.update({t: args.mlp_tiles for t in MLP_TILED_WEIGHTS if args.mlp_tiles > 0})
-    manifest = emit_model(model, layers, args.out, args.verify, pot_weights=pot_weights,
-                          pot_scales=pot_scales, perms=perms, tiles=tiles)
+    manifest = emit_model(
+        model,
+        layers,
+        args.out,
+        args.verify,
+        pot_weights=pot_weights,
+        pot_scales=pot_scales,
+        perms=perms,
+        tiles=tiles,
+    )
     if args.model_index:
         emit_model_index(manifest, args.out, entry_format=0 if pot_weights else 1)
     print(f"\nWrote {len(layers)} layer(s) to {args.out}/", file=sys.stderr)

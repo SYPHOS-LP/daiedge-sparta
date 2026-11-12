@@ -1,32 +1,46 @@
 #!/usr/bin/env python3
-"""Python host: run the 12-layer ViT encoder on the Kria (xck26) accelerator.
+"""
+This module holds the implementation for executing the 12-layer ViT encoder 
+via the host on the Kria (xck26) accelerator.
 
-Pipeline:
-    X (768x50 int8, feature-major)
+The module supports both `p16` and `p32` ViT Sparse-aware models, the embedding
+layer is executed on the host converting an input image into an (768, n) array, 
+feature-major, for `n` in `{50, 197}` based on the patch size. Which is then 
+loaded on the FPGA, and executed sequentially by each encoder layer:
+
+e.g. for X (768x50 int8, feature-major)
     for L in 0..11:  X = encoder_layer_top(X, weights[L], scales[L])   (on FPGA)
 
-Run as a script this checks the accelerator against the simulation's golden data,
-which needs nothing but numpy and pynq.  Classifying a real image needs the SW
-embedding and classifier head as well -- that is infer_hw.py, which imports this
-file for the hardware seam and brings the image pipeline with it.
+This module executed as a script acts as a test as it checks the accelerator 
+against the simulation's golden data, which needs nothing but numpy and pynq.
 
-Division of labour (all Python; PYNQ is the only hardware dependency):
-  - SPARTALoader.Loader   : parse model.bin / manifest -> numpy views.
-  - this file (Python)    : allocate + fill DDR buffers (PYNQ), the 12-layer loop,
-                            ping-pong activations, golden comparison.
-  - HwKernel (this file)  : the ONE hardware seam — programs the PL from the .bit
-                            and invokes encoder_layer_top by writing the PHYSICAL
-                            DDR ADDRESSES of those buffers into its s_axi_control
-                            registers, then polling ap_done.
+Classifying a real image needs the SW embedding and classifier head as well, called
+by the `infer_hw.py` module, which imports this file for the hardware part and 
+brings the image pipeline with it.
+
+What each module holds:
+- SpartaModelLoader :
+    A class for parsing `model.bin` and `manifest.json` file. Holds model weights
+    as views to numpy arrays loaded into memory.
+- SPARTA.py : 
+    Allocate + fill DDR buffers (PYNQ), the 12-layer loop, ping-pong activations, 
+    and perform the golden comparison.
+- HwKernel  : 
+    A class to act as a boundary layer for the hardware. It programs the PL from 
+    the `.bit` and invokes encoder_layer_top by writing the PHYSICAL DDR ADDRESSES
+    of those buffers into its s_axi_control registers, then polling `ap_done`.
+
+Dependencies (on-device):
+- `pynq`
+- `numpy`
+
+Notes:
 
 FLOW: this is the custom block-design path, NOT the XRT/Vitis path.  The BD in
 scripts/encoder_layer_kr260_bd.tcl emits a .bit/.hwh pair (loadable by PYNQ or
 xmutil), never an .xclbin, so there is no XRT kernel to bind arguments to --
 the arguments ARE control registers, written directly.  Register offsets come
 from the HLS-generated xencoder_layer_top_hw.h; see REGMAP below.
-
-Requires: pynq (on-device) and numpy.  pynq is imported lazily so this file can
-be linted/inspected on the dev host without it present.
 
 BRING-UP, in this order:
   1. control path only -- no DDR, no ap_start:
@@ -51,11 +65,10 @@ import os
 import re
 import sys
 import time
-
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from SPARTALoader import Loader
+from SPARTALoader import SpartaModelLoader
 
 # Encoder dims.  These are a property of the BITSTREAM, not of the payload: the kernel's
 # activation ports and its on-chip buffers are sized at synthesis time.  50 tokens for the
@@ -68,18 +81,134 @@ from SPARTALoader import Loader
 # transfer was empty and the byte requests did not merge into bursts).
 ENC_PACK = 8
 
+# Fabric clock in MHz, used only to turn measured seconds into cycles for the report.  Defined here
+# as well as set from --clock-mhz, because run_encoder() reads it and this module is also imported
+# as a library (infer_hw.py), where main() never runs.
+CLOCK_MHZ = 200.0
+
 
 def set_enc_dims(features, tokens):
-    """Set the encoder geometry, and everything that follows from it."""
+    """
+    Set the encoder geometry, and everything that follows from it.
+    """
     global ENC_D, ENC_N, ACT_ELEMS, ENC_ROW_WORDS, ACT_WORDS, ACT_BYTES
     ENC_D, ENC_N = features, tokens
-    ACT_ELEMS     = ENC_D * ENC_N                  # the logical activation: D x N int8
-    ENC_ROW_WORDS = -(-ENC_N // ENC_PACK)          # 7 at N=50, 25 at N=197
-    ACT_WORDS     = ENC_D * ENC_ROW_WORDS          # what the DMA buffer holds
-    ACT_BYTES     = ACT_WORDS * ENC_PACK
+    ACT_ELEMS = ENC_D * ENC_N  # the logical activation: D x N int8
+    ENC_ROW_WORDS = -(-ENC_N // ENC_PACK)  # 7 at N=50, 25 at N=197
+    ACT_WORDS = ENC_D * ENC_ROW_WORDS  # what the DMA buffer holds
+    ACT_BYTES = ACT_WORDS * ENC_PACK
 
 
-set_enc_dims(768, 50)
+def parse_args():
+    """
+    Parse arguments for executing `SPARTA.py` as a script.
+    """
+
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+
+    parser.add_argument(
+        "-d",
+        "--model-dir",
+        default=None,
+        help="dir with model.bin + manifest.json (from compile_model.py); "
+        "not needed with --selftest",
+    )
+    parser.add_argument(
+        "-b",
+        "--bitstream",
+        default=None,
+        help="overlay to program (.bit, with its .hwh alongside); not needed with --no-download",
+    )
+    parser.add_argument(
+        "--instance",
+        default=None,
+        help="BD cell name of the kernel (default: discover it)",
+    )
+    parser.add_argument(
+        "--no-download",
+        action="store_true",
+        help="Attach to a PL already programmed (e.g. by xmutil) "
+        "instead of reprogramming it; maps the control "
+        "registers directly and needs no .bit/.hwh",
+    )
+    parser.add_argument(
+        "--base-addr",
+        default=None,
+        help="`s_axi_control` base address when attaching. Default comes from `0x{{HwKernel.CONTROL_BASE:08x}}`",
+    )
+    parser.add_argument(
+        "--selftest",
+        action="store_true",
+        help="Write/read-back every control register and exit; "
+        "checks the AXI-Lite control path only (no DDR, no ap_start). "
+        "Is a first check against a new bitstream.",
+    )
+    parser.add_argument(
+        "-e",
+        "--e2e-dir",
+        default=None,
+        help="Directory with sim payload with `inputs.bin` (and golden/hw_out.bin) to "
+        "check against; not needed with --selftest",
+    )
+    parser.add_argument(
+        "--golden-dir",
+        default=None,
+        help="Directory holding the golden reference `hw_out.bin` file.",
+    )
+    parser.add_argument(
+        "-n",
+        "--images",
+        type=int,
+        default=1,
+        help="how many images from the payload to run (default 1)",
+    )
+    parser.add_argument(
+        "--n-layers",
+        type=int,
+        default=None,
+        help="run only the first N encoder layers; for TIMING only, the result is "
+        "partway through the encoder so the golden comparison will fail",
+    )
+    parser.add_argument(
+        "--features",
+        type=int,
+        default=768,
+        help=f"The encoder feature dimension the BITSTREAM was built for.",
+    )
+    parser.add_argument(
+        "--tokens",
+        type=int,
+        default=50,
+        help=f"The encoder token count the BITSTREAM was built for. Depends on patch-size."
+        f"50 for the 32x32-patch model, 197 for the 16x16-patch one",
+    )
+    parser.add_argument(
+        "--clock-mhz",
+        type=float,
+        default=200,
+        help="FPGA clock, used only for reporting. The actual cycles depend on the device.",
+    )
+    parser.add_argument(
+        "--hw-header",
+        default=None,
+        help="HLS-generated xencoder_layer_top_hw.h to read the register "
+        "offsets from (default: the built-in REGMAP)",
+    )
+
+    args = parser.parse_args()
+
+    # Validate args
+    if not args.bitstream and not args.no_download:
+        parser.error("-b/--bitstream is required unless --no-download is given")
+
+    if not args.selftest and (not args.model_dir or not args.e2e_dir):
+        parser.error(
+            "-d/--model-dir and -e/--e2e-dir are required unless --selftest is given"
+        )
+
+    return args
 
 
 def pack_rows(a):
@@ -91,14 +220,12 @@ def pack_rows(a):
 
 def unpack_rows(w):
     """(ACT_WORDS,) uint64  ->  (ENC_D, ENC_N) int8.  Drops the per-feature padding."""
-    b = np.asarray(w, dtype=np.uint64).view(np.uint8).reshape(ENC_D, ENC_ROW_WORDS * ENC_PACK)
+    b = (
+        np.asarray(w, dtype=np.uint64)
+        .view(np.uint8)
+        .reshape(ENC_D, ENC_ROW_WORDS * ENC_PACK)
+    )
     return np.ascontiguousarray(b[:, :ENC_N]).view(np.int8)
-
-# Fabric clock, for turning measured time into cycles.  Set by the app's device-tree overlay, NOT
-# by anything here -- check it on the board with
-#   sudo cat /sys/kernel/debug/clk/clk_summary | grep -i pl
-# and override with --clock-mhz if it differs.
-CLOCK_HZ = 190e6
 
 
 # ============================================================================
@@ -128,12 +255,18 @@ class SpartaLayerArgs(ctypes.Structure):
         ("feature_dim", ctypes.c_int32),
         ("tokens_dim", ctypes.c_int32),
         ("intermediate_dim", ctypes.c_int32),
-        ("wq_bank", ctypes.c_uint64), ("wq_counts", ctypes.c_uint64),
-        ("wk_bank", ctypes.c_uint64), ("wk_counts", ctypes.c_uint64),
-        ("wv_bank", ctypes.c_uint64), ("wv_counts", ctypes.c_uint64),
-        ("wo_bank", ctypes.c_uint64), ("wo_counts", ctypes.c_uint64),
-        ("w1_bank", ctypes.c_uint64), ("w1_counts", ctypes.c_uint64),
-        ("w2_bank", ctypes.c_uint64), ("w2_counts", ctypes.c_uint64),
+        ("wq_bank", ctypes.c_uint64),
+        ("wq_counts", ctypes.c_uint64),
+        ("wk_bank", ctypes.c_uint64),
+        ("wk_counts", ctypes.c_uint64),
+        ("wv_bank", ctypes.c_uint64),
+        ("wv_counts", ctypes.c_uint64),
+        ("wo_bank", ctypes.c_uint64),
+        ("wo_counts", ctypes.c_uint64),
+        ("w1_bank", ctypes.c_uint64),
+        ("w1_counts", ctypes.c_uint64),
+        ("w2_bank", ctypes.c_uint64),
+        ("w2_counts", ctypes.c_uint64),
         ("scales", ctypes.c_uint64),
         ("output", ctypes.c_uint64),
         # The kernel keeps the activation on-chip between layers: only the first layer reads it
@@ -154,12 +287,12 @@ class SpartaLayerArgs(ctypes.Structure):
 # whatever the previous layer put there; on a board with >4GB visible that
 # aims the kernel at an arbitrary physical address rather than faulting.
 # ============================================================================
-AP_CTRL = 0x000          # control/status register
-AP_START    = 0x1        # bit0  W/COH -- kernel clears it when it accepts
-AP_DONE     = 0x2        # bit1  R     -- LATCHED until ap_continue (see invoke)
-AP_IDLE     = 0x4        # bit2  R
-AP_READY    = 0x8        # bit3  R/COR
-AP_CONTINUE = 0x10       # bit4  W/SC  -- releases the latched done state
+AP_CTRL = 0x000  # control/status register
+AP_START = 0x1  # bit0  W/COH -- kernel clears it when it accepts
+AP_DONE = 0x2  # bit1  R     -- LATCHED until ap_continue (see invoke)
+AP_IDLE = 0x4  # bit2  R
+AP_READY = 0x8  # bit3  R/COR
+AP_CONTINUE = 0x10  # bit4  W/SC  -- releases the latched done state
 
 # name -> (offset, is_64bit).  Order is documentation only: the AXI-Lite map is
 # addressed, not positional, so unlike the XRT set_arg path a misordered entry
@@ -175,19 +308,26 @@ AP_CONTINUE = 0x10       # bit4  W/SC  -- releases the latched done state
 # offsets does not fail -- it silently aims `output` and `scales` at whatever
 # address the neighbouring argument left behind.
 REGMAP = {
-    "input":            (0x010, True),
-    "feature_dim":      (0x01c, False),
-    "tokens_dim":       (0x024, False),
-    "intermediate_dim": (0x02c, False),
-    "wq_bank": (0x034, True), "wq_counts": (0x040, True),
-    "wk_bank": (0x04c, True), "wk_counts": (0x058, True),
-    "wv_bank": (0x064, True), "wv_counts": (0x070, True),
-    "wo_bank": (0x07c, True), "wo_counts": (0x088, True),
-    "w1_bank": (0x094, True), "w1_counts": (0x0a0, True),
-    "w2_bank": (0x0ac, True), "w2_counts": (0x0b8, True),
-    "scales":  (0x0c4, True),
-    "output":  (0x0d0, True),
-    "first_layer": (0x0dc, False), "last_layer": (0x0e4, False),
+    "input": (0x010, True),
+    "feature_dim": (0x01C, False),
+    "tokens_dim": (0x024, False),
+    "intermediate_dim": (0x02C, False),
+    "wq_bank": (0x034, True),
+    "wq_counts": (0x040, True),
+    "wk_bank": (0x04C, True),
+    "wk_counts": (0x058, True),
+    "wv_bank": (0x064, True),
+    "wv_counts": (0x070, True),
+    "wo_bank": (0x07C, True),
+    "wo_counts": (0x088, True),
+    "w1_bank": (0x094, True),
+    "w1_counts": (0x0A0, True),
+    "w2_bank": (0x0AC, True),
+    "w2_counts": (0x0B8, True),
+    "scales": (0x0C4, True),
+    "output": (0x0D0, True),
+    "first_layer": (0x0DC, False),
+    "last_layer": (0x0E4, False),
 }
 
 
@@ -226,12 +366,14 @@ def _cma_total_bytes(default=1 << 30):
 
 
 class HwKernel:
-    """encoder_layer_top over PYNQ: programs the PL and invokes via AXI-Lite.
+    """
+    encoder_layer_top over PYNQ: programs the PL and invokes via AXI-Lite.
 
-    Replaces the libsparta.so/XRT seam.  The custom block design (see
-    scripts/encoder_layer_kr260_bd.tcl) produces a .bit/.hwh pair, not an
-    .xclbin, so there is no XRT kernel object to bind arguments to -- the
-    arguments ARE the control registers, written directly.
+    Replaces libsparta.so/XRT. The custom block design produces a `.bit`/`.hwh`
+    pair not an `.xclbin`, so there is no XRT kernel object to bind arguments to.
+    (see scripts/encoder_layer_kr260_bd.tcl)
+
+    The arguments are the control registers, written directly.
     """
 
     # s_axi_control base address, from the BD's address map (confirmed in
@@ -242,23 +384,35 @@ class HwKernel:
     CONTROL_SIZE = 0x1_0000
 
     # AXI Timer register offsets (PG079). Only Timer0 is used.
-    TMR_TCSR0 = 0x00   # control/status
-    TMR_TLR0  = 0x04   # load register
-    TMR_TCR0  = 0x08   # counter value (what we sample)
-    TMR_SIZE  = 0x1_0000
+    TMR_TCSR0 = 0x00  # control/status
+    TMR_TLR0 = 0x04  # load register
+    TMR_TCR0 = 0x08  # counter value (what we sample)
+    TMR_SIZE = 0x1_0000
     # TCSR0 bits: ENT0 (enable, bit7) | ARHT0 (auto-reload, bit4) | UDT0=0 (up).
     # ENT0|ARHT0 = a free-running up-counter that wraps at 2^32.
     TMR_TCSR0_RUN = (1 << 7) | (1 << 4)
 
-    def __init__(self, bitstream=None, instance=None, download=True,
-                 timeout_s=60.0, base_addr=None, timer_base=None, regmap=None):
+    def __init__(
+        self,
+        bitstream=None,
+        instance=None,
+        download=True,
+        timeout_s=60.0,
+        base_addr=None,
+        timer_base=None,
+        regmap=None,
+    ):
         self.timeout_s = timeout_s
         # Register map: from the generated header (load_regmap) when given, else REGMAP.
         self.regmap = regmap if regmap is not None else REGMAP
-        missing = [name for name, _ in SpartaLayerArgs._fields_ if name not in self.regmap]
+        missing = [
+            name for name, _ in SpartaLayerArgs._fields_ if name not in self.regmap
+        ]
         if missing:
-            raise ValueError(f"register map has no offsets for kernel arguments {missing}; "
-                             "is the header from a different kernel build?")
+            raise ValueError(
+                f"register map has no offsets for kernel arguments {missing}; "
+                "is the header from a different kernel build?"
+            )
         self.overlay = None
         # Optional diagnostic AXI timer: a free-running counter on the
         # kernel's ap_clk. When present, invoke() returns fabric cycles too.
@@ -266,11 +420,12 @@ class HwKernel:
         # timer IP is discoverable in an overlay.
         self.timer = None
         self._timer_base = timer_base
-        self.last_cycles = None   # fabric cycles of the most recent invoke()
+        self.last_cycles = None  # fabric cycles of the most recent invoke()
 
         if download:
             # Program the PL and let PYNQ resolve the IP from the metadata.
             from pynq import Overlay
+
             self.overlay = Overlay(bitstream, download=True)
             self.ip = self._find_ip(instance)
         else:
@@ -281,6 +436,7 @@ class HwKernel:
             # control base is fixed by the block design and the register
             # offsets come from REGMAP -- so map the register block directly.
             from pynq import MMIO
+
             self.ip = MMIO(base_addr or self.CONTROL_BASE, self.CONTROL_SIZE)
             self._register_ps_memory()
 
@@ -289,8 +445,8 @@ class HwKernel:
     def _setup_timer(self, instance):
         """Map the diagnostic AXI timer, if this bitstream has one.
 
-        On the attach path the timer base is passed explicitly (--timer-base).  
-        On the overlay path we try to discover an axi_timer IP from the metadata.  
+        On the attach path the timer base is passed explicitly (--timer-base).
+        On the overlay path we try to discover an axi_timer IP from the metadata.
         Absent either, self.timer stays None and invoke() reports no cycles,
         so a non-debug bitstream just works with the timing feature silently off.
 
@@ -307,6 +463,7 @@ class HwKernel:
         if base is None:
             return
         from pynq import MMIO
+
         self.timer = MMIO(base, self.TMR_SIZE)
         # Arm Timer0 as a free-running up-counter: clear, load 0, then run.
         self.timer.write(self.TMR_TCSR0, 0)
@@ -343,7 +500,7 @@ class HwKernel:
 
         dev = Device.active_device
         if getattr(dev, "mem_dict", None):
-            return                              # already populated
+            return  # already populated
         # XrtMemory reads exactly these three keys; idx is the memory-bank
         # index handed to the allocator, and 0 is the PS-DDR bank.
         dev.mem_dict = {
@@ -365,12 +522,16 @@ class HwKernel:
         if instance is not None:
             return getattr(self.overlay, instance)
 
-        matches = [n for n, d in self.overlay.ip_dict.items()
-                   if "encoder_layer_top" in d.get("type", "")]
+        matches = [
+            n
+            for n, d in self.overlay.ip_dict.items()
+            if "encoder_layer_top" in d.get("type", "")
+        ]
         if not matches:
             raise RuntimeError(
                 "no encoder_layer_top IP in this overlay; found: "
-                f"{sorted(self.overlay.ip_dict)}.  Pass instance=... explicitly.")
+                f"{sorted(self.overlay.ip_dict)}.  Pass instance=... explicitly."
+            )
         if len(matches) > 1:
             raise RuntimeError(f"ambiguous encoder_layer_top instances: {matches}")
         return getattr(self.overlay, matches[0].split("/")[-1])
@@ -378,7 +539,7 @@ class HwKernel:
     def _write_arg(self, name, value):
         off, is64 = self.regmap[name]
         if is64:
-            self.ip.write(off,     value        & 0xFFFFFFFF)
+            self.ip.write(off, value & 0xFFFFFFFF)
             self.ip.write(off + 4, (value >> 32) & 0xFFFFFFFF)
         else:
             self.ip.write(off, value & 0xFFFFFFFF)
@@ -416,7 +577,8 @@ class HwKernel:
             if wrote != got:
                 failures.append(
                     f"{name}@0x{off:03x} {note}: wrote 0x{wrote:08x}, "
-                    f"read 0x{got:08x}")
+                    f"read 0x{got:08x}"
+                )
 
         # Per-32-bit-word view: a 64-bit arg is two independently addressed
         # words, and only testing the pair together would hide a dead high word.
@@ -449,14 +611,20 @@ class HwKernel:
         if verbose:
             ctrl = self.ip.read(AP_CTRL)
             print(f"control base : {self._base_addr_str()}")
-            print(f"ap_ctrl      : 0x{ctrl:08x} "
-                  f"(start={bool(ctrl & AP_START)}, done={bool(ctrl & AP_DONE)}, "
-                  f"idle={bool(ctrl & AP_IDLE)}, ready={bool(ctrl & AP_READY)})")
+            print(
+                f"ap_ctrl      : 0x{ctrl:08x} "
+                f"(start={bool(ctrl & AP_START)}, done={bool(ctrl & AP_DONE)}, "
+                f"idle={bool(ctrl & AP_IDLE)}, ready={bool(ctrl & AP_READY)})"
+            )
             if ctrl & AP_DONE:
-                print("               ^ done is LATCHED from an earlier run "
-                      "(ap_ctrl_chain); invoke() clears it before starting.")
-            print(f"registers    : {len(words)} 32-bit words "
-                  f"({len(self.regmap)} kernel arguments)")
+                print(
+                    "               ^ done is LATCHED from an earlier run "
+                    "(ap_ctrl_chain); invoke() clears it before starting."
+                )
+            print(
+                f"registers    : {len(words)} 32-bit words "
+                f"({len(self.regmap)} kernel arguments)"
+            )
             print(f"patterns     : 5 (4 uniform + 1 unique/aliasing)")
             if failures:
                 print(f"\nFAIL -- {len(failures)} register(s) did not read back:")
@@ -527,7 +695,8 @@ class HwKernel:
                     f"{self.timeout_s}s (ap_ctrl=0x{ctrl:08x}, "
                     f"start={bool(ctrl & AP_START)}, idle={bool(ctrl & AP_IDLE)}). "
                     "A hung kernel usually means a bad buffer address or an "
-                    "m_axi bundle that does not reach a PS port.")
+                    "m_axi bundle that does not reach a PS port."
+                )
         cyc_end = self._timer_cycles()
 
         # ---- 5: release the done state so the next invoke can start --------
@@ -567,10 +736,11 @@ class HwKernel:
                     f"encoder_layer_top is not startable (ap_ctrl=0x{ctrl:08x}, "
                     f"done={bool(ctrl & AP_DONE)}, idle={bool(ctrl & AP_IDLE)}). "
                     "If done stays latched despite ap_continue, or the block "
-                    "never goes idle, reload the PL (xmutil) to reset it.")
+                    "never goes idle, reload the PL (xmutil) to reset it."
+                )
 
     def close(self):
-        pass    # the Overlay owns the PL; nothing per-kernel to release.
+        pass  # the Overlay owns the PL; nothing per-kernel to release.
 
 
 # ============================================================================
@@ -582,13 +752,14 @@ class HwKernel:
 # outputs that sim/ already produced, so the board can be held to the same
 # bit-exact standard as the native testbench.
 # ============================================================================
-MAGIC_INPUTS = 0x45324E49    # 'IN2E', sim/emit_e2e.py
-MAGIC_OUTPUT = 0x45324F55    # 'OU2E', tb/encoder_e2e_tb.cpp
+MAGIC_INPUTS = 0x45324E49  # 'IN2E', sim/emit_e2e.py
+MAGIC_OUTPUT = 0x45324F55  # 'OU2E', tb/encoder_e2e_tb.cpp
 
 
 def read_e2e_blob(path, magic):
     """(n_images, D, N) int8 from an inputs.bin / hw_out.bin, header checked."""
     import struct
+
     blob = open(path, "rb").read()
     if len(blob) < 16:
         raise SystemExit(f"{path}: too short to hold a header")
@@ -597,9 +768,11 @@ def read_e2e_blob(path, magic):
         raise SystemExit(f"{path}: bad magic {m:#x} (expected {magic:#x})")
     body = np.frombuffer(blob[16:], dtype=np.int8)
     if body.size < n * d * tokens:
-        raise SystemExit(f"{path}: holds {body.size} bytes, header claims "
-                         f"{n}x{d}x{tokens} = {n * d * tokens}")
-    return body[:n * d * tokens].reshape(n, d, tokens)
+        raise SystemExit(
+            f"{path}: holds {body.size} bytes, header claims "
+            f"{n}x{d}x{tokens} = {n * d * tokens}"
+        )
+    return body[: n * d * tokens].reshape(n, d, tokens)
 
 
 # ============================================================================
@@ -612,7 +785,7 @@ def _allocate(pynq_allocate, nbytes, dtype=np.uint8):
 
 # The kernel bursts weight values/columns in wide words (up to 256 bits) and reads the
 # final word whole, so every weight buffer must stay readable up to the next word boundary.
-WIDE_READ_ALIGN = 64   # bytes
+WIDE_READ_ALIGN = 64  # bytes
 
 
 def _stage_layer(alloc, layer):
@@ -624,18 +797,18 @@ def _stage_layer(alloc, layer):
         raw = np.frombuffer(np.ascontiguousarray(arr).tobytes(), dtype=np.uint8)
         padded = -(-raw.size // WIDE_READ_ALIGN) * WIDE_READ_ALIGN
         b = _allocate(alloc, padded, np.uint8)
-        b[:raw.size] = raw
-        b[raw.size:] = 0
+        b[: raw.size] = raw
+        b[raw.size :] = 0
         b.sync_to_device()
         bufs[name] = b
 
     for tag, w in layer.weights.items():
         if w.layout == "tiled_bank":
-            stage(f"{tag}.bank",   w.bank)
+            stage(f"{tag}.bank", w.bank)
             stage(f"{tag}.counts", w.counts)
         else:
             stage(f"{tag}.values", w.values)
-            stage(f"{tag}.col",    w.col)
+            stage(f"{tag}.col", w.col)
             stage(f"{tag}.rowptr", w.rowptr)
     stage("scales", layer.scales)
     # NOT staged: scale_rows and gammas.  Neither is a kernel argument on this
@@ -673,22 +846,40 @@ def _build_args(x_buf, y_buf, lb, n_tokens, d, d_h, first_layer=1, last_layer=1)
     manifest via SPARTALoader and are unaffected by the runtime flow."""
     return SpartaLayerArgs(
         input=_addr(x_buf),
-        feature_dim=d, tokens_dim=n_tokens, intermediate_dim=d_h,
-        wq_bank=_addr(lb["w_q.bank"]), wq_counts=_addr(lb["w_q.counts"]),
-        wk_bank=_addr(lb["w_k.bank"]), wk_counts=_addr(lb["w_k.counts"]),
-        wv_bank=_addr(lb["w_v.bank"]), wv_counts=_addr(lb["w_v.counts"]),
-        wo_bank=_addr(lb["out_proj.bank"]), wo_counts=_addr(lb["out_proj.counts"]),
-        w1_bank=_addr(lb["linear_1.bank"]), w1_counts=_addr(lb["linear_1.counts"]),
-        w2_bank=_addr(lb["linear_2.bank"]), w2_counts=_addr(lb["linear_2.counts"]),
+        feature_dim=d,
+        tokens_dim=n_tokens,
+        intermediate_dim=d_h,
+        wq_bank=_addr(lb["w_q.bank"]),
+        wq_counts=_addr(lb["w_q.counts"]),
+        wk_bank=_addr(lb["w_k.bank"]),
+        wk_counts=_addr(lb["w_k.counts"]),
+        wv_bank=_addr(lb["w_v.bank"]),
+        wv_counts=_addr(lb["w_v.counts"]),
+        wo_bank=_addr(lb["out_proj.bank"]),
+        wo_counts=_addr(lb["out_proj.counts"]),
+        w1_bank=_addr(lb["linear_1.bank"]),
+        w1_counts=_addr(lb["linear_1.counts"]),
+        w2_bank=_addr(lb["linear_2.bank"]),
+        w2_counts=_addr(lb["linear_2.counts"]),
         scales=_addr(lb["scales"]),
-        first_layer=int(first_layer), last_layer=int(last_layer),
+        first_layer=int(first_layer),
+        last_layer=int(last_layer),
         output=_addr(y_buf),
     )
 
 
-def run_encoder(model_dir, e2e_dir, n_images=1, bitstream=None, instance=None,
-                download=True, base_addr=None, hw_header=None, golden_dir=None,
-                n_layers=None):
+def run_encoder(
+    model_dir,
+    e2e_dir,
+    n_images=1,
+    bitstream=None,
+    instance=None,
+    download=True,
+    base_addr=None,
+    hw_header=None,
+    golden_dir=None,
+    n_layers=None,
+):
     """Run encoder inputs from the simulation payload and compare against its golden.
 
     This is the datapath check that needs no torch: `e2e_dir/inputs.bin` holds the
@@ -700,25 +891,34 @@ def run_encoder(model_dir, e2e_dir, n_images=1, bitstream=None, instance=None,
 
     Returns the number of mismatching images (0 on success).
     """
-    from pynq import allocate            # on-device only; import lazily.
+    from pynq import allocate  # on-device only; import lazily.
 
     inputs = read_e2e_blob(os.path.join(e2e_dir, "inputs.bin"), MAGIC_INPUTS)
-    want = read_e2e_blob(os.path.join(golden_dir or os.path.join(e2e_dir, "golden"),
-                                      "hw_out.bin"), MAGIC_OUTPUT)
+    want = read_e2e_blob(
+        os.path.join(golden_dir or os.path.join(e2e_dir, "golden"), "hw_out.bin"),
+        MAGIC_OUTPUT,
+    )
     if inputs.shape[1:] != (ENC_D, ENC_N):
-        raise SystemExit(f"payload is {inputs.shape[1]}x{inputs.shape[2]}, "
-                         f"this build is ENC_D={ENC_D} x ENC_N={ENC_N}")
+        raise SystemExit(
+            f"payload is {inputs.shape[1]}x{inputs.shape[2]}, "
+            f"this build is ENC_D={ENC_D} x ENC_N={ENC_N}"
+        )
     n_images = min(n_images, inputs.shape[0], want.shape[0])
 
-    mp = Loader(model_dir)
+    mp = SpartaModelLoader(model_dir)
+
     layers = mp.layer_indices()
     if n_layers is not None:
         # Running a prefix of the encoder leaves the result partway through, so the golden
         # comparison is meaningless -- this is for timing, not accuracy.
         layers = layers[:n_layers]
-    kernel = HwKernel(bitstream, instance=instance, download=download,
-                      base_addr=base_addr,
-                      regmap=load_regmap(hw_header) if hw_header else None)
+    kernel = HwKernel(
+        bitstream,
+        instance=instance,
+        download=download,
+        base_addr=base_addr,
+        regmap=load_regmap(hw_header) if hw_header else None,
+    )
 
     # activation ping-pong: X (in) / Y (out), in the packed word form the ports carry.
     a = allocate(shape=(ACT_WORDS,), dtype=np.uint64)
@@ -728,7 +928,9 @@ def run_encoder(model_dir, e2e_dir, n_images=1, bitstream=None, instance=None,
 
     bad = 0
     per_image = []
-    per_layer_s = {}       # layer position -> summed kernel time, to see if the twelve differ
+    per_layer_s = (
+        {}
+    )  # layer position -> summed kernel time, to see if the twelve differ
     # invoke() returns its own ap_start -> ap_done wall time, so summing those separates the
     # kernel's time from the host's register writes and struct building.  Worth having: the
     # difference is how much of the frame rate Python is responsible for.
@@ -744,9 +946,16 @@ def run_encoder(model_dir, e2e_dir, n_images=1, bitstream=None, instance=None,
             for n, L in enumerate(layers):
                 # The activation stays on chip between layers: only the first reads it
                 # from DDR and only the last writes it back.
-                args = _build_args(x_buf, y_buf, staged[L], ENC_N, ENC_D, d_h[L],
-                                   first_layer=(L == layers[0]),
-                                   last_layer=(L == layers[-1]))
+                args = _build_args(
+                    x_buf,
+                    y_buf,
+                    staged[L],
+                    ENC_N,
+                    ENC_D,
+                    d_h[L],
+                    first_layer=(L == layers[0]),
+                    last_layer=(L == layers[-1]),
+                )
                 before = kernel_s
                 try:
                     kernel_s += kernel.invoke(args)
@@ -763,8 +972,10 @@ def run_encoder(model_dir, e2e_dir, n_images=1, bitstream=None, instance=None,
             if diff:
                 bad += 1
                 worst = int(np.abs(got.astype(int) - want[img].astype(int)).max())
-                print(f"  image {img}: {diff} of {ACT_ELEMS} bytes differ, "
-                      f"max |difference| {worst}")
+                print(
+                    f"  image {img}: {diff} of {ACT_ELEMS} bytes differ, "
+                    f"max |difference| {worst}"
+                )
             else:
                 print(f"  image {img}: bit-exact")
     finally:
@@ -776,94 +987,73 @@ def run_encoder(model_dir, e2e_dir, n_images=1, bitstream=None, instance=None,
         # Wall clock per image, which includes the host's per-layer register writes and the
         # ap_start/ap_done handshake -- so it is the end-to-end rate, not the fabric's alone.
         best, mean = min(per_image), sum(per_image) / len(per_image)
-        print(f"per image: {1000 * mean:.1f} ms mean, {1000 * best:.1f} ms best"
-              f"  ({1.0 / mean:.1f} FPS mean, {1.0 / best:.1f} FPS best)")
-        print(f"per layer: {1000 * mean / 12:.2f} ms mean over {len(per_image)} image(s)")
+        print(
+            f"per image: {1000 * mean:.1f} ms mean, {1000 * best:.1f} ms best"
+            f"  ({1.0 / mean:.1f} FPS mean, {1.0 / best:.1f} FPS best)"
+        )
+        print(
+            f"per layer: {1000 * mean / 12:.2f} ms mean over {len(per_image)} image(s)"
+        )
         kmean = sum(per_image_kernel) / len(per_image_kernel)
-        print(f"  of which kernel (ap_start -> ap_done): {1000 * kmean:.1f} ms "
-              f"({100 * kmean / mean:.1f} %), host {1000 * (mean - kmean):.1f} ms")
-        print(f"  kernel per layer: {1000 * kmean / len(layers):.2f} ms"
-              f"  =  {kmean / len(layers) * CLOCK_HZ / 1e6:.2f} M cycles at "
-              f"{CLOCK_HZ / 1e6:.0f} MHz")
+        print(
+            f"  of which kernel (ap_start -> ap_done): {1000 * kmean:.1f} ms "
+            f"({100 * kmean / mean:.1f} %), host {1000 * (mean - kmean):.1f} ms"
+        )
+        print(
+            f"  kernel per layer: {1000 * kmean / len(layers):.2f} ms"
+            f"  =  {kmean / len(layers) * CLOCK_MHZ:.2f} M cycles at "
+            f"{CLOCK_MHZ:.0f} MHz"
+        )
         # Layers 0 and the last are the only ones that convert the activation to/from DDR
         # (first_layer / last_layer), so they should stand out by a known amount.
         print("\n  per-layer kernel time (ms) and cycles:")
         for n in sorted(per_layer_s):
             t = per_layer_s[n] / len(per_image)
-            print(f"    layer {layers[n]:2d}: {1000 * t:7.3f} ms  "
-                  f"{t * CLOCK_HZ / 1e6:6.3f} M cycles")
+            print(
+                f"    layer {layers[n]:2d}: {1000 * t:7.3f} ms  "
+                f"{t * CLOCK_MHZ:6.3f} M cycles"
+            )
     return bad
 
 
 def main():
-    global CLOCK_HZ
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("-d", "--model-dir", default=None,
-                    help="dir with model.bin + manifest.json (from compile_model.py); "
-                         "not needed with --selftest")
-    ap.add_argument("-b", "--bitstream", default=None,
-                    help="overlay to program (.bit, with its .hwh alongside); "
-                         "not needed with --no-download")
-    ap.add_argument("--instance", default=None,
-                    help="BD cell name of the kernel (default: discover it)")
-    ap.add_argument("--no-download", action="store_true",
-                    help="attach to a PL already programmed (e.g. by xmutil) "
-                         "instead of reprogramming it; maps the control "
-                         "registers directly and needs no .bit/.hwh")
-    ap.add_argument("--base-addr", default=None,
-                    help=f"s_axi_control base address when attaching "
-                         f"(default 0x{HwKernel.CONTROL_BASE:08x})")
-    ap.add_argument("--selftest", action="store_true",
-                    help="write/read-back every control register and exit; "
-                         "checks the AXI-Lite control path only (no DDR, no "
-                         "ap_start). Run this first on a new bitstream.")
-    ap.add_argument("-e", "--e2e-dir", default=None,
-                    help="sim payload dir with inputs.bin (and golden/hw_out.bin) to "
-                         "check against; not needed with --selftest")
-    ap.add_argument("--golden-dir", default=None,
-                    help="dir holding the reference hw_out.bin (default: <e2e-dir>/golden). "
-                         "A payload emitted for a different engine configuration is still "
-                         "checked against the ORIGINAL design's golden")
-    ap.add_argument("-n", "--images", type=int, default=1,
-                    help="how many images from the payload to run (default 1)")
-    ap.add_argument("--n-layers", type=int, default=None,
-                    help="run only the first N encoder layers; for TIMING only, the result is "
-                         "partway through the encoder so the golden comparison will fail")
-    ap.add_argument("--features", type=int, default=ENC_D,
-                    help=f"encoder feature width the BITSTREAM was built for (default {ENC_D})")
-    ap.add_argument("--tokens", type=int, default=ENC_N,
-                    help=f"encoder token count the BITSTREAM was built for (default {ENC_N}); "
-                         f"50 for the 32x32-patch model, 197 for the 16x16-patch one")
-    ap.add_argument("--clock-mhz", type=float, default=CLOCK_HZ / 1e6,
-                    help="fabric clock, for reporting cycles (default %(default)s); the app's "
-                         "device-tree overlay sets the real one")
-    ap.add_argument("--hw-header", default=None,
-                    help="HLS-generated xencoder_layer_top_hw.h to read the register "
-                         "offsets from (default: the built-in REGMAP)")
-    args = ap.parse_args()
-    set_enc_dims(args.features, args.tokens)
-    regmap = load_regmap(args.hw_header) if args.hw_header else None
+    """
+    Main function for executing `SPARTA.py` as a script.
+    """
+    args = parse_args()
 
-    if not args.bitstream and not args.no_download:
-        ap.error("-b/--bitstream is required unless --no-download is given")
+    set_enc_dims(args.features, args.tokens)
+
+    regmap = load_regmap(args.hw_header) if args.hw_header else None
     base = int(args.base_addr, 0) if args.base_addr else None
-    CLOCK_HZ = args.clock_mhz * 1e6
+
+    global CLOCK_MHZ
+    CLOCK_MHZ = args.clock_mhz
 
     if args.selftest:
-        kernel = HwKernel(args.bitstream, instance=args.instance,
-                          download=not args.no_download, base_addr=base, regmap=regmap)
+        kernel = HwKernel(
+            args.bitstream,
+            instance=args.instance,
+            download=not args.no_download,
+            base_addr=base,
+            regmap=regmap,
+        )
         failures = kernel.selftest()
         return 1 if failures else 0
 
-    if not args.model_dir or not args.e2e_dir:
-        ap.error("-d/--model-dir and -e/--e2e-dir are required unless --selftest is given")
+    bad = run_encoder(
+        args.model_dir,
+        args.e2e_dir,
+        n_images=args.images,
+        bitstream=args.bitstream,
+        instance=args.instance,
+        download=not args.no_download,
+        base_addr=base,
+        hw_header=args.hw_header,
+        golden_dir=args.golden_dir,
+        n_layers=args.n_layers,
+    )
 
-    bad = run_encoder(args.model_dir, args.e2e_dir, n_images=args.images,
-                      bitstream=args.bitstream, instance=args.instance,
-                      download=not args.no_download, base_addr=base,
-                      hw_header=args.hw_header, golden_dir=args.golden_dir,
-                      n_layers=args.n_layers)
     return 1 if bad else 0
 
 
